@@ -1,0 +1,11 @@
+﻿target/
+*.class
+node_modules/
+dist/
+build/
+.idea/
+*.iml
+.vscode/
+.superpowers/
+*.log
+.DS_Store
