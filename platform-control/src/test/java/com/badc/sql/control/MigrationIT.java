@@ -32,6 +32,16 @@ class MigrationIT extends AbstractMySqlIT {
     }
 
     @Test
+    void database_session_is_utc_so_current_timestamp_defaults_are_utc() {
+        // 列默认值 CURRENT_TIMESTAMP(3) 取会话时区；会话必须是 UTC，否则写入的是服务器本地时间。
+        assertThat(jdbc.queryForObject("select @@session.time_zone", String.class))
+                .isEqualTo("+00:00");
+        assertThat(jdbc.queryForObject(
+                "select timestampdiff(second, utc_timestamp(), now())", Long.class))
+                .isZero();
+    }
+
+    @Test
     void seed_fixtures_grant_dev01_the_module_holding_datasources_101_and_102() {
         ResourceDatabasePopulator populator =
                 new ResourceDatabasePopulator(new ClassPathResource("seed/test-fixtures.sql"));

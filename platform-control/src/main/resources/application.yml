@@ -5,7 +5,7 @@ spring:
   application:
     name: platform-control
   datasource:
-    url: "${BADCSQL_DB_URL:jdbc:mysql://127.0.0.1:3306/badc_sql?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true}"
+    url: "${BADCSQL_DB_URL:jdbc:mysql://127.0.0.1:3306/badc_sql?useSSL=false&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&characterEncoding=UTF-8&allowPublicKeyRetrieval=true}"
     username: "${BADCSQL_DB_USER:root}"
     password: "${BADCSQL_DB_PASS:root}"
     driver-class-name: com.mysql.cj.jdbc.Driver

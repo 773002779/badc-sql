@@ -25,9 +25,11 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 public abstract class AbstractMySqlIT {
 
     private static final String DEFAULT_BASE_URL = "jdbc:mysql://127.0.0.1:3306";
-    // Connector/J 的 characterEncoding 只接受 Java 字符集名；UTF-8 在 MySQL 8 上即 utf8mb4。
+    // characterEncoding 只接受 Java 字符集名（UTF-8 在 MySQL 8 上即 utf8mb4）；
+    // forceConnectionTimeZoneToSession 把会话时区固定为 UTC，保证 CURRENT_TIMESTAMP 默认值写入 UTC。
     private static final String CONNECTION_PARAMS =
-            "useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+            "useSSL=false&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+                    + "&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
     private static final Pattern SCHEMA_NAME = Pattern.compile("badc_test_[a-z0-9]{8}");
 
     protected static String schema;
