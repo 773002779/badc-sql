@@ -37,6 +37,20 @@ public abstract class AbstractMySqlIT {
 
     @BeforeAll
     static void createSchemaAndMigrate() {
+        ensureSchema();
+    }
+
+    /**
+     * 确保随机 schema 已创建并完成迁移，返回该 schema 的 JDBC URL。
+     *
+     * <p>幂等；供 {@code @DynamicPropertySource} 在 Spring 上下文启动前调用（此时 {@code @BeforeAll}
+     * 尚未执行），{@link #createSchemaAndMigrate()} 随后再调用一次不会重复建库。
+     */
+    protected static synchronized String ensureSchema() {
+        if (schema != null) {
+            return schemaUrl();
+        }
+
         schema = "badc_test_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         executeOnServer("create database `" + schema + "` character set utf8mb4 collate utf8mb4_0900_ai_ci");
 
@@ -48,6 +62,7 @@ public abstract class AbstractMySqlIT {
                 .migrate();
 
         jdbc = new JdbcTemplate(new DriverManagerDataSource(schemaUrl(), dbUser(), dbPass()));
+        return schemaUrl();
     }
 
     @AfterAll
@@ -91,11 +106,11 @@ public abstract class AbstractMySqlIT {
         return url;
     }
 
-    private static String dbUser() {
+    protected static String dbUser() {
         return System.getenv().getOrDefault("BADCSQL_TEST_DB_USER", "root");
     }
 
-    private static String dbPass() {
+    protected static String dbPass() {
         return System.getenv().getOrDefault("BADCSQL_TEST_DB_PASS", "root");
     }
 }
