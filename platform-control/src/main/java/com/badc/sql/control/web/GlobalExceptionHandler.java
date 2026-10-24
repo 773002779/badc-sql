@@ -1,5 +1,6 @@
 package com.badc.sql.control.web;
 
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -28,5 +29,16 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ErrorCode.INVALID_ARGUMENT.httpStatus())
                 .body(new ApiError(ErrorCode.INVALID_ARGUMENT.name(),
                         ErrorCode.INVALID_ARGUMENT.defaultMessage()));
+    }
+
+    /**
+     * 唯一键冲突（系统/模块/数据源重名）转成 409，而不是让原始 SQL 异常漏成 500。
+     *
+     * <p>不把数据库异常消息带出去：里面可能含表名与 SQL 片段。
+     */
+    @ExceptionHandler(DuplicateKeyException.class)
+    public ResponseEntity<ApiError> handleDuplicateKey(DuplicateKeyException e) {
+        return ResponseEntity.status(ErrorCode.CONFLICT.httpStatus())
+                .body(new ApiError(ErrorCode.CONFLICT.name(), "名称已存在"));
     }
 }

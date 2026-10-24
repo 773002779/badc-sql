@@ -40,7 +40,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 class AuthControllerIT extends AbstractMySqlIT {
 
     private static final String LOGIN_PATH = "/api/v1/auth/login";
-    private static final String PROBE_PATH = "/api/v1/_probe/me";
+    /** 真实的受保护业务端点，用来验证过滤器链与鉴权行为（替代 T2 的临时探针）。 */
+    private static final String PROTECTED_PATH = "/api/v1/datasources";
 
     // 默认的 HttpURLConnection 在流式发送请求体后收到 401 会抛 HttpRetryException
     //（它想带着认证信息重试）；JDK HttpClient 没有这个行为，401 响应可以正常读回。
@@ -133,7 +134,7 @@ class AuthControllerIT extends AbstractMySqlIT {
 
     @Test
     void api_requests_without_a_token_are_rejected_with_401_not_403() throws Exception {
-        ResponseEntity<String> response = rest.getForEntity(PROBE_PATH, String.class);
+        ResponseEntity<String> response = rest.getForEntity(PROTECTED_PATH, String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         assertThat(errorCode(response)).isEqualTo("UNAUTHORIZED");
@@ -141,7 +142,7 @@ class AuthControllerIT extends AbstractMySqlIT {
 
     @Test
     void api_requests_with_a_malformed_token_are_rejected_with_401() throws Exception {
-        ResponseEntity<String> response = getWithToken(PROBE_PATH, "not-a-real-token");
+        ResponseEntity<String> response = getWithToken(PROTECTED_PATH, "not-a-real-token");
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         assertThat(errorCode(response)).isEqualTo("UNAUTHORIZED");
@@ -152,15 +153,15 @@ class AuthControllerIT extends AbstractMySqlIT {
         String forged = new JwtService("forged-secret-forged-secret-forged-secret-0123")
                 .issue(1L, "dev01");
 
-        assertThat(getWithToken(PROBE_PATH, forged).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(getWithToken(PROTECTED_PATH, forged).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test
-    void api_requests_with_a_valid_token_reach_the_handler_and_carry_the_user_id() throws Exception {
-        ResponseEntity<String> response = getWithToken(PROBE_PATH, JwtTestSupport.devToken(1L));
+    void api_requests_with_a_valid_token_reach_the_handler() throws Exception {
+        ResponseEntity<String> response = getWithToken(PROTECTED_PATH, JwtTestSupport.devToken(1L));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(objectMapper.readTree(response.getBody()).path("userId").asLong()).isEqualTo(1L);
+        assertThat(objectMapper.readTree(response.getBody())).isNotEmpty();
     }
 
     @Test

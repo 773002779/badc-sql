@@ -18,6 +18,8 @@ public class UserMapper {
              where login_name = ?
             """;
 
+    private static final String SELECT_ROLE_BY_ID = "select role from sys_user where id = ?";
+
     private static final RowMapper<SysUser> ROW_MAPPER = (rs, rowNum) -> new SysUser(
             rs.getLong("id"),
             rs.getString("login_name"),
@@ -33,5 +35,11 @@ public class UserMapper {
 
     public Optional<SysUser> findByLoginName(String loginName) {
         return jdbcTemplate.query(SELECT_BY_LOGIN_NAME, ROW_MAPPER, loginName).stream().findFirst();
+    }
+
+    /** 当前用户的角色，供写接口的角色判定使用（本任务先按 {@code sys_user.role}）。 */
+    public Optional<String> findRoleById(long userId) {
+        return jdbcTemplate.query(SELECT_ROLE_BY_ID,
+                (rs, rowNum) -> rs.getString("role"), userId).stream().findFirst();
     }
 }
