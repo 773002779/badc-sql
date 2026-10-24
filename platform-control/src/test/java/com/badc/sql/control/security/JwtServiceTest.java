@@ -9,10 +9,15 @@ import java.util.Date;
 
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
@@ -78,6 +83,51 @@ class JwtServiceTest {
         assertThatThrownBy(() -> new JwtService("too-short"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("32");
+    }
+
+    @Test
+    void warn_is_logged_when_the_secret_is_still_the_committed_default() {
+        ListAppender<ILoggingEvent> logs = attachLogCapture();
+        try {
+            // 启动不失败：本地开发照常可用，只提醒签名密钥是公开的。
+            new JwtService(JwtService.DEFAULT_SECRET);
+        } finally {
+            detachLogCapture(logs);
+        }
+
+        assertThat(logs.list).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.WARN);
+            assertThat(event.getFormattedMessage())
+                    .contains("BADCSQL_JWT_SECRET")
+                    .contains("伪造");
+        });
+    }
+
+    @Test
+    void no_warning_when_the_secret_is_overridden_by_the_environment() {
+        ListAppender<ILoggingEvent> logs = attachLogCapture();
+        try {
+            new JwtService("overridden-unit-test-secret-0123456789-0123456789");
+        } finally {
+            detachLogCapture(logs);
+        }
+
+        assertThat(logs.list).isEmpty();
+    }
+
+    private static ListAppender<ILoggingEvent> attachLogCapture() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger().addAppender(appender);
+        return appender;
+    }
+
+    private static void detachLogCapture(ListAppender<ILoggingEvent> appender) {
+        logger().detachAppender(appender);
+    }
+
+    private static Logger logger() {
+        return (Logger) LoggerFactory.getLogger(JwtService.class);
     }
 
     private static void assertUnauthorized(ThrowingCallable call) {

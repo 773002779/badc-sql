@@ -19,6 +19,7 @@ import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.web.ApiError;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.http.HttpServletResponse;
 
 /**
@@ -26,6 +27,11 @@ import jakarta.servlet.http.HttpServletResponse;
  *
  * <p>除 {@code /api/v1/auth/login} 外所有 {@code /api/**} 端点都要求认证；未认证一律 401（绝不 403），
  * 错误体与 {@code @RestControllerAdvice} 保持一致。
+ *
+ * <p>授权默认是 <b>fail-closed</b>：没有明确登记的路径一律 {@code denyAll()}。新增端点若挂错前缀
+ * （例如漏了 {@code /api}），会直接关闭，而不是悄悄对外开放；需要公开时必须显式加一条规则。
+ * 容器内部的 {@code ERROR} 派发（转发到 {@code /error}）单独放行，否则 4xx/5xx 的错误页本身会被
+ * 安全链拦掉，把 404 变成 401/403 或空响应体。
  */
 @Configuration
 @EnableWebSecurity
@@ -43,9 +49,13 @@ public class SecurityConfig {
                 .logout(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(requests -> requests
+                        // 错误派发必须先放行：Spring Boot 把未处理异常转发到 /error，若被 denyAll 拦下，
+                        // 404/500 会退化成 401/403 或空 body。
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(LOGIN_PATH).permitAll()
                         .requestMatchers("/api/**").authenticated()
-                        .anyRequest().permitAll())
+                        // fail closed：未登记路径默认关闭，不随新增控制器自动开放。
+                        .anyRequest().denyAll())
                 .exceptionHandling(handling -> handling
                         .authenticationEntryPoint((request, response, e) ->
                                 writeError(response, ErrorCode.UNAUTHORIZED, objectMapper))

@@ -7,6 +7,8 @@ import java.util.Date;
 
 import javax.crypto.SecretKey;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -24,15 +26,23 @@ import io.jsonwebtoken.security.Keys;
  * <p>密钥取 {@code badcsql.jwt.secret}（环境变量 {@code BADCSQL_JWT_SECRET} 覆盖），有效期固定 8 小时；
  * claims 至少包含 {@code sub}（用户 ID）与 {@code loginName}。解析失败（签名不符、过期、格式错误）一律
  * 抛 {@link ErrorCode#UNAUTHORIZED}，不向调用方区分原因。
+ *
+ * <p>若密钥仍等于 {@link #DEFAULT_SECRET}（即没有用 {@code BADCSQL_JWT_SECRET} 覆盖），启动时打一条
+ * WARN：本地开发照常可用，但生产漏配会把「源码里公开的密钥」当成签名密钥。
  */
 @Component
 public class JwtService {
+
+    private static final Logger log = LoggerFactory.getLogger(JwtService.class);
 
     /** token 有效期：8 小时。 */
     static final Duration TTL = Duration.ofHours(8);
 
     /** HS256 要求密钥至少 256 位。 */
     private static final int MIN_SECRET_BYTES = 32;
+
+    /** 与 {@code application.yml} 中 {@code badcsql.jwt.secret} 的本地默认值保持一致。 */
+    static final String DEFAULT_SECRET = "badc-sql-local-dev-jwt-secret-change-me-in-production";
 
     private static final String LOGIN_NAME_CLAIM = "loginName";
 
@@ -53,6 +63,12 @@ public class JwtService {
         }
         this.key = Keys.hmacShaKeyFor(secretBytes);
         this.ttl = ttl;
+        if (DEFAULT_SECRET.equals(secret)) {
+            // 只告警、不阻断：本地开发必须能直接跑起来。
+            log.warn("badcsql.jwt.secret 仍在用代码库中的默认值（未设置环境变量 BADCSQL_JWT_SECRET）："
+                    + "签名密钥是公开的，任何拿到源码的人都能伪造出合法的登录 token；"
+                    + "生产部署必须通过 BADCSQL_JWT_SECRET 覆盖。");
+        }
     }
 
     /** 签发 token。 */
