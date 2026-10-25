@@ -28,3 +28,9 @@ INSERT INTO module_datasource (id, module_id, datasource_id) VALUES
 
 INSERT INTO user_module_grant (id, user_id, module_id, can_export, granted_by) VALUES
     (1, 1, 201, 1, 2);
+
+-- R16：运维按系统归属（V2）。ops01 是系统 2（支付中心）的主运维；dev01 不是任何系统的运维。
+INSERT INTO sys_system_operator (id, system_id, user_id, operator_type) VALUES
+    (1, 2, 2, 'PRIMARY');
+INSERT INTO sys_user (id, login_name, password_hash, role, display_name) VALUES
+    (3, 'admin01', '$2b$10$TznpaUV2xFOaY3aN9B0lpe0H6sbVMVrDBekF4fxgICSl5BcU9SVGW', 'ADMIN', '管理员');
