@@ -11,6 +11,8 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.audit.AuditCommand;
+import com.badc.sql.control.audit.AuditService;
 import com.badc.sql.control.security.JwtService;
 
 /**
@@ -28,12 +30,15 @@ public class AuthController {
     private final UserMapper userMapper;
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
+    private final AuditService auditService;
     private final String dummyPasswordHash;
 
-    public AuthController(UserMapper userMapper, PasswordEncoder passwordEncoder, JwtService jwtService) {
+    public AuthController(UserMapper userMapper, PasswordEncoder passwordEncoder, JwtService jwtService,
+                          AuditService auditService) {
         this.userMapper = userMapper;
         this.passwordEncoder = passwordEncoder;
         this.jwtService = jwtService;
+        this.auditService = auditService;
         // 用户不存在时用它陪跑一次 BCrypt，保证失败路径耗时与密码错误一致。
         this.dummyPasswordHash = passwordEncoder.encode(UUID.randomUUID().toString());
     }
@@ -43,6 +48,7 @@ public class AuthController {
         String loginName = request.loginName() == null ? "" : request.loginName().trim();
         String password = request.password();
         if (loginName.isEmpty() || password == null || password.isEmpty()) {
+            auditLoginFailure(null, loginName);
             throw invalidCredentials();
         }
 
@@ -50,14 +56,23 @@ public class AuthController {
         boolean passwordMatches = passwordEncoder.matches(
                 password, user.map(SysUser::passwordHash).orElse(dummyPasswordHash));
         if (user.isEmpty() || !passwordMatches) {
+            auditLoginFailure(user.map(SysUser::id).orElse(null), loginName);
             throw invalidCredentials();
         }
 
         SysUser authenticated = user.get();
+        auditService.record(new AuditCommand("LOGIN", authenticated.id(), authenticated.loginName(), null,
+                "login_success", null, "{\"loginName\":\"" + authenticated.loginName() + "\"}"));
         return new LoginResponse(
                 jwtService.issue(authenticated.id(), authenticated.loginName()),
                 authenticated.id(),
                 authenticated.loginName());
+    }
+
+    /** 登录失败也入链：暴力破解与撞库的第一手证据。 */
+    private void auditLoginFailure(Long userId, String loginName) {
+        auditService.record(new AuditCommand("LOGIN_FAILED", userId, loginName, null,
+                "login_failed", null, "{\"loginName\":\"" + loginName + "\"}"));
     }
 
     private static BizException invalidCredentials() {

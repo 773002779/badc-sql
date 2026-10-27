@@ -19,6 +19,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.badc.sql.control.audit.AuditService;
 import com.badc.sql.control.security.JwtService;
 import com.badc.sql.control.security.SecurityConfig;
 
@@ -44,6 +45,10 @@ class AuthControllerTest {
 
     @MockBean
     private UserMapper userMapper;
+
+    /** 审计链在切片里由 T8 引入；Web 层单测不连库，用 mock 顶替。 */
+    @MockBean
+    private AuditService auditService;
 
     @Test
     void login_with_valid_password_returns_token() throws Exception {

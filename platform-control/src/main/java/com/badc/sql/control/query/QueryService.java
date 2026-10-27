@@ -12,6 +12,8 @@ import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.common.sql.SqlText;
+import com.badc.sql.control.audit.AuditCommand;
+import com.badc.sql.control.audit.AuditService;
 import com.badc.sql.control.grant.VisibilityService;
 import com.badc.sql.control.org.ConnAccountService;
 import com.badc.sql.control.user.UserRoleService;
@@ -41,6 +43,7 @@ public class QueryService {
     private final ExecutorClient executorClient;
     private final ResultCacheService resultCacheService;
     private final QueryHistoryService queryHistoryService;
+    private final AuditService auditService;
 
     public QueryService(
             VisibilityService visibilityService,
@@ -49,7 +52,8 @@ public class QueryService {
             SqlLimitInjector limitInjector,
             ExecutorClient executorClient,
             ResultCacheService resultCacheService,
-            QueryHistoryService queryHistoryService) {
+            QueryHistoryService queryHistoryService,
+            AuditService auditService) {
         this.visibilityService = visibilityService;
         this.userRoleService = userRoleService;
         this.connAccountService = connAccountService;
@@ -57,6 +61,7 @@ public class QueryService {
         this.executorClient = executorClient;
         this.resultCacheService = resultCacheService;
         this.queryHistoryService = queryHistoryService;
+        this.auditService = auditService;
     }
 
     /**
@@ -71,6 +76,10 @@ public class QueryService {
         }
         // 1) 只读白名单：写语句走工单，不走查询接口。
         if (!isReadonlyStatement(sql)) {
+            // 被拒的写操作也要留痕：这是"有人试图经查询接口改数据"的证据。
+            auditService.record(new AuditCommand(
+                    "QUERY_REJECTED", userId, null, datasourceId, "non_readonly_statement", null,
+                    "{\"sql\":\"" + sql.replace("\"", "'") + "\"}"));
             throw new BizException(ErrorCode.FORBIDDEN, "查询接口只接受查询类语句，需要变更请提交变更工单");
         }
         // 2) 可见性：存在但无权 403，不存在 404。
@@ -90,6 +99,9 @@ public class QueryService {
         resultCacheService.put(resultId, raw);
         // 6) 历史：写失败不影响本次查询返回。
         queryHistoryService.record(userId, datasourceId, boundedSql, raw.rows().size(), raw.elapsedMs(), "SUCCESS");
+        // 7) 审计：查询本身也入链（谁、查了哪个库、多少行）。
+        auditService.record(new AuditCommand("QUERY", userId, null, datasourceId, "query", resultId,
+                "{\"rows\":" + raw.rows().size() + ",\"truncated\":" + raw.truncated() + "}"));
 
         return new QueryResult(
                 resultId,
