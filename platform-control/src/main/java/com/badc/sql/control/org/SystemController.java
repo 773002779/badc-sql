@@ -13,6 +13,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.badc.sql.control.security.CurrentUser;
+
 /**
  * 系统建档与维护。
  *
@@ -39,7 +41,8 @@ public class SystemController {
     @PostMapping
     public SystemEntity create(@RequestBody SystemRequest request) {
         operatorGuard.requireAdmin();
-        return systemService.createSystem(request.name());
+        // 建档者同时成为该系统的 PRIMARY 运维，否则建完系统再建数据源的人自己看不到它（B8）。
+        return systemService.createSystem(request.name(), CurrentUser.id());
     }
 
     @PutMapping("/{id}")

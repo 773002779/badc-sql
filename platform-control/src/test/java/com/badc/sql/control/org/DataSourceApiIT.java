@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -29,6 +31,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.grant.VisibilityService;
 import com.badc.sql.control.support.AbstractMySqlIT;
 import com.badc.sql.control.support.JwtTestSupport;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -64,6 +67,12 @@ class DataSourceApiIT extends AbstractMySqlIT {
 
     @Autowired
     private ConnAccountService connAccountService;
+
+    @Autowired
+    private SystemService systemService;
+
+    @Autowired
+    private VisibilityService visibilityService;
 
     @DynamicPropertySource
     static void datasource(DynamicPropertyRegistry registry) {
@@ -108,6 +117,87 @@ class DataSourceApiIT extends AbstractMySqlIT {
                 .doesNotContain("\"charset\"")
                 .doesNotContain("time_zone")
                 .doesNotContain("\"timeZone\"");
+    }
+
+    /**
+     * §4.3-8 最小可见：研发的列表里只有已授权模块下的数据源。999 属于系统 2（未授权），
+     * 必须<b>不出现在响应里</b>——不是前端隐藏，是后端不返回。
+     */
+    @Test
+    void developer_list_contains_only_granted_datasources() throws Exception {
+        Set<Long> ids = listIds(devToken());
+
+        // 模块 201 已授权给 dev01，模块下只有 101 / 102。
+        assertThat(ids).containsExactlyInAnyOrder(101L, 102L);
+        assertThat(ids).doesNotContain(999L);
+    }
+
+    /** 运维按系统归属收敛：ops01 只负责系统 2，所以看得到 999，看不到系统 1 的 101 / 102。 */
+    @Test
+    void operator_list_contains_only_datasources_of_operated_systems() throws Exception {
+        Set<Long> ids = listIds(opsToken());
+
+        assertThat(ids).contains(999L);
+        assertThat(ids).doesNotContain(101L, 102L);
+    }
+
+    /**
+     * 管理员全量可见；否则排障与代维都无从下手。
+     *
+     * <p>与库里的<b>全部</b>数据源比对，而不是只比对三个种子 ID：只断言种子行的话，管理员列表一旦开始
+     * 漏行也发现不了。
+     */
+    @Test
+    void admin_list_contains_every_datasource() throws Exception {
+        Set<Long> all = new LinkedHashSet<>(jdbc.queryForList("select id from datasource", Long.class));
+        assertThat(all).contains(101L, 102L, 999L);
+
+        assertThat(listIds(adminToken())).containsExactlyInAnyOrderElementsOf(all);
+    }
+
+    /**
+     * 建档时把创建者登记为该系统的 PRIMARY 运维，创建者才能立刻配置这个系统。
+     *
+     * <p>没有这一步，「建完系统再建数据源」的人自己反而看不到它——列表过滤（B8）会把这条记录筛掉。
+     */
+    @Test
+    void system_creator_is_registered_as_primary_operator_and_sees_its_datasources() throws Exception {
+        long systemId = createSystem(uniqueName("IT Creator"));
+        assertThat(operatorType(systemId, 3L)).isEqualTo("PRIMARY");
+
+        long datasourceId = createDatasource(systemId, uniqueName("IT Creator DS"), "it_creator_db");
+
+        assertThat(listIds(adminToken())).contains(datasourceId);
+        // 对照：研发没有这个系统的模块授权，同一个数据源不该出现在研发的列表里。
+        assertThat(listIds(devToken())).doesNotContain(datasourceId);
+
+        // 删除系统要连运维归属一起清掉，不留孤儿行。
+        assertThat(delete("/api/v1/datasources/" + datasourceId, adminToken()).getStatusCode())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(delete("/api/v1/systems/" + systemId, adminToken()).getStatusCode())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(operatorType(systemId, 3L)).isNull();
+    }
+
+    /**
+     * 登记的是「谁建的」，不是「管理员才能建」：创建者 ID 作为接口参数传入，将来放开运维建档时归属登记
+     * 自动生效。这里直接调 service 模拟非管理员创建者（ops01），验证他能看到新系统下的数据源。
+     */
+    @Test
+    void a_non_admin_creator_also_sees_the_datasources_of_the_system_they_created() throws Exception {
+        long systemId = systemService.createSystem(uniqueName("IT Ops Creator"), 2L).id();
+        assertThat(operatorType(systemId, 2L)).isEqualTo("PRIMARY");
+
+        long datasourceId = createDatasource(systemId, uniqueName("IT Ops Creator DS"), "it_ops_creator_db");
+
+        assertThat(visibilityService.visibleDatasourceIds(2L)).contains(datasourceId);
+        assertThat(listIds(opsToken())).contains(datasourceId);
+
+        assertThat(delete("/api/v1/datasources/" + datasourceId, adminToken()).getStatusCode())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(delete("/api/v1/systems/" + systemId, adminToken()).getStatusCode())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(operatorType(systemId, 2L)).isNull();
     }
 
     @Test
@@ -230,7 +320,10 @@ class DataSourceApiIT extends AbstractMySqlIT {
         assertThat(delete("/api/v1/modules/" + moduleId + "/datasources/" + datasourceId, adminToken())
                 .getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
 
-        ResponseEntity<String> list = get(DATA_SOURCES, devToken());
+        // 这个用例断的是「响应体里没有连接信息」，与可见性无关：新系统对 dev01 没有模块授权，
+        // B8 之后该数据源本就不该出现在研发的列表里（见 developer_list_contains_only_granted_datasources），
+        // 所以这里用能看见它的管理员来验证视图字段。
+        ResponseEntity<String> list = get(DATA_SOURCES, adminToken());
         JsonNode listed = findById(objectMapper.readTree(list.getBody()), datasourceId);
         assertThat(listed.size()).isEqualTo(5);
         assertThat(list.getBody())
@@ -470,6 +563,25 @@ class DataSourceApiIT extends AbstractMySqlIT {
 
     private int systemCount(String name) {
         return jdbc.queryForObject("select count(*) from sys_system where name = ?", Integer.class, name);
+    }
+
+    /** 列表接口返回的数据源 ID 集合；顺带断言 HTTP 200，避免用错误响应体做出「空列表」的假绿。 */
+    private Set<Long> listIds(String token) throws Exception {
+        ResponseEntity<String> response = get(DATA_SOURCES, token);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        Set<Long> ids = new LinkedHashSet<>();
+        for (JsonNode node : objectMapper.readTree(response.getBody())) {
+            ids.add(node.path("id").asLong());
+        }
+        return ids;
+    }
+
+    /** 该系统的运维归属类型；没有归属行时返回 null。 */
+    private String operatorType(long systemId, long userId) {
+        var types = jdbc.queryForList(
+                "select operator_type from sys_system_operator where system_id = ? and user_id = ?",
+                String.class, systemId, userId);
+        return types.isEmpty() ? null : types.get(0);
     }
 
     private static String uniqueName(String prefix) {

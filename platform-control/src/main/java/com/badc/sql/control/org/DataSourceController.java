@@ -1,6 +1,8 @@
 package com.badc.sql.control.org;
 
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -13,11 +15,15 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.badc.sql.control.grant.VisibilityService;
+import com.badc.sql.control.security.CurrentUser;
+
 /**
  * 数据源维护：元数据、连接参数、账号集。
  *
  * <p>列表只返回 {@link DataSourceView}（id/name/dbName/systemId/type），连接信息与凭证绝不出现在
- * 任何响应里；写接口仅运维 / 管理员，且运维只能改<b>自己负责的系统</b>下的数据源。
+ * 任何响应里；列表按登录用户的可见范围收敛（§4.3-8：不是隐藏，是不查）。写接口仅运维 / 管理员，
+ * 且运维只能改<b>自己负责的系统</b>下的数据源。
  */
 @RestController
 @RequestMapping("/api/v1/datasources")
@@ -26,13 +32,13 @@ public class DataSourceController {
     private final DataSourceService dataSourceService;
     private final ConnAccountService connAccountService;
     private final OperatorGuard operatorGuard;
-    private final com.badc.sql.control.grant.VisibilityService visibilityService;
+    private final VisibilityService visibilityService;
 
     public DataSourceController(
             DataSourceService dataSourceService,
             ConnAccountService connAccountService,
             OperatorGuard operatorGuard,
-            com.badc.sql.control.grant.VisibilityService visibilityService) {
+            VisibilityService visibilityService) {
         this.dataSourceService = dataSourceService;
         this.connAccountService = connAccountService;
         this.operatorGuard = operatorGuard;
@@ -43,11 +49,16 @@ public class DataSourceController {
      * 列表按可见性过滤：研发只看得到已授权模块下的库（§4.3-8「不是隐藏，是不查」）。
      *
      * <p>不过滤就等于把全部生产库的库名与所属系统暴露给任何登录用户，还会让前端列出点了就 403 的库。
+     *
+     * <p>可见集合为 null 时按空集处理：这条路径是读接口，宁可返回空列表也不能 NPE 成 500。
      */
     @GetMapping
     public List<DataSourceView> list() {
-        // TODO(B8 未关闭)：尚未按可见性过滤，见最终评审结论。
-        return dataSourceService.listDatasources();
+        Set<Long> visible = Objects.requireNonNullElse(
+                visibilityService.visibleDatasourceIds(CurrentUser.id()), Set.of());
+        return dataSourceService.listDatasources().stream()
+                .filter(view -> visible.contains(view.id()))
+                .toList();
     }
 
     @PostMapping

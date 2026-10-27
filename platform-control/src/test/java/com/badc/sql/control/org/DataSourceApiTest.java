@@ -14,6 +14,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.util.List;
+import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -96,6 +97,38 @@ class DataSourceApiTest {
                 .andExpect(content().string(not(containsString("127.0.0.1"))));
     }
 
+    /**
+     * B8：列表按可见性过滤。可见集合是服务端算出的白名单，未授权的高 ID 不能出现在响应里，
+     * 即使 service 把全量视图取了回来。
+     */
+    @Test
+    void datasource_list_keeps_only_visible_datasources() throws Exception {
+        given(visibilityService.visibleDatasourceIds(1L)).willReturn(Set.of(101L));
+        given(dataSourceService.listDatasources()).willReturn(List.of(
+                new DataSourceView(101L, "订单库-只读", "order_db", 1L, "MYSQL"),
+                new DataSourceView(999L, "支付库-只读", "pay_db", 2L, "MYSQL")));
+
+        mockMvc.perform(get(DATA_SOURCES).header("Authorization", DEV_AUTH))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(1)))
+                .andExpect(jsonPath("$[0].id").value(101));
+    }
+
+    /**
+     * 可见性服务返回 null 时列表必须是空数组，不能变成 500：读路径上宁可少给也不能崩。
+     * （{@code Set.of(...).contains(null)} 与 NPE 都是这里要挡住的失败模式。）
+     */
+    @Test
+    void datasource_list_treats_null_visibility_as_empty_instead_of_500() throws Exception {
+        given(visibilityService.visibleDatasourceIds(1L)).willReturn(null);
+        given(dataSourceService.listDatasources()).willReturn(List.of(
+                new DataSourceView(101L, "订单库-只读", "order_db", 1L, "MYSQL")));
+
+        mockMvc.perform(get(DATA_SOURCES).header("Authorization", DEV_AUTH))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(0)));
+    }
+
     @Test
     void anonymous_request_is_rejected_with_401() throws Exception {
         mockMvc.perform(get(DATA_SOURCES))
@@ -135,7 +168,7 @@ class DataSourceApiTest {
     @Test
     void admin_can_create_a_system() throws Exception {
         given(userRoleService.roleOf(3L)).willReturn("ADMIN");
-        given(systemService.createSystem("支付中心")).willReturn(new SystemEntity(4L, "支付中心"));
+        given(systemService.createSystem("支付中心", 3L)).willReturn(new SystemEntity(4L, "支付中心"));
 
         mockMvc.perform(post("/api/v1/systems")
                         .header("Authorization", ADMIN_AUTH)
