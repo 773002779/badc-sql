@@ -52,13 +52,17 @@ public class OperatorGuard {
         this.jdbc = jdbc;
     }
 
-    /** 角色级守卫（保留）：归属校验见 require*For* 系列，尚未接线。 */
+    /** 角色级守卫（保留）：产品代码已全部改用下面的归属感知守卫，这里只为兼容旧调用点/测试。 */
     public void requireOperator() {
         requireRole(CONNECTION_ROLES);
     }
 
-    /** 连接 / 凭证类写入：需要角色 + 系统归属。 */
-    public void requireConnectionOperatorForSystem(long systemId) {
+    /**
+     * 连接 / 凭证类写入：需要角色 + 系统归属。
+     *
+     * <p>参数用 {@code Long}：新建数据源时 systemId 来自请求体，缺失是常见错误输入，不该在控制器里拆箱成 NPE。
+     */
+    public void requireConnectionOperatorForSystem(Long systemId) {
         requireOwnership(systemId, CONNECTION_ROLES);
     }
 
@@ -70,7 +74,7 @@ public class OperatorGuard {
     }
 
     /** 系统 / 模块结构类写入：需要角色 + 系统归属。 */
-    public void requireStructureOperatorForSystem(long systemId) {
+    public void requireStructureOperatorForSystem(Long systemId) {
         requireOwnership(systemId, STRUCTURE_ROLES);
     }
 
@@ -80,16 +84,21 @@ public class OperatorGuard {
         requireMembership(systemOfModule(moduleId), role);
     }
 
-    /** 建档（新建系统）仅管理员（§4.4）。 */
+    /** 建档（新建系统）仅管理员（§4.4）；改名 / 删除走 {@link #requireStructureOperatorForSystem}。 */
     public void requireAdmin() {
         Long userId = CurrentUser.id();
         if (!"ADMIN".equals(roleOf(userId))) {
-            throw new BizException(ErrorCode.FORBIDDEN, "仅管理员可新建或删除系统");
+            throw new BizException(ErrorCode.FORBIDDEN, "仅管理员可新建系统");
         }
     }
 
-    private void requireOwnership(long systemId, Set<String> allowedRoles) {
-        requireMembership(systemId, requireRole(allowedRoles));
+    private void requireOwnership(Long systemId, Set<String> allowedRoles) {
+        String role = requireRole(allowedRoles);
+        // 先判角色再判参数：无权限者不该从 400/403 的差异里反推出"这个系统存不存在"。
+        if (systemId == null) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT, "所属系统不能为空");
+        }
+        requireMembership(systemId, role);
     }
 
     private String requireRole(Set<String> allowedRoles) {

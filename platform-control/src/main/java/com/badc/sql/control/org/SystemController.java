@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
  * 系统建档与维护。
  *
  * <p>读接口对所有已登录用户开放（系统名本身不是敏感信息）；写接口仅运维 / 管理员，研发一律 403。
+ * 其中<b>建档仅管理员</b>（§4.4），改名 / 删除还要求该系统在该运维的归属范围内。
  */
 @RestController
 @RequestMapping("/api/v1/systems")
@@ -37,20 +38,20 @@ public class SystemController {
 
     @PostMapping
     public SystemEntity create(@RequestBody SystemRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireAdmin();
         return systemService.createSystem(request.name());
     }
 
     @PutMapping("/{id}")
     public SystemEntity rename(@PathVariable long id, @RequestBody SystemRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForSystem(id);
         return systemService.renameSystem(id, request.name());
     }
 
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable long id) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForSystem(id);
         systemService.deleteSystem(id);
     }
 

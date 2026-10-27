@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 模块维护与「模块-数据源」挂载。
  *
- * <p>写接口仅运维 / 管理员；挂载要求模块与数据源属于同一系统。
+ * <p>写接口仅运维 / 管理员，且运维只能改<b>自己负责的系统</b>下的模块；挂载要求模块与数据源属于同一系统。
  */
 @RestController
 @RequestMapping("/api/v1/modules")
@@ -38,34 +38,34 @@ public class ModuleController {
 
     @PostMapping
     public ModuleEntity create(@RequestBody CreateModuleRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForSystem(request.systemId());
         return moduleService.createModule(request.systemId(), request.name());
     }
 
     @PutMapping("/{id}")
     public ModuleEntity rename(@PathVariable long id, @RequestBody RenameModuleRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForModule(id);
         return moduleService.renameModule(id, request.name());
     }
 
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable long id) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForModule(id);
         moduleService.deleteModule(id);
     }
 
     @PostMapping("/{id}/datasources/{datasourceId}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void mountDatasource(@PathVariable long id, @PathVariable long datasourceId) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForModule(id);
         moduleService.mountDatasource(id, datasourceId);
     }
 
     @DeleteMapping("/{id}/datasources/{datasourceId}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void unmountDatasource(@PathVariable long id, @PathVariable long datasourceId) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireStructureOperatorForModule(id);
         moduleService.unmountDatasource(id, datasourceId);
     }
 

@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
  * 数据源维护：元数据、连接参数、账号集。
  *
  * <p>列表只返回 {@link DataSourceView}（id/name/dbName/systemId/type），连接信息与凭证绝不出现在
- * 任何响应里；写接口仅运维 / 管理员。
+ * 任何响应里；写接口仅运维 / 管理员，且运维只能改<b>自己负责的系统</b>下的数据源。
  */
 @RestController
 @RequestMapping("/api/v1/datasources")
@@ -52,7 +52,7 @@ public class DataSourceController {
 
     @PostMapping
     public DataSourceView create(@RequestBody CreateDataSourceRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireConnectionOperatorForSystem(request.systemId());
         return dataSourceService.createDataSource(new DataSourceService.NewDataSource(
                 request.systemId(),
                 request.name(),
@@ -66,21 +66,21 @@ public class DataSourceController {
 
     @PutMapping("/{id}")
     public DataSourceView update(@PathVariable long id, @RequestBody UpdateDataSourceRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireConnectionOperatorForDatasource(id);
         return dataSourceService.updateDataSource(id, request.name(), request.dbName());
     }
 
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable long id) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireConnectionOperatorForDatasource(id);
         dataSourceService.deleteDataSource(id);
     }
 
     @PutMapping("/{id}/connection")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void updateConnection(@PathVariable long id, @RequestBody ConnectionRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireConnectionOperatorForDatasource(id);
         dataSourceService.updateConnection(
                 id, request.host(), request.port(), request.charset(), request.timeZone());
     }
@@ -89,14 +89,14 @@ public class DataSourceController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void saveAccount(
             @PathVariable long id, @PathVariable String accountType, @RequestBody AccountRequest request) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireConnectionOperatorForDatasource(id);
         connAccountService.saveAccount(id, accountType, request.username(), request.password());
     }
 
     @DeleteMapping("/{id}/accounts/{accountType}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteAccount(@PathVariable long id, @PathVariable String accountType) {
-        operatorGuard.requireOperator();
+        operatorGuard.requireConnectionOperatorForDatasource(id);
         connAccountService.deleteAccount(id, accountType);
     }
 

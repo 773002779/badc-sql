@@ -4,6 +4,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -13,29 +14,28 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.util.List;
-import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
-import org.springframework.jdbc.core.JdbcTemplate;
-import com.badc.sql.control.grant.VisibilityService;
-import com.badc.sql.control.user.UserRoleService;
-import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.badc.sql.control.grant.VisibilityService;
 import com.badc.sql.control.security.JwtService;
 import com.badc.sql.control.security.SecurityConfig;
 import com.badc.sql.control.support.JwtTestSupport;
 import com.badc.sql.control.user.UserMapper;
+import com.badc.sql.control.user.UserRoleService;
 
 /**
  * 数据源接口的快速 Web 层测试：真实 {@link SecurityConfig}、真实 JWT 过滤器、真实
- * {@link OperatorGuard} 与 {@code GlobalExceptionHandler}，只有 service 与 {@link UserMapper} 被 mock。
+ * {@link OperatorGuard} 与 {@code GlobalExceptionHandler}，只有 service、{@link UserRoleService}
+ * 与 {@link UserMapper} 被 mock（{@code JdbcTemplate} 也 mock 掉，用于模拟系统归属查询）。
  *
  * <p>真实 MySQL、真实凭证加密与真实 HTTP 的深覆盖见 {@link DataSourceApiIT}。
  */
@@ -47,6 +47,7 @@ class DataSourceApiTest {
     private static final String DATA_SOURCES = "/api/v1/datasources";
     private static final String DEV_AUTH = "Bearer " + JwtTestSupport.devToken(1L);
     private static final String OPS_AUTH = "Bearer " + JwtTestSupport.token(2L, "ops01");
+    private static final String ADMIN_AUTH = "Bearer " + JwtTestSupport.token(3L, "admin01");
 
     @Autowired
     @MockBean
@@ -104,7 +105,7 @@ class DataSourceApiTest {
 
     @Test
     void developer_cannot_create_a_system_and_gets_403() throws Exception {
-        given(userMapper.findRoleById(1L)).willReturn(Optional.of("DEVELOPER"));
+        given(userRoleService.roleOf(1L)).willReturn("DEVELOPER");
 
         mockMvc.perform(post("/api/v1/systems")
                         .header("Authorization", DEV_AUTH)
@@ -118,20 +119,36 @@ class DataSourceApiTest {
 
     @Test
     void primary_ops_cannot_create_a_system_because_that_is_admin_only() throws Exception {
-        given(userMapper.findRoleById(2L)).willReturn(Optional.of("PRIMARY_OPS"));
-        given(systemService.createSystem("支付中心")).willReturn(new SystemEntity(3L, "支付中心"));
+        given(userRoleService.roleOf(2L)).willReturn("PRIMARY_OPS");
 
         // §4.4：建档属于管理员职责；运维只维护自己系统内的模块与数据源。
         mockMvc.perform(post("/api/v1/systems")
                         .header("Authorization", OPS_AUTH)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"支付中心\"}"))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+
+        verifyNoInteractions(systemService);
+    }
+
+    @Test
+    void admin_can_create_a_system() throws Exception {
+        given(userRoleService.roleOf(3L)).willReturn("ADMIN");
+        given(systemService.createSystem("支付中心")).willReturn(new SystemEntity(4L, "支付中心"));
+
+        mockMvc.perform(post("/api/v1/systems")
+                        .header("Authorization", ADMIN_AUTH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"支付中心\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(4))
+                .andExpect(jsonPath("$.name").value("支付中心"));
     }
 
     @Test
     void developer_cannot_change_connection_or_credentials() throws Exception {
-        given(userMapper.findRoleById(1L)).willReturn(Optional.of("DEVELOPER"));
+        given(userRoleService.roleOf(1L)).willReturn("DEVELOPER");
 
         mockMvc.perform(put("/api/v1/datasources/101/connection")
                         .header("Authorization", DEV_AUTH)
@@ -148,5 +165,62 @@ class DataSourceApiTest {
                 .andExpect(jsonPath("$.code").value("FORBIDDEN"));
 
         verifyNoInteractions(dataSourceService, connAccountService);
+    }
+
+    /**
+     * C1 的最小复现：ops01 角色够了，但 101 属于系统 1，而归属表里只有 (系统 2, ops01)。
+     *
+     * <p>守卫必须按数据源反查系统再查归属，否则一次 PUT 就能把别人的连接串指向自己的主机。
+     */
+    @Test
+    void primary_ops_cannot_change_connection_of_a_datasource_in_another_system() throws Exception {
+        given(userRoleService.roleOf(2L)).willReturn("PRIMARY_OPS");
+        given(jdbcTemplate.queryForList("select system_id from datasource where id = ?", Long.class, 101L))
+                .willReturn(List.of(1L));
+        given(jdbcTemplate.queryForObject(
+                "select count(*) from sys_system_operator where system_id = ? and user_id = ?",
+                Integer.class, 1L, 2L)).willReturn(0);
+
+        mockMvc.perform(put("/api/v1/datasources/101/connection")
+                        .header("Authorization", OPS_AUTH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"host\":\"attacker.tld\",\"port\":3306,\"charset\":\"utf8mb4\",\"timeZone\":\"+00:00\"}"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+
+        verifyNoInteractions(dataSourceService);
+    }
+
+    @Test
+    void primary_ops_can_change_connection_of_a_datasource_in_their_own_system() throws Exception {
+        given(userRoleService.roleOf(2L)).willReturn("PRIMARY_OPS");
+        given(jdbcTemplate.queryForList("select system_id from datasource where id = ?", Long.class, 101L))
+                .willReturn(List.of(2L));
+        given(jdbcTemplate.queryForObject(
+                "select count(*) from sys_system_operator where system_id = ? and user_id = ?",
+                Integer.class, 2L, 2L)).willReturn(1);
+
+        mockMvc.perform(put("/api/v1/datasources/101/connection")
+                        .header("Authorization", OPS_AUTH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"host\":\"10.0.0.9\",\"port\":3307,\"charset\":\"utf8mb4\",\"timeZone\":\"+00:00\"}"))
+                .andExpect(status().isNoContent());
+
+        verify(dataSourceService).updateConnection(101L, "10.0.0.9", 3307, "utf8mb4", "+00:00");
+    }
+
+    /** 新建数据源缺 systemId：运维拿到 400（参数问题），不能因为守卫拆箱变成 500。 */
+    @Test
+    void creating_a_datasource_without_system_id_is_400_not_500() throws Exception {
+        given(userRoleService.roleOf(2L)).willReturn("PRIMARY_OPS");
+
+        mockMvc.perform(post(DATA_SOURCES)
+                        .header("Authorization", OPS_AUTH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"没有归属的数据源\",\"dbName\":\"x\",\"host\":\"10.0.0.9\",\"port\":3306}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
+
+        verifyNoInteractions(dataSourceService);
     }
 }
