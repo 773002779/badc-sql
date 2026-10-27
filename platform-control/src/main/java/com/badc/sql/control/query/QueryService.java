@@ -85,8 +85,13 @@ public class QueryService {
         // 2) 可见性：存在但无权 403，不存在 404。
         visibilityService.assertVisible(userId, datasourceId);
 
-        // 3) 行数上限：研发强约束，其他角色用宽松上限。
-        boolean developer = userRoleService.isDeveloper(userId);
+        // 3) 管理员不可执行生产语句（§4.3-5 的硬隔离）：只能配置与授权。
+        String role = userRoleService.roleOf(userId);
+        if ("ADMIN".equals(role)) {
+            throw new BizException(ErrorCode.FORBIDDEN, "管理员不可执行生产语句，只能进行配置与授权");
+        }
+        // 4) 行数上限：研发强约束，其他角色用宽松上限。
+        boolean developer = "DEVELOPER".equals(role);
         int maxRows = developer ? DEVELOPER_ROW_CAP : DEFAULT_ROW_CAP;
         String boundedSql = developer ? limitInjector.apply(sql) : sql;
 
@@ -113,20 +118,73 @@ public class QueryService {
 
     /** 只看首个关键字，且必须先剥掉注释与字面量（{@code -- select} 不算查询语句）。 */
     static boolean isReadonlyStatement(String sql) {
-        String stripped = SqlText.stripLiteralsAndComments(sql);
-        for (int i = 0; i < stripped.length(); i++) {
-            char c = stripped.charAt(i);
+        String code = SqlText.stripLiteralsAndComments(sql).toLowerCase(Locale.ROOT);
+        String first = firstKeyword(code);
+        if (first == null) {
+            return false;
+        }
+        if ("explain".equals(first)) {
+            String rest = code.substring(Math.min(7, code.length())).stripLeading();
+            if (rest.startsWith("analyze")) {
+                rest = rest.substring(7).stripLeading();
+            }
+            String verb = firstKeyword(rest);
+            return "select".equals(verb) || "with".equals(verb);
+        }
+        if ("with".equals(first)) {
+            return "select".equals(lastTopLevelVerb(code));
+        }
+        return READONLY_KEYWORDS.contains(first);
+    }
+
+    private static String firstKeyword(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
             if (Character.isWhitespace(c) || c == '(') {
                 continue;
             }
             int end = i;
-            while (end < stripped.length() && Character.isLetter(stripped.charAt(end))) {
+            while (end < text.length() && Character.isLetter(text.charAt(end))) {
                 end++;
             }
-            String keyword = stripped.substring(i, end).toLowerCase(Locale.ROOT);
-            return READONLY_KEYWORDS.contains(keyword);
+            return end == i ? null : text.substring(i, end);
         }
-        return false;
+        return null;
+    }
+
+    /** WITH 子句之后的真正动词：取括号深度 0 上最后一个增删改查关键字。 */
+    private static String lastTopLevelVerb(String code) {
+        String[] verbs = {"select", "update", "delete", "insert", "replace"};
+        int depth = 0;
+        int lastIndex = -1;
+        String lastVerb = null;
+        for (int i = 0; i < code.length(); i++) {
+            char c = code.charAt(i);
+            if (c == '(') {
+                depth++;
+                continue;
+            }
+            if (c == ')') {
+                depth = Math.max(0, depth - 1);
+                continue;
+            }
+            if (depth != 0 || !Character.isLetter(c)) {
+                continue;
+            }
+            int end = i;
+            while (end < code.length() && Character.isLetter(code.charAt(end))) {
+                end++;
+            }
+            String word = code.substring(i, end);
+            for (String verb : verbs) {
+                if (verb.equals(word) && i > lastIndex) {
+                    lastIndex = i;
+                    lastVerb = verb;
+                }
+            }
+            i = end - 1;
+        }
+        return lastVerb;
     }
 
     /** 查询结果：{@code resultId} 供后续导出 / 结果缓存引用。 */

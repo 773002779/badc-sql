@@ -6,7 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
-import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.ResourceAccessException;
 
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.RawResult;
@@ -39,13 +39,22 @@ public class HttpExecutorClient implements ExecutorClient {
             RawResult result = client.post()
                     .uri("/internal/v1/query")
                     .body(new QueryCall(conn, sql, maxRows))
-                    .retrieve()
-                    .body(RawResult.class);
+                    .exchange((request, response) -> {
+                        if (response.getStatusCode().is2xxSuccessful()) {
+                            return response.bodyTo(RawResult.class);
+                        }
+                        // 把执行器的 {code,message} 原样带回去：用户需要看到"表不存在/语法错/超时"，
+                        // 而不是被统一糊成"执行器不可用"。
+                        throw ExecutorErrors.toBizException(
+                                response.getStatusCode().value(), new String(
+                                        response.getBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+                    });
             if (result == null) {
                 throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器返回空结果");
             }
             return result;
-        } catch (RestClientException e) {
+        } catch (ResourceAccessException e) {
+            // 只有连不上/读超时才是"执行器不可用"。
             throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器不可用，请稍后重试", e);
         }
     }

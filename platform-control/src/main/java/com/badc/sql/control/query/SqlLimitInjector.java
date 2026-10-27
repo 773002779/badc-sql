@@ -48,6 +48,8 @@ public class SqlLimitInjector {
         if (sql == null || sql.isBlank()) {
             return sql;
         }
+        // B5：先去掉行尾注释与空白，否则追加的 LIMIT 会被 `-- ...` / `# ...` 吞掉。
+        sql = trimTrailingIgnorable(sql);
         if (!isRowReturning(sql)) {
             return sql;
         }
@@ -179,5 +181,67 @@ public class SqlLimitInjector {
             return trimmed.substring(0, trimmed.length() - 1).stripTrailing();
         }
         return trimmed;
+    }
+    /**
+     * 去掉尾部的注释与空白，只保留代码部分。
+     *
+     * <p>MySQL 的行注释一直延续到行尾，若直接追加 {@code limit}，它会成为注释的一部分而失效——
+     * 语句照样全表执行，与"研发单次只能取 1001 行"的承诺相悖。
+     */
+    static String trimTrailingIgnorable(String sql) {
+        int n = sql.length();
+        // content[i]=true 表示该字符属于 SQL 正文（含字符串字面量内部），注释与空白不算。
+        boolean[] content = new boolean[n];
+        int i = 0;
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (c == '#' || (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-'
+                    && (i + 2 >= n || Character.isWhitespace(sql.charAt(i + 2))))) {
+                while (i < n && sql.charAt(i) != '\n') {
+                    i++;
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < n && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) {
+                    i++;
+                }
+                i = Math.min(i + 2, n);
+                continue;
+            }
+            if (c == '\'' || c == '"' || c == '`') {
+                char quote = c;
+                content[i] = true;
+                i++;
+                while (i < n) {
+                    char d = sql.charAt(i);
+                    content[i] = true;
+                    if (d == '\\' && quote != '`' && i + 1 < n) {
+                        i += 2;
+                        continue;
+                    }
+                    if (d == quote) {
+                        if (i + 1 < n && sql.charAt(i + 1) == quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            content[i] = true;
+            i++;
+        }
+        int end = -1;
+        for (int k = 0; k < n; k++) {
+            if (content[k] && !Character.isWhitespace(sql.charAt(k))) {
+                end = k;
+            }
+        }
+        return end < 0 ? "" : sql.substring(0, end + 1);
     }
 }

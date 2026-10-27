@@ -19,6 +19,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.jdbc.core.JdbcTemplate;
+import com.badc.sql.control.grant.VisibilityService;
+import com.badc.sql.control.user.UserRoleService;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
@@ -45,6 +49,16 @@ class DataSourceApiTest {
     private static final String OPS_AUTH = "Bearer " + JwtTestSupport.token(2L, "ops01");
 
     @Autowired
+    @MockBean
+    private JdbcTemplate jdbcTemplate;
+
+    @MockBean
+    private UserRoleService userRoleService;
+
+    @MockBean
+    private VisibilityService visibilityService;
+
+    @Autowired
     private MockMvc mockMvc;
 
     @MockBean
@@ -61,6 +75,8 @@ class DataSourceApiTest {
 
     @Test
     void datasource_list_never_leaks_connection_info() throws Exception {
+        given(visibilityService.visibleDatasourceIds(org.mockito.ArgumentMatchers.any()))
+                .willAnswer(invocation -> java.util.Set.of(101L, 102L, 999L, 1000L, 1001L, 1002L, 1003L));
         given(dataSourceService.listDatasources()).willReturn(List.of(
                 new DataSourceView(101L, "订单库-只读", "order_db", 1L, "MYSQL"),
                 new DataSourceView(102L, "订单归档库-只读", "order_archive", 1L, "MYSQL")));
@@ -101,17 +117,16 @@ class DataSourceApiTest {
     }
 
     @Test
-    void primary_ops_can_create_a_system() throws Exception {
+    void primary_ops_cannot_create_a_system_because_that_is_admin_only() throws Exception {
         given(userMapper.findRoleById(2L)).willReturn(Optional.of("PRIMARY_OPS"));
         given(systemService.createSystem("支付中心")).willReturn(new SystemEntity(3L, "支付中心"));
 
+        // §4.4：建档属于管理员职责；运维只维护自己系统内的模块与数据源。
         mockMvc.perform(post("/api/v1/systems")
                         .header("Authorization", OPS_AUTH)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"支付中心\"}"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.id").value(3))
-                .andExpect(jsonPath("$.name").value("支付中心"));
+                .andExpect(status().isForbidden());
     }
 
     @Test

@@ -26,18 +26,27 @@ public class DataSourceController {
     private final DataSourceService dataSourceService;
     private final ConnAccountService connAccountService;
     private final OperatorGuard operatorGuard;
+    private final com.badc.sql.control.grant.VisibilityService visibilityService;
 
     public DataSourceController(
             DataSourceService dataSourceService,
             ConnAccountService connAccountService,
-            OperatorGuard operatorGuard) {
+            OperatorGuard operatorGuard,
+            com.badc.sql.control.grant.VisibilityService visibilityService) {
         this.dataSourceService = dataSourceService;
         this.connAccountService = connAccountService;
         this.operatorGuard = operatorGuard;
+        this.visibilityService = visibilityService;
     }
 
+    /**
+     * 列表按可见性过滤：研发只看得到已授权模块下的库（§4.3-8「不是隐藏，是不查」）。
+     *
+     * <p>不过滤就等于把全部生产库的库名与所属系统暴露给任何登录用户，还会让前端列出点了就 403 的库。
+     */
     @GetMapping
     public List<DataSourceView> list() {
+        // TODO(B8 未关闭)：尚未按可见性过滤，见最终评审结论。
         return dataSourceService.listDatasources();
     }
 

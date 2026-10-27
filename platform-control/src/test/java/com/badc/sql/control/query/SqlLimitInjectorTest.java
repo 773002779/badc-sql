@@ -95,4 +95,27 @@ class SqlLimitInjectorTest {
         String sql = "show tables";
         assertThat(injector.apply(sql)).isEqualTo(sql);
     }
+    // B5：行尾注释会把追加的 LIMIT 吞掉（MySQL 里 `-- ...` 与 `# ...` 一直到行尾都是注释）。
+    @Test
+    void trailing_line_comment_does_not_swallow_the_injected_limit() {
+        String bounded = injector.apply("select * from t_order -- 备注");
+
+        assertThat(bounded).startsWith("select * from t_order");
+        assertThat(bounded.replace(" ", "").toLowerCase()).contains("limit1001");
+        assertThat(bounded).doesNotContain("-- 备注 limit 1001");
+    }
+
+    @Test
+    void trailing_hash_comment_does_not_swallow_the_injected_limit() {
+        String bounded = injector.apply("select * from t_order # 备注");
+
+        assertThat(bounded.replace(" ", "").toLowerCase()).contains("limit1001");
+    }
+
+    @Test
+    void trailing_comment_after_a_semicolon_is_handled_too() {
+        String bounded = injector.apply("select * from t_order; -- 结尾说明");
+
+        assertThat(bounded.replace(" ", "").toLowerCase()).contains("limit1001");
+    }
 }

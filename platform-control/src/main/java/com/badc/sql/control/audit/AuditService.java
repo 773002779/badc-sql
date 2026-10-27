@@ -76,7 +76,8 @@ public class AuditService {
                     prevHash = (String) head.get(0).get("hash");
                 }
                 long seq = prevSeq + 1;
-                String hash = hash(prevSeq, prevHash, command.eventType(), command.operatorId(), canonical);
+                String hash = hash(prevSeq, prevHash, command.eventType(), command.operatorId(),
+                        command.execIdentity(), command.datasourceId(), command.action(), command.objectId(), canonical);
                 try {
                     jdbc.update(INSERT_SQL,
                             seq,
@@ -120,6 +121,10 @@ public class AuditService {
                     storedPrev,
                     (String) row.get("event_type"),
                     row.get("operator_id") == null ? null : ((Number) row.get("operator_id")).longValue(),
+                    (String) row.get("exec_identity"),
+                    row.get("datasource_id") == null ? null : ((Number) row.get("datasource_id")).longValue(),
+                    (String) row.get("action"),
+                    (String) row.get("object_id"),
                     (String) row.get("payload_json"));
             if (!recomputed.equals(storedHash)) {
                 return new VerifyResult(false, seq);
@@ -134,8 +139,12 @@ public class AuditService {
     public record VerifyResult(boolean valid, Long brokenAtSeq) {
     }
 
-    private static String hash(long prevSeq, String prevHash, String eventType, Long operatorId, String canonicalPayload) {
-        String material = prevSeq + "|" + prevHash + "|" + eventType + "|" + operatorId + "|" + canonicalPayload;
+    private static String hash(long prevSeq, String prevHash, String eventType, Long operatorId,
+                               String execIdentity, Long datasourceId, String action, String objectId,
+                               String canonicalPayload) {
+        String material = prevSeq + "|" + prevHash + "|" + eventType + "|" + operatorId
+                + "|" + execIdentity + "|" + datasourceId + "|" + action + "|" + objectId
+                + "|" + canonicalPayload;
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(material.getBytes(StandardCharsets.UTF_8)));
