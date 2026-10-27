@@ -4,6 +4,7 @@ import org.springframework.stereotype.Component;
 
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.ValidationResult;
+import com.badc.sql.common.sql.SqlText;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -65,65 +66,12 @@ public class MySqlDialect {
     }
 
     /**
-     * 把字符串字面量、反引号标识符、以及 {@code --} / {@code #} / {@code /* *}{@code /} 注释替换成空格，
-     * 只留下真正的代码文本。保留换行以尽量维持可读性（也避免把两行拼成一个词）。
+     * 剥离注释与字符串字面量。
+     *
+     * <p>实现在 {@link SqlText}：方言校验（"是否用了 CTE"）与 LIMIT 注入（"是否已有顶层 LIMIT"）
+     * 需要完全一致的剥离语义，两份实现迟早会分叉。
      */
     static String stripLiteralsAndComments(String sql) {
-        StringBuilder out = new StringBuilder(sql.length());
-        int i = 0;
-        int n = sql.length();
-        while (i < n) {
-            char c = sql.charAt(i);
-
-            // 行注释：-- 后必须跟空白（MySQL 规则），或 # 开头
-            if (c == '#' || (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-'
-                    && (i + 2 >= n || Character.isWhitespace(sql.charAt(i + 2))))) {
-                while (i < n && sql.charAt(i) != '\n') {
-                    i++;
-                }
-                out.append(' ');
-                continue;
-            }
-
-            // 块注释
-            if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
-                i += 2;
-                while (i + 1 < n && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) {
-                    i++;
-                }
-                i = Math.min(i + 2, n);
-                out.append(' ');
-                continue;
-            }
-
-            // 字符串字面量与反引号标识符：整体跳过，内容不参与关键字匹配
-            if (c == '\'' || c == '"' || c == '`') {
-                char quote = c;
-                i++;
-                while (i < n) {
-                    char d = sql.charAt(i);
-                    if (d == '\\' && quote != '`' && i + 1 < n) {
-                        i += 2;
-                        continue;
-                    }
-                    if (d == quote) {
-                        // '' 或 "" 是转义的双写，不是结束
-                        if (i + 1 < n && sql.charAt(i + 1) == quote) {
-                            i += 2;
-                            continue;
-                        }
-                        i++;
-                        break;
-                    }
-                    i++;
-                }
-                out.append(' ');
-                continue;
-            }
-
-            out.append(c);
-            i++;
-        }
-        return out.toString();
+        return SqlText.stripLiteralsAndComments(sql);
     }
 }

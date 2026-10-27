@@ -48,7 +48,7 @@ class MigrationIT extends AbstractMySqlIT {
         DatabasePopulatorUtils.execute(populator, jdbc.getDataSource());
 
         assertThat(jdbc.queryForList("select login_name from sys_user order by id", String.class))
-                .containsExactly("dev01", "ops01");
+                .containsExactly("dev01", "ops01", "admin01");
         assertThat(jdbc.queryForObject(
                 "select role from sys_user where login_name = 'dev01'", String.class))
                 .isEqualTo("DEVELOPER");

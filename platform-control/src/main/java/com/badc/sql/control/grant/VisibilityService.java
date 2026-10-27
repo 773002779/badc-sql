@@ -1,7 +1,6 @@
 package com.badc.sql.control.grant;
 
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Set;
 
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -9,6 +8,7 @@ import org.springframework.stereotype.Service;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.user.UserRoleService;
 
 /**
  * 数据源可见性判定。
@@ -30,7 +30,6 @@ import com.badc.sql.common.error.ErrorCode;
 @Service
 public class VisibilityService {
 
-    private static final String ROLE_SQL = "select role from sys_user where id = ?";
 
     private static final String DEV_DATASOURCES_SQL = """
             select ds.id
@@ -63,9 +62,11 @@ public class VisibilityService {
     private static final String DATASOURCE_EXISTS_SQL = "select count(*) from datasource where id = ?";
 
     private final JdbcTemplate jdbc;
+    private final UserRoleService userRoleService;
 
-    public VisibilityService(JdbcTemplate jdbc) {
+    public VisibilityService(JdbcTemplate jdbc, UserRoleService userRoleService) {
         this.jdbc = jdbc;
+        this.userRoleService = userRoleService;
     }
 
     /** 该用户可见的数据源 ID 集合（可能为空，不为 null）。 */
@@ -116,11 +117,8 @@ public class VisibilityService {
     }
 
     private String roleOf(Long userId) {
-        if (userId == null) {
-            return null;
-        }
-        List<String> roles = jdbc.queryForList(ROLE_SQL, String.class, userId);
-        return roles.isEmpty() ? null : roles.get(0);
+        // 角色查询统一走 UserRoleService：查询编排与可见性判定必须看到同一个角色来源。
+        return userRoleService.roleOf(userId);
     }
 
     private Set<Long> ids(String sql, Object... args) {

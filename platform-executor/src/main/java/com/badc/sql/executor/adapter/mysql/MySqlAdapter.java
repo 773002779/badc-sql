@@ -92,7 +92,7 @@ public class MySqlAdapter implements DataSourceAdapter {
         return DriverManager.getConnection(url(conn), conn.username(), conn.password());
     }
 
-    static String url(ConnConfig conn) {
+    public static String url(ConnConfig conn) {
         StringBuilder url = new StringBuilder("jdbc:mysql://")
                 .append(conn.host()).append(':').append(conn.port()).append('/');
         if (conn.dbName() != null && !conn.dbName().isBlank()) {

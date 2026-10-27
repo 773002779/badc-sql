@@ -8,10 +8,12 @@ import org.springframework.web.bind.annotation.RestController;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.executor.adapter.DataSourceAdapter;
+import com.badc.sql.executor.exec.QueryRunner;
 
 /**
  * 执行器内部接口：只有控制面调用，不经公网暴露。
@@ -23,9 +25,22 @@ import com.badc.sql.executor.adapter.DataSourceAdapter;
 public class ExecutorController {
 
     private final DataSourceAdapter adapter;
+    private final QueryRunner queryRunner;
 
-    public ExecutorController(DataSourceAdapter adapter) {
+    public ExecutorController(DataSourceAdapter adapter, QueryRunner queryRunner) {
         this.adapter = adapter;
+        this.queryRunner = queryRunner;
+    }
+
+    /**
+     * 执行只读查询。行数上限由控制面按角色决定（研发固定 1001），执行器只负责不越界。
+     */
+    @PostMapping("/query")
+    public RawResult query(@RequestBody QueryCall request) {
+        if (request.conn() == null) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT, "缺少连接配置");
+        }
+        return queryRunner.run(request.conn(), request.sql(), request.maxRows());
     }
 
     @PostMapping("/probe")
@@ -47,5 +62,9 @@ public class ExecutorController {
 
     /** 校验入参。{@code dbVersion} 为空表示版本未知，此时不做版本判定。 */
     public record ValidateRequest(String sql, DbVersion dbVersion) {
+    }
+
+    /** 查询入参。{@code maxRows} 由控制面按角色决定。 */
+    public record QueryCall(ConnConfig conn, String sql, int maxRows) {
     }
 }
