@@ -39,18 +39,24 @@ public class QueryService {
     private final ConnAccountService connAccountService;
     private final SqlLimitInjector limitInjector;
     private final ExecutorClient executorClient;
+    private final ResultCacheService resultCacheService;
+    private final QueryHistoryService queryHistoryService;
 
     public QueryService(
             VisibilityService visibilityService,
             UserRoleService userRoleService,
             ConnAccountService connAccountService,
             SqlLimitInjector limitInjector,
-            ExecutorClient executorClient) {
+            ExecutorClient executorClient,
+            ResultCacheService resultCacheService,
+            QueryHistoryService queryHistoryService) {
         this.visibilityService = visibilityService;
         this.userRoleService = userRoleService;
         this.connAccountService = connAccountService;
         this.limitInjector = limitInjector;
         this.executorClient = executorClient;
+        this.resultCacheService = resultCacheService;
+        this.queryHistoryService = queryHistoryService;
     }
 
     /**
@@ -79,8 +85,14 @@ public class QueryService {
         ConnConfig conn = connAccountService.readonlyConnConfig(datasourceId);
         RawResult raw = executorClient.query(conn, boundedSql, maxRows);
 
+        String resultId = UUID.randomUUID().toString();
+        // 5) 结果短期缓存（30 分钟 / 20 条），供后续导出引用。
+        resultCacheService.put(resultId, raw);
+        // 6) 历史：写失败不影响本次查询返回。
+        queryHistoryService.record(userId, datasourceId, boundedSql, raw.rows().size(), raw.elapsedMs(), "SUCCESS");
+
         return new QueryResult(
-                UUID.randomUUID().toString(),
+                resultId,
                 raw.columns(),
                 raw.rows(),
                 raw.truncated(),

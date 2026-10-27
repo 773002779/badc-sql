@@ -50,6 +50,7 @@ class QueryControllerIT extends AbstractMySqlIT {
 
     private static final String QUERY = "/api/v1/query";
     private static final String DEV_TOKEN = JwtTestSupport.devToken(1L);
+    private static final String OPS_TOKEN = JwtTestSupport.token(2L, "ops01");
 
     @Autowired
     private TestRestTemplate rest;
@@ -140,6 +141,47 @@ class QueryControllerIT extends AbstractMySqlIT {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).doesNotContain("readonly-pass").doesNotContain("readonly_user");
+    }
+
+    @Test
+    void a_successful_query_is_recorded_in_the_callers_history() throws Exception {
+        post(DEV_TOKEN, """
+                {"datasourceId":101,"sql":"select * from t_order"}
+                """);
+
+        JsonNode history = getHistory(DEV_TOKEN);
+
+        assertThat(history.path("total").asLong()).isGreaterThanOrEqualTo(1);
+        JsonNode first = history.path("items").get(0);
+        assertThat(first.path("datasource_id").asLong()).isEqualTo(101L);
+        assertThat(first.path("sql_text").asText()).contains("limit 1001");
+        assertThat(first.path("status").asText()).isEqualTo("SUCCESS");
+    }
+
+    @Test
+    void history_is_scoped_so_an_operator_cannot_see_a_developers_queries() throws Exception {
+        post(DEV_TOKEN, """
+                {"datasourceId":101,"sql":"select 1"}
+                """);
+
+        JsonNode opsHistory = getHistory(OPS_TOKEN);
+
+        assertThat(opsHistory.path("total").asLong()).isZero();
+    }
+
+    @Test
+    void history_requires_authentication() {
+        assertThat(rest.getForEntity("/api/v1/history", String.class).getStatusCode())
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    private JsonNode getHistory(String token) throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        ResponseEntity<String> response = rest.exchange(
+                "/api/v1/history", HttpMethod.GET, new HttpEntity<>(headers), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody());
     }
 
     private ResponseEntity<String> post(String token, String body) {
