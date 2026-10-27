@@ -34,6 +34,13 @@ public class DataSourceService {
         return dataSourceMapper.findAll().stream().map(DataSourceService::toView).toList();
     }
 
+    /** 单个数据源的安全视图；不存在时 404。可见性由调用方（controller）先行判定。 */
+    public DataSourceView viewOf(long id) {
+        return dataSourceMapper.findById(id)
+                .map(DataSourceService::toView)
+                .orElseThrow(() -> OrgRules.notFound("数据源", id));
+    }
+
     public DataSourceView createDataSource(NewDataSource request) {
         if (request == null || request.systemId() == null) {
             throw new BizException(ErrorCode.INVALID_ARGUMENT, "所属系统不能为空");

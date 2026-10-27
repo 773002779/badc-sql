@@ -27,6 +27,7 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import com.badc.sql.control.grant.VisibilityService;
+import com.badc.sql.control.query.DatasourceCapabilityService;
 import com.badc.sql.control.security.JwtService;
 import com.badc.sql.control.security.SecurityConfig;
 import com.badc.sql.control.support.JwtTestSupport;
@@ -71,6 +72,10 @@ class DataSourceApiTest {
 
     @MockBean
     private ConnAccountService connAccountService;
+
+    /** 详情接口依赖能力探测；本类只测 Web 层与守卫，能力由 {@code QueryControllerIT} 端到端覆盖。 */
+    @MockBean
+    private DatasourceCapabilityService capabilityService;
 
     @MockBean
     private UserMapper userMapper;

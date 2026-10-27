@@ -1,5 +1,6 @@
 package com.badc.sql.control.query;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -8,8 +9,11 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.ResourceAccessException;
 
+import com.badc.sql.common.DbVersion;
+import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 
@@ -18,9 +22,15 @@ import com.badc.sql.common.error.ErrorCode;
  *
  * <p>超时设置：连接 2s（执行器在同机房，连不上就是真不可用），读 70s（要大于执行器的 60s 语句超时，
  * 否则控制面先放弃、执行器还在跑）。
+ *
+ * <p>三个内部调用（query / probe / validate）共用同一套错误还原：非 2xx 一律交给
+ * {@link ExecutorErrors} 把执行器的 {@code {code,message}} 还原成 {@link BizException}，
+ * 连不上才是"执行器不可用"。各写一套的结果是同一类故障在不同入口给出不同提示，用户无从判断。
  */
 @Component
 public class HttpExecutorClient implements ExecutorClient {
+
+    private static final String UNAVAILABLE = "执行器不可用，请稍后重试";
 
     private final RestClient client;
 
@@ -35,31 +45,63 @@ public class HttpExecutorClient implements ExecutorClient {
 
     @Override
     public RawResult query(ConnConfig conn, String sql, int maxRows) {
+        return post("/internal/v1/query", new QueryCall(conn, sql, maxRows), RawResult.class,
+                "执行器返回空结果");
+    }
+
+    @Override
+    public Capability probe(ConnConfig conn, ConnConfig onlineDdlOrNull) {
+        return post("/internal/v1/probe", new ProbeCall(conn, onlineDdlOrNull), Capability.class,
+                "执行器返回空的能力探测结果");
+    }
+
+    @Override
+    public ValidationResult validate(ConnConfig conn, String sql, DbVersion version) {
+        // 连接参数不随校验请求下发：判定只依赖版本，下发凭证是多余的暴露面。
+        return post("/internal/v1/validate", new ValidateCall(sql, version), ValidationResult.class,
+                "执行器返回空的校验结果");
+    }
+
+    /**
+     * 发一个内部调用并把结果映射成 {@code type}。
+     *
+     * @param emptyResultMessage 执行器 2xx 却没有响应体时的错误消息
+     */
+    private <T> T post(String uri, Object body, Class<T> type, String emptyResultMessage) {
+        T result;
         try {
-            RawResult result = client.post()
-                    .uri("/internal/v1/query")
-                    .body(new QueryCall(conn, sql, maxRows))
-                    .exchange((request, response) -> {
+            result = client.post()
+                    .uri(uri)
+                    .body(body)
+                    .<T>exchange((request, response) -> {
                         if (response.getStatusCode().is2xxSuccessful()) {
-                            return response.bodyTo(RawResult.class);
+                            return response.bodyTo(type);
                         }
                         // 把执行器的 {code,message} 原样带回去：用户需要看到"表不存在/语法错/超时"，
                         // 而不是被统一糊成"执行器不可用"。
                         throw ExecutorErrors.toBizException(
-                                response.getStatusCode().value(), new String(
-                                        response.getBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+                                response.getStatusCode().value(),
+                                new String(response.getBody().readAllBytes(), StandardCharsets.UTF_8));
                     });
-            if (result == null) {
-                throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器返回空结果");
-            }
-            return result;
         } catch (ResourceAccessException e) {
             // 只有连不上/读超时才是"执行器不可用"。
-            throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器不可用，请稍后重试", e);
+            throw new BizException(ErrorCode.INTERNAL_ERROR, UNAVAILABLE, e);
         }
+        if (result == null) {
+            throw new BizException(ErrorCode.INTERNAL_ERROR, emptyResultMessage);
+        }
+        return result;
     }
 
     /** 执行器的查询入参。 */
     public record QueryCall(ConnConfig conn, String sql, int maxRows) {
+    }
+
+    /** 执行器的探测入参；{@code onlineDdlConn} 为空表示该数据源未配置在线 DDL 账号。 */
+    public record ProbeCall(ConnConfig conn, ConnConfig onlineDdlConn) {
+    }
+
+    /** 执行器的校验入参；{@code dbVersion} 为空表示版本未知，执行器不做版本判定。 */
+    public record ValidateCall(String sql, DbVersion dbVersion) {
     }
 }

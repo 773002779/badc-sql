@@ -15,7 +15,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.badc.sql.common.dto.Capability;
 import com.badc.sql.control.grant.VisibilityService;
+import com.badc.sql.control.query.DatasourceCapabilityService;
 import com.badc.sql.control.security.CurrentUser;
 
 /**
@@ -33,16 +35,19 @@ public class DataSourceController {
     private final ConnAccountService connAccountService;
     private final OperatorGuard operatorGuard;
     private final VisibilityService visibilityService;
+    private final DatasourceCapabilityService capabilityService;
 
     public DataSourceController(
             DataSourceService dataSourceService,
             ConnAccountService connAccountService,
             OperatorGuard operatorGuard,
-            VisibilityService visibilityService) {
+            VisibilityService visibilityService,
+            DatasourceCapabilityService capabilityService) {
         this.dataSourceService = dataSourceService;
         this.connAccountService = connAccountService;
         this.operatorGuard = operatorGuard;
         this.visibilityService = visibilityService;
+        this.capabilityService = capabilityService;
     }
 
     /**
@@ -59,6 +64,25 @@ public class DataSourceController {
         return dataSourceService.listDatasources().stream()
                 .filter(view -> visible.contains(view.id()))
                 .toList();
+    }
+
+    /**
+     * 单个数据源的详情，附带能力探测结果（版本、{@code EXPLAIN ANALYZE} / INSTANT DDL 支持等）。
+     *
+     * <p>详情是列表之外的第二条读路径，<b>必须同样按可见性收敛</b>：否则知道 ID 就能绕过列表过滤，
+     * 把未授权库的元数据读出来；403（存在但无权）与 404（不存在）的语义也与查询链路保持一致。
+     *
+     * <p>{@code capabilities} 可能是 {@code null}（探测失败 / 未配置只读账号）：详情页要能照常打开，
+     * 只是不展示依赖版本的功能入口。
+     */
+    @GetMapping("/{id}")
+    public DataSourceDetail detail(@PathVariable long id) {
+        visibilityService.assertVisible(CurrentUser.id(), id);
+        DataSourceView view = dataSourceService.viewOf(id);
+        // 探测失败时返回 null（能力未知），详情照常可见。
+        Capability capabilities = capabilityService.capabilityOf(id);
+        return new DataSourceDetail(
+                view.id(), view.name(), view.dbName(), view.systemId(), view.type(), capabilities);
     }
 
     @PostMapping
