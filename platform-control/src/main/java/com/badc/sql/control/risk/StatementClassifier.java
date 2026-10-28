@@ -108,9 +108,8 @@ public final class StatementClassifier {
 
         EnumSet<DdlAction> actions = ddlActions(tokens);
         DdlAction ddlAction = DdlAction.mostSevere(actions);
-        // 结构性判定看整组动作，而不是只看"最严重的那个"：声明顺序里 ALTER_MODIFY 排在改字符集与
-        // drop partition 之前，若只看返回值，`modify a int, convert to character set utf8mb4` 会把恒 L3
-        // 的改字符集漏掉。
+        // 重排后声明顺序即严重度，ddlAction() 已经会返回结构性动作；这里仍按整组计算是第二道保险：
+        // 将来若有人往非结构性区间插入新的 DDL 动作，也不会让已经识别出的结构性动作被掩掉。
         boolean structuralDamage = actions.stream().anyMatch(DdlAction::isStructuralDamage);
         String firstKeyword = firstKeyword(tokens);
 
@@ -166,10 +165,15 @@ public final class StatementClassifier {
     /**
      * {@code explain analyze <dml>} 会真的执行 DML，算写；{@code explain <dml>}（不带 analyze）只出计划，不算。
      *
+     * <p>入参是<b>原文大小写</b>的骨架，所以这里先整体小写再比关键字：SQL 关键字大小写等价，
+     * {@code EXPLAIN ANALYZE DELETE ...} 与 {@code explain analyze delete ...} 必须同判——漏掉大小写
+     * 会让大写写语句免审批，方向正好错。
+     *
      * @param code 已剥离注释与字面量的文本，首词必然是 {@code explain}（调用方已确认）
      */
     private static boolean isWriteUnderExplain(String code) {
-        String rest = code.stripLeading();
+        String lower = code.toLowerCase(Locale.ROOT);
+        String rest = lower.stripLeading();
         int endOfExplain = 0;
         while (endOfExplain < rest.length() && Character.isLetter(rest.charAt(endOfExplain))) {
             endOfExplain++;
@@ -178,7 +182,7 @@ public final class StatementClassifier {
         if (!startsWithWord(after, "analyze")) {
             return false; // explain <dml>：只出计划，不执行
         }
-        String verb = SqlText.firstTopLevelVerb(code);
+        String verb = SqlText.firstTopLevelVerb(lower);
         return verb == null || DML_VERBS.contains(verb);
     }
 

@@ -437,6 +437,24 @@ class StatementClassifierTest {
         assertThat(classifier.classify("explain delete from t").writeStatement()).isFalse();
     }
 
+    /** SQL 关键字大小写等价：全大写/混合大小写必须与全小写同判，否则大写一句就能免审批。 */
+    @Test
+    void explain_analyze_is_case_insensitive() {
+        assertThat(classifier.classify("EXPLAIN ANALYZE DELETE FROM t").writeStatement()).isTrue();
+        assertThat(classifier.classify("Explain Analyze Delete From t").writeStatement()).isTrue();
+        assertThat(classifier.classify("EXPLAIN ANALYZE WITH cte AS (SELECT 1) DELETE FROM t").writeStatement())
+                .isTrue();
+        assertThat(classifier.classify("EXPLAIN ANALYZE SELECT * FROM t").writeStatement()).isFalse();
+        assertThat(classifier.classify("EXPLAIN DELETE FROM t").writeStatement()).isFalse();
+    }
+
+    // ---- 跨库：CTE 里的 update 也是表位置（防止有人按 M2 顺手把 update 收紧掉） ----
+
+    @Test
+    void a_cte_update_of_a_cross_database_table_is_flagged() {
+        assertThat(classifier.classify("with cte as (select 1) update db2.t2 set a = 1").crossDatabase()).isTrue();
+    }
+
     // ---- M1：只读查询里的 DDL 词不能触发结构判定 ----
 
     @Test
