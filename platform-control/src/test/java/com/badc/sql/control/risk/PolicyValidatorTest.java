@@ -136,6 +136,31 @@ class PolicyValidatorTest {
                 "WRITE_WITHOUT_WHERE")).singleElement();
     }
 
+    /**
+     * {@code explain delete from t} 只出执行计划、不执行（FR-11 允许对写语句做 EXPLAIN）：分类器对它返回
+     * {@code writeStatement=false}，本校验器必须同判，否则一条分析命令会被误钉成 L3。
+     */
+    @Test
+    void an_explain_delete_is_not_a_write_without_where() {
+        assertThat(withCode(hits("explain delete from t_order"), "WRITE_WITHOUT_WHERE")).isEmpty();
+        assertThat(hits("explain delete from t_order"))
+                .noneMatch(hit -> hit.discipline() == Discipline.PIN_LEVEL);
+    }
+
+    /** {@code explain analyze <dml>} 在 MySQL 里会真的执行，所以仍然是"没有 where 的写操作"。 */
+    @Test
+    void an_explain_analyze_delete_is_a_write_without_where() {
+        assertThat(withCode(hits("explain analyze delete from t_order"), "WRITE_WITHOUT_WHERE"))
+                .singleElement()
+                .satisfies(hit -> assertThat(hit.level()).isEqualTo(RiskLevel.L3));
+    }
+
+    /** 同上：{@code explain update ...} 只出计划，也不算写。 */
+    @Test
+    void an_explain_update_is_not_a_write_without_where() {
+        assertThat(withCode(hits("explain update t_order set a = 1"), "WRITE_WITHOUT_WHERE")).isEmpty();
+    }
+
     // ------------------------------------------------------------------ PIN_LEVEL：七个结构性动作
 
     @ParameterizedTest(name = "{0} → {1}")
@@ -173,12 +198,16 @@ class PolicyValidatorTest {
 
     // ------------------------------------------------------------------ PIN_LEVEL：收窄（三条 brief 指定用例）
 
-    /** 有旧类型且是放宽：不算收窄，不得命中 ALTER_MODIFY_NARROWED。 */
+    /**
+     * 有旧类型且是放宽：不算收窄。断言用 {@code noneMatch(PIN_LEVEL)} 而不是"缺席某一条码"——后者只能查出
+     * 漏报，查不出多报（任何别的 PIN 命中都能溜过去）。
+     */
     @Test
     void widening_a_column_type_is_not_narrowing_when_the_old_type_is_known() {
         Map<String, Map<String, String>> old = Map.of("t", Map.of("c", "varchar(64)"));
-        assertThat(hits("alter table t modify column c varchar(255) not null", old))
-                .noneSatisfy(hit -> assertThat(hit.ruleCode()).isEqualTo("ALTER_MODIFY_NARROWED"));
+        List<RiskHit> hits = hits("alter table t modify column c varchar(255) not null", old);
+        assertThat(hits).noneMatch(hit -> hit.discipline() == Discipline.PIN_LEVEL);
+        assertThat(withCode(hits, "ALTER_MODIFY_NARROWED")).isEmpty();
     }
 
     /** 有旧类型且是收窄：命中 L3。 */
@@ -306,6 +335,49 @@ class PolicyValidatorTest {
         assertThat(withCode(hits("alter table t add column d int null", old), "ALTER_MODIFY_NARROWED")).isEmpty();
     }
 
+    // ------------------------------------------------------------------ PIN_LEVEL：modify 里改字符集
+
+    /**
+     * {@code modify ... character set} 与 {@code convert to charset} 是同一个操作（重建表 + 转码 + 锁表）：
+     * 同宽不算收窄、{@code ALTER_MODIFY} 又不是结构性动作，不补这一条就会让一次真实的重建拿到 0 条 PIN。
+     */
+    @Test
+    void modify_with_a_character_set_pins_convert_charset() {
+        assertThat(withCode(hits("alter table t modify c varchar(64) character set utf8mb4"), "ALTER_CONVERT_CHARSET"))
+                .singleElement()
+                .satisfies(hit -> {
+                    assertThat(hit.discipline()).isEqualTo(Discipline.PIN_LEVEL);
+                    assertThat(hit.level()).isEqualTo(RiskLevel.L3);
+                    assertThat(hit.message()).contains("character set").isNotEmpty();
+                });
+    }
+
+    /** {@code charset} 与 {@code collate} 两种写法同样算改字符集。 */
+    @Test
+    void modify_with_charset_or_collate_pins_convert_charset() {
+        assertThat(withCode(hits("alter table t modify c varchar(64) charset utf8mb4"), "ALTER_CONVERT_CHARSET"))
+                .singleElement();
+        assertThat(withCode(hits("alter table t modify c varchar(64) collate utf8mb4_bin"), "ALTER_CONVERT_CHARSET"))
+                .singleElement();
+    }
+
+    /** 不带字符集的 modify 不该误报改字符集。 */
+    @Test
+    void modify_without_a_character_set_is_not_reported_as_convert_charset() {
+        Map<String, Map<String, String>> old = Map.of("t", Map.of("c", "varchar(64)"));
+        assertThat(withCode(hits("alter table t modify c varchar(64) not null", old),
+                "ALTER_CONVERT_CHARSET")).isEmpty();
+    }
+
+    /** 字符串字面量里的 "character set" 不是改字符集（列注释常见这么写）。 */
+    @Test
+    void a_comment_mentioning_a_character_set_is_not_a_charset_change() {
+        List<RiskHit> hits = hits("alter table t modify c varchar(64) not null comment 'character set utf8mb4'",
+                Map.of("t", Map.of("c", "varchar(64)")));
+        assertThat(withCode(hits, "ALTER_CONVERT_CHARSET")).isEmpty();
+        assertThat(hits).noneMatch(hit -> hit.discipline() == Discipline.PIN_LEVEL);
+    }
+
     // ------------------------------------------------------------------ WARN
 
     @Test
@@ -383,37 +455,95 @@ class PolicyValidatorTest {
                 "LEADING_WILDCARD_LIKE")).isEmpty();
     }
 
+    /**
+     * 字符列与不带引号的数字比较：MySQL 会把整列转成数字，索引失效。查得到列类型才判，所以必须给快照。
+     */
     @Test
-    void comparing_a_column_with_a_quoted_number_warns_about_implicit_cast() {
-        assertThat(withCode(hits("select id from t_order where code = '123' limit 10"), "IMPLICIT_CAST"))
+    void comparing_a_character_column_with_an_unquoted_number_warns_about_implicit_cast() {
+        Map<String, Map<String, String>> old = Map.of("t", Map.of("code", "varchar(32)"));
+        assertThat(withCode(hits("select id from t where code = 123 limit 10", old), "IMPLICIT_CAST"))
                 .singleElement()
                 .satisfies(hit -> {
                     assertThat(hit.discipline()).isEqualTo(Discipline.WARN);
                     assertThat(hit.level()).isNull();
+                    assertThat(hit.message()).contains("varchar(32)");
                 });
     }
 
+    /** 数值列配数字是同类比较：完全正常的写法，不能报。 */
     @Test
-    void comparing_a_column_with_a_quoted_word_does_not_warn() {
-        assertThat(withCode(hits("select id from t_order where code = 'abc' limit 10"), "IMPLICIT_CAST")).isEmpty();
+    void comparing_a_numeric_column_with_an_unquoted_number_does_not_warn() {
+        Map<String, Map<String, String>> old = Map.of("t", Map.of("id", "bigint"));
+        assertThat(withCode(hits("select id from t where id = 123 limit 10", old), "IMPLICIT_CAST")).isEmpty();
     }
 
+    /** 数值列配带引号的纯数字：字面量会被转成数字，写法有歧义，提示但不阻断。 */
     @Test
-    void comparing_a_column_with_a_quoted_date_warns_about_implicit_cast() {
-        assertThat(withCode(hits("select id from t_order where created_at = '2026-01-01 00:00:00' limit 10"),
+    void comparing_a_numeric_column_with_a_quoted_number_warns() {
+        Map<String, Map<String, String>> old = Map.of("t", Map.of("id", "bigint"));
+        assertThat(withCode(hits("select id from t where id = '123' limit 10", old), "IMPLICIT_CAST"))
+                .singleElement();
+    }
+
+    /** 日期列配日期字面量是同类比较，不该命中（日期正则存在的意义）。 */
+    @Test
+    void comparing_a_datetime_column_with_a_date_literal_does_not_warn() {
+        Map<String, Map<String, String>> old = Map.of("t", Map.of("created_at", "datetime"));
+        assertThat(withCode(hits("select id from t where created_at = '2026-01-01' limit 10", old),
+                "IMPLICIT_CAST")).isEmpty();
+    }
+
+    /** 字符列配日期字面量：日期与字符混用，命中。 */
+    @Test
+    void comparing_a_character_column_with_a_date_literal_warns() {
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("day_text", "varchar(10)"));
+        assertThat(withCode(hits("select id from t_order where day_text = '2026-01-01' limit 10", old),
                 "IMPLICIT_CAST")).singleElement();
     }
 
+    /** 字符列配字符串是同类比较：不命中。 */
     @Test
-    void comparing_a_column_with_an_unquoted_number_does_not_warn() {
-        assertThat(withCode(hits("select id from t_order where code = 123 limit 10"), "IMPLICIT_CAST")).isEmpty();
+    void comparing_a_character_column_with_a_quoted_word_does_not_warn() {
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("code", "varchar(32)"));
+        assertThat(withCode(hits("select id from t_order where code = 'abc' limit 10", old), "IMPLICIT_CAST")).isEmpty();
+    }
+
+    /** 字符列配带引号的数字仍是字符串比较（索引可用）：不命中。 */
+    @Test
+    void comparing_a_character_column_with_a_quoted_number_does_not_warn() {
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("code", "varchar(32)"));
+        assertThat(withCode(hits("select id from t_order where code = '123' limit 10", old),
+                "IMPLICIT_CAST")).isEmpty();
+    }
+
+    /** 没有列类型就不猜：整型列的正常写法不能被误报成隐式转换。 */
+    @Test
+    void an_unknown_column_type_never_reports_an_implicit_cast() {
+        assertThat(withCode(hits("select id from t where code = 123 limit 10"), "IMPLICIT_CAST")).isEmpty();
+        assertThat(withCode(hits("select id from t where code = '123' limit 10"), "IMPLICIT_CAST")).isEmpty();
+    }
+
+    /** 快照里有别的列、但没有被比较的那一列：同样不猜。 */
+    @Test
+    void a_column_missing_from_the_snapshot_never_reports_an_implicit_cast() {
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("other", "varchar(32)"));
+        assertThat(withCode(hits("select id from t_order where code = 123 limit 10", old), "IMPLICIT_CAST")).isEmpty();
+    }
+
+    /** 反过来写（数字在左）也要判到。 */
+    @Test
+    void an_implicit_cast_is_detected_with_the_number_on_the_left() {
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("code", "varchar(32)"));
+        assertThat(withCode(hits("select id from t_order where 123 = code limit 10", old), "IMPLICIT_CAST"))
+                .singleElement();
     }
 
     /** 双字符比较运算符（{@code <>}/{@code !=}/{@code <=}/{@code >=}）同样是"列与字面量比较"。 */
-    @ParameterizedTest(name = "code {0} ''123''")
+    @ParameterizedTest(name = "id {0} ''123''")
     @CsvSource(value = {"<>", "!=", "<=", ">="})
     void every_comparison_operator_detects_the_implicit_cast(String operator) {
-        assertThat(withCode(hits("select id from t_order where code " + operator + " '123' limit 10"),
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("id", "bigint"));
+        assertThat(withCode(hits("select id from t_order where id " + operator + " '123' limit 10", old),
                 "IMPLICIT_CAST")).singleElement();
     }
 
@@ -435,8 +565,9 @@ class PolicyValidatorTest {
     /** 关键字比较一律先小写：大写 SQL 的 WARN 规则同样要命中，风格 INFO 则不应误报。 */
     @Test
     void warn_rules_match_keywords_case_insensitively() {
-        List<RiskHit> hits = hits("SELECT id FROM t_order WHERE code = '123' AND name LIKE '%x%' "
-                + "ORDER BY RAND() LIMIT 10");
+        Map<String, Map<String, String>> old = Map.of("t_order", Map.of("code", "varchar(32)"));
+        List<RiskHit> hits = hits("SELECT id FROM t_order WHERE code = 123 AND name LIKE '%x%' "
+                + "ORDER BY RAND() LIMIT 10", old);
         assertThat(hits).extracting(RiskHit::ruleCode)
                 .contains("IMPLICIT_CAST", "LEADING_WILDCARD_LIKE", "ORDER_BY_RAND");
         assertThat(withCode(hits, "KEYWORD_NOT_UPPERCASE")).isEmpty();
@@ -506,6 +637,26 @@ class PolicyValidatorTest {
     @Test
     void a_version_mismatch_hint_is_never_produced() {
         assertThat(withCode(hits("select id from t_order limit 10"), "VERSION_MISMATCH_HINT")).isEmpty();
+    }
+
+    /** 尾部分号只是一条语句的结束符，不是多语句拼接（单语句也能带分号提交）。 */
+    @Test
+    void a_trailing_semicolon_is_not_a_second_statement() {
+        List<RiskHit> hits = hits("update t_order set a = 1;");
+        assertThat(withCode(hits, "MULTI_STATEMENT")).isEmpty();
+        assertThat(hits).noneMatch(hit -> hit.discipline() == Discipline.BLOCK);
+    }
+
+    /**
+     * 调用方漏传分类时本类自己分类（兜底）：必须与传分类时同判，不能因为参数缺失就 fail-open 放掉结构性破坏。
+     */
+    @Test
+    void a_missing_classification_is_recomputed_instead_of_failing_open() {
+        assertThat(withCode(validator.validate("drop table t_order", null, null), "DROP_TABLE"))
+                .singleElement()
+                .satisfies(hit -> assertThat(hit.level()).isEqualTo(RiskLevel.L3));
+        assertThat(validator.validate(null, null, null)).isEmpty();
+        assertThat(validator.validate("   ", null, null)).isEmpty();
     }
 
     @Test

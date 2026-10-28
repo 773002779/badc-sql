@@ -57,15 +57,33 @@ import com.badc.sql.common.sql.SqlText;
  * </ul>
  * <p>两条路径都要有用例（{@code PolicyValidatorTest}），否则"前后对比"会静悄悄退化成"一律 L3"而无人察觉。
  *
- * <h2>近似规则</h2>
- * <p>{@code IMPLICIT_CAST} 拿不到列类型，只能按文本模式识别：<b>带引号的纯数字/日期字面量与标识符比较</b>
- * 即命中。{@code where code = '123'} 命中，{@code where code = 'abc'} 不命中——后者是字符串与字符串比较，
- * 没有可判定的隐式转换。
+ * <p><b>{@code modify ... character set}/{@code collate} 也是改字符集</b>：{@code alter table t modify c
+ * varchar(64) character set utf8mb4} 与 {@code convert to charset} 是同一个操作（重建表 + 转码 + 锁表），
+ * 不能因为它写在 {@code modify} 后面就只按"改列类型"处理——同宽不算收窄、{@code ALTER_MODIFY} 又不是结构性
+ * 动作，那样一次真实的重建会拿到 0 条 PIN。看到子句里有 {@code character set}/{@code charset}/{@code collate}
+ * 就补一条 {@code ALTER_CONVERT_CHARSET} 的 L3 命中。
+ *
+ * <h2>{@code IMPLICIT_CAST} 要列类型，查不到就不报</h2>
+ * <p>这条规则<b>不能靠纯文本判</b>：{@code where id = 123}（整型列）完全正常，{@code where code = 123}
+ * （字符列）才会让 MySQL 把整列转成数字、索引失效，而两者在文本上一模一样。所以只有从
+ * {@code oldColumnTypesOrNull} 里<b>查得到</b>被比较列的类型时才判定；查不到一律不报——不猜，避免满屏误报。
+ * <ul>
+ *   <li>字符列（{@code char}/{@code varchar}/{@code text} 系列）与<b>不带引号的数字</b>比较 → 命中（真会让索引失效）；</li>
+ *   <li>数值列与<b>带引号的纯数字</b>比较 → 命中（字面量会被转成数字，写法有歧义；仍可走索引，属提示）；</li>
+ *   <li>字符列与<b>带引号的日期字面量</b>比较 → 命中（日期字面量与字符列混用）；</li>
+ *   <li>同类比较（数值列配数字、字符列配字符串、日期/时间列配日期字面量）→ 不命中。</li>
+ * </ul>
+ * <p>表名优先取 {@link Classification#table()}（写语句与 DDL 都有）；{@code select} 没有这个字段时，退而取
+ * 顶层 {@code from} 之后的表名。取不到表名等同于"查不到列类型"，不报。
  *
  * <h2>判定来源与大小写</h2>
  * <p>"是不是写语句、动了哪张表、属于哪个 DDL 动作"一律读 {@link Classification}（任务 3），本类<b>不重新
  * 解析 DDL 动作</b>。所有关键字比较都先小写再比：SQL 关键字大小写等价，{@code DROP TABLE} 与 {@code drop table}
  * 必须同判（任务 3 曾因大写 {@code ANALYZE} 把写语句判成只读）。原文只用于取"列名 + 新类型"与取字面量内容。
+ *
+ * <p>{@code writeStatement()} 是"写语句无 where"的闸门：{@code explain delete from t} 只出执行计划、不执行
+ * （FR-11 允许对写语句做 EXPLAIN），分类器对它返回 {@code writeStatement=false}，本类必须同判，否则会把一条
+ * 分析命令误钉成 L3。
  *
  * <h2>已知局限</h2>
  * <ul>
@@ -76,6 +94,16 @@ import com.badc.sql.common.sql.SqlText;
  *       但快照与 SQL 的大小写不保证一致）。</li>
  *   <li>{@code SELECT_*} 与 {@code SELECT_WITHOUT_LIMIT} 只看语句自身的顶层查询（{@code with ... select} 也算），
  *       子查询里的 {@code select *} 不单独出码。</li>
+ *   <li>带符号性的收窄看不见：{@code bigint unsigned → bigint} 只比较基础类型名（{@code TypeSpec} 不留
+ *       {@code unsigned}/{@code zerofill}），因此不命中；{@code decimal(10,2) → decimal(10,1)} 只缩小数位不算
+ *       收窄（spec 字面只讲精度 p）。两条都留待终审。</li>
+ *   <li>{@code hasAggregate} 会看到子查询与 {@code where} 里的聚合函数，可能错误抑制
+ *       {@code SELECT_WITHOUT_LIMIT}（宁可少提示，不误报）。</li>
+ *   <li>{@code KEYWORD_NOT_UPPERCASE} 会把名为关键字族的标识符（{@code value}/{@code key}/{@code comment}/
+ *       {@code desc}）当成未大写的关键字——INFO 级，可接受。</li>
+ *   <li>{@code IMPLICIT_CAST} 只覆盖能确定性判定的三类组合；数值列配日期字面量、日期列配数字、数值列配非数字
+ *       字符串同样是真问题，带正负号的数字字面量（{@code code = -1}）也没判（符号是一个单独的 token），
+ *       本轮不做，留待终审。</li>
  * </ul>
  */
 public final class PolicyValidator {
@@ -128,6 +156,18 @@ public final class PolicyValidator {
     private static final Set<String> ORDER_CLAUSE_END = Set.of(
             "limit", "offset", "for", "union", "procedure", "into", "lock");
 
+    /** 字符型列族：与不带引号的数字比较时，MySQL 会把整列转成数字、索引失效。 */
+    private static final Set<String> CHARACTER_TYPES = Set.of(
+            "char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set");
+
+    /** 数值型列族：与带引号的纯数字比较时，字面量会被转成数字（写法有歧义，但仍可走索引）。 */
+    private static final Set<String> NUMERIC_TYPES = Set.of(
+            "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "decimal", "numeric", "dec",
+            "fixed", "float", "double", "real", "bit", "bool", "boolean");
+
+    /** 日期/时间型列族：与日期字面量比较属同类，不该命中。 */
+    private static final Set<String> TEMPORAL_TYPES = Set.of("date", "datetime", "timestamp", "time", "year");
+
     /** 用于风格提示（INFO）的关键字集合。刻意不收类型名：{@code date}/{@code text} 这类常被当列名。 */
     private static final Set<String> KEYWORDS = Set.of(
             "select", "from", "where", "group", "by", "order", "having", "limit", "offset",
@@ -175,8 +215,8 @@ public final class PolicyValidator {
         List<Tok> tokens = tokenize(original);
         structuralPins(classification, hits);
         writeWithoutWherePin(original, classification, hits);
-        narrowedColumnPin(classification, tokens, oldColumnTypesOrNull, hits);
-        warnings(original, classification, tokens, hits);
+        modifyColumnPins(classification, tokens, oldColumnTypesOrNull, hits);
+        warnings(original, classification, tokens, oldColumnTypesOrNull, hits);
         infos(original, tokens, hits);
         return List.copyOf(hits);
     }
@@ -223,7 +263,7 @@ public final class PolicyValidator {
             case DROP_PARTITION -> pin(hits, RULE_DROP_PARTITION,
                     "drop partition 属结构性破坏：整分区数据丢失，等级恒为 L3");
             default -> {
-                // ALTER_MODIFY 是否收窄要看旧类型（见 narrowedColumnPin），其余动作不是结构性破坏。
+                // ALTER_MODIFY 是否收窄/改字符集要看原文与旧类型（见 modifyColumnPins），其余动作不是结构性破坏。
                 // 兜底：将来往 DdlAction 里加了结构性动作却忘了在这里编码时，仍然钉 L3，不会静默放行。
                 if (action.isStructuralDamage()) {
                     pin(hits, action.name(), "识别到结构性破坏动作 " + action.name() + "：等级恒为 L3");
@@ -237,11 +277,19 @@ public final class PolicyValidator {
     /**
      * {@code update}/{@code delete} 没有顶层 {@code where} → 钉 L3，但不阻断（spec：不阻断，强制升 L3 + 二次确认）。
      *
+     * <p><b>先看 {@link Classification#writeStatement()}</b>：{@code explain <dml>}（不带 {@code analyze}）只出执行
+     * 计划、不执行，任务 3 的分类器对它返回 {@code false}（FR-11 允许对写语句做 EXPLAIN 分析）。这里必须同判，
+     * 否则一条分析命令会被误钉成"无 where 的写操作"。
+     *
      * <p>动词取自 {@link Classification#firstKeyword()}，{@code with}/{@code explain} 开头时改用
      * {@link SqlText#firstTopLevelVerb(String)}（与分类器、只读白名单共用同一判定）：{@code with ... delete}
-     * 的动词是 {@code delete}，只看首关键字会漏掉"没有 where 的 CTE 删除"。
+     * 与 {@code explain analyze delete} 的 {@code writeStatement()} 都是 {@code true}，动词也能正确剥出
+     * {@code delete}。
      */
     private static void writeWithoutWherePin(String sql, Classification c, List<RiskHit> hits) {
+        if (!c.writeStatement()) {
+            return;
+        }
         String verb = statementVerb(sql, c);
         if (verb == null || !WHERE_SENSITIVE_VERBS.contains(verb) || c.hasWhere()) {
             return;
@@ -264,18 +312,23 @@ public final class PolicyValidator {
         return first;
     }
 
-    // ------------------------------------------------------------------ PIN_LEVEL：类型收窄
+    // ------------------------------------------------------------------ PIN_LEVEL：改列定义（收窄 / 改字符集）
 
     /**
-     * 判 {@code modify}/{@code change} 是否把列类型收窄。
+     * {@code modify}/{@code change} 的两类钉级：类型收窄（{@code ALTER_MODIFY_NARROWED}）与改字符集
+     * （{@code ALTER_CONVERT_CHARSET}）。
      *
      * <p>只在 {@link Classification#ddlAction()} 是 {@link DdlAction#ALTER_MODIFY} 时进入：分类器已经确认这条
-     * alter 改了列定义，本方法只负责"和旧类型比一比"——不重新识别 DDL 动作。
+     * alter 改了列定义，本方法只负责"和旧类型比一比 / 看子句里有没有字符集"——不重新识别 DDL 动作。
      *
      * <p>旧类型缺失（参数为 {@code null}、快照里没有这张表、或没有这一列）时一律保守钉 L3 并在消息里说明
      * "无法判定是否收窄"；有旧类型时只有<b>证得出收窄</b>才命中，放宽/同宽不命中。
+     *
+     * <p>子句里带 {@code character set}/{@code charset}/{@code collate} 时额外钉 {@code ALTER_CONVERT_CHARSET}：
+     * {@code modify ... character set} 与 {@code convert to charset} 是同一个操作（重建表 + 转码 + 锁表），
+     * 同宽不算收窄、{@code ALTER_MODIFY} 又不是结构性动作，不补这一条就会让一次真实的重建拿到 0 条 PIN。
      */
-    private static void narrowedColumnPin(Classification c, List<Tok> tokens,
+    private static void modifyColumnPins(Classification c, List<Tok> tokens,
             Map<String, Map<String, String>> oldColumnTypesOrNull, List<RiskHit> hits) {
         if (c.ddlAction() != DdlAction.ALTER_MODIFY) {
             return;
@@ -288,6 +341,11 @@ public final class PolicyValidator {
             return;
         }
         for (ColumnChange change : changes) {
+            if (change.changesCharset()) {
+                pin(hits, RULE_ALTER_CONVERT_CHARSET, change.keyword() + " 列 " + change.column()
+                        + "：子句带 character set/collate，会按新字符集重建表并转码"
+                        + "（与 convert to charset 同一操作），等级恒为 L3");
+            }
             String oldType = oldTypeOf(oldColumnTypesOrNull, c.table(), change.column());
             if (oldType == null) {
                 pin(hits, RULE_ALTER_MODIFY_NARROWED, change.keyword() + " 列 " + change.column()
@@ -302,7 +360,8 @@ public final class PolicyValidator {
     }
 
     /**
-     * 从原文取 {@code modify|change [column] 列名 类型}（{@code change} 还有改名的第二个名字）。
+     * 从原文取 {@code modify|change [column] 列名 类型}（{@code change} 还有改名的第二个名字），并记下子句里
+     * 有没有改字符集。
      *
      * <p>只认顶层（括号深度 0）的关键字，并且跳过字符串/注释/反引号里的同名内容：这些都是 token 化时已经
      * 处理过的。取不到完整列定义（没有名字或没有类型）的子句会被跳过。
@@ -340,9 +399,44 @@ public final class PolicyValidator {
             if (type == null) {
                 continue;
             }
-            changes.add(new ColumnChange(modify ? "modify" : "change", column.text(), type));
+            boolean changesCharset = mentionsCharset(tokens, j, endOfClause(tokens, j));
+            changes.add(new ColumnChange(modify ? "modify" : "change", column.text(), type, changesCharset));
         }
         return changes;
+    }
+
+    /** 子句结束位置：下一个顶层逗号（下一个子句开始），没有则到语句结尾。 */
+    private static int endOfClause(List<Tok> tokens, int from) {
+        for (int i = from; i < tokens.size(); i++) {
+            Tok token = tokens.get(i);
+            if (token.depth() == 0 && token.isPunct(",")) {
+                return i;
+            }
+        }
+        return tokens.size();
+    }
+
+    /**
+     * 子句里是否改字符集：{@code character set}、{@code charset}、{@code collate}。
+     *
+     * <p>只看 {@code [from, end)} 区间里的代码 token，字符串字面量（如 {@code comment 'character set'}）已是
+     * {@code LITERAL}，不会被误认。
+     */
+    private static boolean mentionsCharset(List<Tok> tokens, int from, int end) {
+        for (int i = from; i < end; i++) {
+            Tok token = tokens.get(i);
+            if (token.kind() != Kind.WORD) {
+                continue;
+            }
+            String lower = token.lower();
+            if ("charset".equals(lower) || "collate".equals(lower)) {
+                return true;
+            }
+            if ("character".equals(lower) && isWordAt(tokens, i + 1, "set")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 读一个列类型：{@code varchar(64)}、{@code decimal(10,2)}、{@code bigint} 都能取到。 */
@@ -497,8 +591,12 @@ public final class PolicyValidator {
     /**
      * 提示类命中。{@code SELECT_*} 与"没有 limit"只看语句自身的顶层查询（CTE 的 {@code select} 也算）；
      * {@code like} / 隐式转换 / {@code order by rand()} 则是纯文本特征，写语句里同样要提示。
+     *
+     * <p>{@code IMPLICIT_CAST} 需要列的旧类型，所以这里把 {@code oldColumnTypesOrNull} 一并传下去：查不到类型
+     * 就不报（见 {@link #implicitCast(List, String, Map)}）。
      */
-    private static void warnings(String sql, Classification c, List<Tok> tokens, List<RiskHit> hits) {
+    private static void warnings(String sql, Classification c, List<Tok> tokens,
+            Map<String, Map<String, String>> oldColumnTypesOrNull, List<RiskHit> hits) {
         boolean selectQuery = "select".equals(statementVerb(sql, c));
         if (selectQuery && hasSelectStar(tokens)) {
             hits.add(warn(RULE_SELECT_STAR,
@@ -512,17 +610,25 @@ public final class PolicyValidator {
             hits.add(warn(RULE_LEADING_WILDCARD_LIKE,
                     "like 的模式以通配符开头：索引用不上，可能退化成全表扫描"));
         }
-        Cast cast = implicitCast(tokens);
+        Cast cast = implicitCast(tokens, targetTable(tokens, c), oldColumnTypesOrNull);
         if (cast != null) {
-            hits.add(warn(RULE_IMPLICIT_CAST,
-                    "列 " + cast.column() + " 与带引号的 '"
-                            + cast.literal() + "' 比较：可能触发隐式类型转换而使索引失效"
-                            + "（近似规则：只按文本模式识别，拿不到列类型）"));
+            hits.add(warn(RULE_IMPLICIT_CAST, castMessage(cast)));
         }
         if (hasOrderByRand(tokens)) {
             hits.add(warn(RULE_ORDER_BY_RAND,
                     "order by rand()：会为每行生成随机数再排序，大表上代价极高"));
         }
+    }
+
+    private static String castMessage(Cast cast) {
+        return switch (cast.kind()) {
+            case CHARACTER_VS_NUMBER -> "列 " + cast.column() + "（" + cast.columnType() + "）与不带引号的数字 "
+                    + cast.literal() + " 比较：MySQL 会把字符列隐式转成数字，索引失效";
+            case NUMERIC_VS_QUOTED_NUMBER -> "列 " + cast.column() + "（" + cast.columnType() + "）与带引号的 '"
+                    + cast.literal() + "' 比较：字面量会被隐式转成数字，写法有歧义，建议去掉引号";
+            case CHARACTER_VS_DATE -> "列 " + cast.column() + "（" + cast.columnType() + "）与带引号的日期 '"
+                    + cast.literal() + "' 比较：日期字面量与字符列混用，容易踩到隐式转换";
+        };
     }
 
     /**
@@ -600,8 +706,23 @@ public final class PolicyValidator {
         return false;
     }
 
-    /** 标识符与带引号的纯数字/日期字面量做比较（任一方向）。 */
-    private static Cast implicitCast(List<Tok> tokens) {
+    /**
+     * 隐式类型转换：只有<b>查得到列类型</b>时才判定，查不到一律不报（不猜，避免把 {@code where id = 123}
+     * 这种正常写法全部误报）。
+     *
+     * <p>命中组合只有三类（都是能确定性判定的）：
+     * <ul>
+     *   <li>字符列 vs 不带引号的数字 → MySQL 把整列转成数字，索引失效；</li>
+     *   <li>数值列 vs 带引号的纯数字 → 字面量被转成数字，写法有歧义；</li>
+     *   <li>字符列 vs 带引号的日期字面量 → 日期与字符混用。</li>
+     * </ul>
+     * 同类比较（数值列配数字、字符列配字符串、日期/时间列配日期字面量）不命中。
+     */
+    private static Cast implicitCast(List<Tok> tokens, String table,
+            Map<String, Map<String, String>> oldColumnTypesOrNull) {
+        if (table == null) {
+            return null; // 连表都定位不到，就不可能查到列类型
+        }
         for (int i = 0; i < tokens.size(); i++) {
             Tok token = tokens.get(i);
             if (token.kind() != Kind.PUNCT) {
@@ -624,9 +745,9 @@ public final class PolicyValidator {
             }
             Tok left = tokenAt(tokens, i - 1);
             Tok right = tokenAt(tokens, operatorEnd + 1);
-            Cast cast = castBetween(left, right);
+            Cast cast = castBetween(left, right, table, oldColumnTypesOrNull);
             if (cast == null) {
-                cast = castBetween(right, left);
+                cast = castBetween(right, left, table, oldColumnTypesOrNull);
             }
             if (cast != null) {
                 return cast;
@@ -635,11 +756,63 @@ public final class PolicyValidator {
         return null;
     }
 
-    private static Cast castBetween(Tok column, Tok literal) {
-        if (!isColumnReference(column) || !isNumberOrDateLiteral(literal)) {
+    private static Cast castBetween(Tok columnToken, Tok literalToken, String table,
+            Map<String, Map<String, String>> oldColumnTypesOrNull) {
+        if (!isColumnReference(columnToken)) {
             return null;
         }
-        return new Cast(column.text(), literal.text());
+        LiteralKind literal = literalKind(literalToken);
+        if (literal == null) {
+            return null;
+        }
+        String columnType = oldTypeOf(oldColumnTypesOrNull, table, columnToken.text());
+        if (columnType == null) {
+            return null; // 查不到列类型：不猜
+        }
+        ColumnClass columnClass = columnClass(parseType(columnType));
+        CastKind kind = switch (columnClass) {
+            case CHARACTER -> switch (literal) {
+                case NUMBER_UNQUOTED -> CastKind.CHARACTER_VS_NUMBER;
+                case DATE_QUOTED -> CastKind.CHARACTER_VS_DATE;
+                default -> null;
+            };
+            case NUMERIC -> literal == LiteralKind.NUMBER_QUOTED ? CastKind.NUMERIC_VS_QUOTED_NUMBER : null;
+            case TEMPORAL, OTHER -> null;
+        };
+        return kind == null ? null : new Cast(columnToken.text(), columnType, literalToken.text(), kind);
+    }
+
+    /** 列的类型族；{@code null}（类型文本解析不出）归 {@link ColumnClass#OTHER}，不参与判定。 */
+    private static ColumnClass columnClass(TypeSpec type) {
+        if (type == null) {
+            return ColumnClass.OTHER;
+        }
+        String base = type.base();
+        if (CHARACTER_TYPES.contains(base)) {
+            return ColumnClass.CHARACTER;
+        }
+        if (NUMERIC_TYPES.contains(base)) {
+            return ColumnClass.NUMERIC;
+        }
+        return TEMPORAL_TYPES.contains(base) ? ColumnClass.TEMPORAL : ColumnClass.OTHER;
+    }
+
+    /** 字面量形态：不带引号的数字、带引号的纯数字、带引号的日期、带引号的普通字符串（或不是字面量）。 */
+    private static LiteralKind literalKind(Tok token) {
+        if (token == null) {
+            return null;
+        }
+        if (token.kind() == Kind.LITERAL) {
+            String text = token.text().strip();
+            if (NUMBER_LITERAL.matcher(text).matches()) {
+                return LiteralKind.NUMBER_QUOTED;
+            }
+            return DATE_LITERAL.matcher(text).matches() ? LiteralKind.DATE_QUOTED : LiteralKind.STRING_QUOTED;
+        }
+        if (token.kind() == Kind.WORD && isDigits(token.text())) {
+            return LiteralKind.NUMBER_UNQUOTED;
+        }
+        return null;
     }
 
     /** 列引用：标识符，或含字母且不是关键字的裸词（纯数字是字面量）。 */
@@ -656,12 +829,42 @@ public final class PolicyValidator {
         return !KEYWORDS.contains(token.lower());
     }
 
-    private static boolean isNumberOrDateLiteral(Tok token) {
-        if (token == null || token.kind() != Kind.LITERAL) {
+    /**
+     * 这条语句作用的表名：优先用 {@link Classification#table()}（写语句与 DDL 有），{@code select} 没有时退而取
+     * 顶层 {@code from} 后的表名（支持 {@code db.t}）。取不到返回 {@code null}。
+     */
+    private static String targetTable(List<Tok> tokens, Classification c) {
+        if (c.table() != null) {
+            return c.table();
+        }
+        int from = indexOfTopLevelWord(tokens, "from");
+        return from < 0 ? null : nameAt(tokens, from + 1);
+    }
+
+    /** 读一个表名（可带 {@code db.} 前缀）；不是名字返回 {@code null}。 */
+    private static String nameAt(List<Tok> tokens, int index) {
+        Tok first = tokenAt(tokens, index);
+        if (!isNameToken(first)) {
+            return null;
+        }
+        if (isPunctAt(tokens, index + 1, ".")) {
+            Tok second = tokenAt(tokens, index + 2);
+            if (isNameToken(second)) {
+                return first.text() + "." + second.text();
+            }
+        }
+        return first.text();
+    }
+
+    private static boolean isNameToken(Tok token) {
+        if (token == null) {
             return false;
         }
-        String text = token.text().strip();
-        return NUMBER_LITERAL.matcher(text).matches() || DATE_LITERAL.matcher(text).matches();
+        if (token.kind() == Kind.IDENTIFIER) {
+            return true;
+        }
+        return token.kind() == Kind.WORD && !token.text().isEmpty()
+                && (Character.isLetter(token.text().charAt(0)) || token.text().charAt(0) == '_');
     }
 
     /** {@code order by rand()}：随机排序，等价于整表排序后随机取。 */
@@ -990,11 +1193,34 @@ public final class PolicyValidator {
     private record TypeSpec(String base, Integer first, Integer second, String text) {
     }
 
-    /** 一条 {@code modify}/{@code change} 子句：关键字、要查旧类型的列名、新类型。 */
-    private record ColumnChange(String keyword, String column, TypeSpec newType) {
+    /** 一条 {@code modify}/{@code change} 子句：关键字、要查旧类型的列名、新类型、是否带字符集。 */
+    private record ColumnChange(String keyword, String column, TypeSpec newType, boolean changesCharset) {
     }
 
-    /** 一处隐式转换：列与字面量，只用于拼消息。 */
-    private record Cast(String column, String literal) {
+    /** 一处隐式转换：列名、列类型、字面量文本、命中的组合，只用于拼消息。 */
+    private record Cast(String column, String columnType, String literal, CastKind kind) {
+    }
+
+    /** 被比较列的类型族；{@code OTHER} 不参与 {@code IMPLICIT_CAST} 判定。 */
+    private enum ColumnClass {
+        CHARACTER,
+        NUMERIC,
+        TEMPORAL,
+        OTHER
+    }
+
+    /** 字面量的形态。 */
+    private enum LiteralKind {
+        NUMBER_UNQUOTED,
+        NUMBER_QUOTED,
+        DATE_QUOTED,
+        STRING_QUOTED
+    }
+
+    /** 命中的隐式转换组合，决定消息措辞。 */
+    private enum CastKind {
+        CHARACTER_VS_NUMBER,
+        NUMERIC_VS_QUOTED_NUMBER,
+        CHARACTER_VS_DATE
     }
 }
