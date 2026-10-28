@@ -288,7 +288,7 @@ PARTIAL_FAILED → ROLLED_BACK
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=MigrationIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=MigrationIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: PASS（既有 9 表断言保留，新增 7 表断言）。
 
 - [ ] **Step 5: 提交**
@@ -700,7 +700,7 @@ class SchemaSnapshotterIT {
 
 - [ ] **Step 5: 运行确认通过并提交**
 
-Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=SchemaSnapshotterIT" "-Dsurefire.failIfNoSpecifiedTests=false"`，再 `.\mvnw.cmd -q test "-Dtest=SnapshotPathsTest,HttpExecutorClientTest"`
+Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=SchemaSnapshotterIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`，再 `.\mvnw.cmd -q test "-Dtest=SnapshotPathsTest,HttpExecutorClientTest"`
 Expected: PASS
 
 ```powershell
@@ -1046,7 +1046,7 @@ Run: `.\mvnw.cmd -q -pl platform-control -am test "-Dtest=StatementFingerprintTe
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketSubmitIT" "-Dsurefire.failIfNoSpecifiedTests=false"`，再跑 `"-Dtest=StatementFingerprintTest"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketSubmitIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`，再跑 `"-Dtest=StatementFingerprintTest"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1168,7 +1168,7 @@ git commit -m "feat(ticket): submit change tickets with rollback requirements an
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketReviewIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketReviewIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: FAIL — 端点不存在。
 
 - [ ] **Step 3: 实现**
@@ -1190,7 +1190,7 @@ Expected: FAIL — 端点不存在。
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketReviewIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketReviewIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1233,7 +1233,7 @@ git commit -m "feat(ticket): two-level approval chain with no self-review and no
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=RiskAckIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=RiskAckIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
@@ -1244,7 +1244,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=RiskAckIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=RiskAckIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1323,7 +1323,7 @@ class WriteRunnerIT {
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=WriteRunnerIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=WriteRunnerIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
@@ -1334,7 +1334,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=WriteRunnerIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=WriteRunnerIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1527,7 +1527,7 @@ class TicketExecutionIT extends AbstractMySqlIT {
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT,TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT,TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
@@ -1576,7 +1576,7 @@ private void abort(long ticketId, String code, Map<String, Object> detail) {
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT,TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT,TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1683,7 +1683,7 @@ git commit -m "feat(ticket): execute approved tickets asynchronously with drift,
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketRollbackIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketRollbackIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
@@ -1701,7 +1701,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketRollbackIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketRollbackIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1791,7 +1791,7 @@ git commit -m "feat(ticket): add rollback tickets that inherit the original roll
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketRecoveryJobIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=TicketRecoveryJobIT" "-Dsurefire.failIfNoSpecifiedTests=false" "-Dfailsafe.failIfNoSpecifiedTests=false"`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
