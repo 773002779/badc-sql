@@ -28,7 +28,15 @@ class MigrationIT extends AbstractMySqlIT {
                 "module_datasource",
                 "user_module_grant",
                 "query_history",
-                "audit_event");
+                "audit_event",
+                // V3：工单写路径
+                "ticket",
+                "ticket_statement",
+                "ticket_review",
+                "ticket_event",
+                "schema_snapshot",
+                "risk_acknowledgement",
+                "datasource_exec_lock");
     }
 
     @Test
