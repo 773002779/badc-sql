@@ -89,6 +89,36 @@ class DatasourceCapabilityServiceTest {
     }
 
     /**
+     * 缓存必须能被显式丢弃：数据源被改指向（5.7 → 8.0）或换了只读账号之后，旧结论就是错的。
+     *
+     * <p>没有这一步，把库从 5.7 迁到 8.0 后的 10 分钟里，正确的 CTE 仍会被 422 拒掉——平台拿自己的
+     * 过期元数据去否用户的正确 SQL，比不校验更糟。
+     */
+    @Test
+    void evicting_a_datasource_forces_the_next_lookup_to_probe_again() {
+        service.capabilityOf(101L);
+        assertThat(executor.probeCalls).isEqualTo(1);
+
+        service.evict(101L);
+
+        assertThat(service.capabilityOf(101L)).isEqualTo(MYSQL_57);
+        assertThat(executor.probeCalls).isEqualTo(2);
+    }
+
+    /** 丢弃一个数据源不能顺手清掉别人的缓存：否则改一台库会让全平台的查询都多打一次探测。 */
+    @Test
+    void evicting_one_datasource_leaves_the_other_cached_capabilities_intact() {
+        given(connAccounts.readonlyConnConfig(102L)).willReturn(READONLY);
+        service.capabilityOf(101L);
+        service.capabilityOf(102L);
+
+        service.evict(101L);
+        service.capabilityOf(102L);
+
+        assertThat(executor.probeCalls).as("102 仍在缓存里，不该重新探测").isEqualTo(2);
+    }
+
+    /**
      * 探测失败必须是"能力未知"，而不是"查询失败"：返回 null，调用方跳过校验，让 SQL 继续执行。
      * 用非 {@link BizException} 的运行时异常来钉住"任何探测故障"这条约束，避免以后把 catch 收窄。
      */

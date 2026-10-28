@@ -74,6 +74,19 @@ public class DatasourceCapabilityService {
         return probed;
     }
 
+    /**
+     * 丢弃某数据源的缓存结论。
+     *
+     * <p>调用时机：该数据源被改指向（换主机 / 端口）或账号被改 / 删之后。版本、binlog、在线 DDL 能力
+     * 都是"跟着那台库走"的属性，元数据或凭证一变，缓存里的结论就不再成立。
+     *
+     * <p>不丢弃的后果是**用过期结论否定正确 SQL**：把库从 5.7 迁到 8.0 后，用户写的 CTE 在 10 分钟内
+     * 仍会被 422 拒掉——用户没有任何办法自查，只能等或者提工单。
+     */
+    public void evict(long datasourceId) {
+        cache.invalidate(datasourceId);
+    }
+
     private Capability probeQuietly(long datasourceId) {
         try {
             ConnConfig conn = connAccountService.readonlyConnConfig(datasourceId);

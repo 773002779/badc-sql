@@ -56,6 +56,7 @@ class QueryControllerIT extends AbstractMySqlIT {
     private static final String QUERY = "/api/v1/query";
     private static final String DEV_TOKEN = JwtTestSupport.devToken(1L);
     private static final String OPS_TOKEN = JwtTestSupport.token(2L, "ops01");
+    private static final String ADMIN_TOKEN = JwtTestSupport.token(3L, "admin01");
 
     @Autowired
     private TestRestTemplate rest;
@@ -68,6 +69,9 @@ class QueryControllerIT extends AbstractMySqlIT {
 
     @Autowired
     private StubExecutor stub;
+
+    @Autowired
+    private DatasourceCapabilityService capabilityService;
 
     @DynamicPropertySource
     static void datasource(DynamicPropertyRegistry registry) {
@@ -107,6 +111,11 @@ class QueryControllerIT extends AbstractMySqlIT {
     void reset() {
         rest.getRestTemplate().setRequestFactory(new JdkClientHttpRequestFactory());
         stub.reset();
+        // 能力缓存是 context 级单例，会跨用例存活：不清掉的话，两个用例用同一个数据源 ID 时，
+        // 后跑的用例会读到前一个用例留下的探测结论（与执行顺序耦合）。显式丢弃，保证每个用例都从冷缓存开始。
+        for (long id : new long[] {101L, 102L, 103L}) {
+            capabilityService.evict(id);
+        }
     }
 
     @Test
@@ -347,6 +356,62 @@ class QueryControllerIT extends AbstractMySqlIT {
                 .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
+    /**
+     * 改指向（换主机/端口）后必须重新探测。
+     *
+     * <p>不失效的后果就是"用过期结论否定正确 SQL"：库从 5.7 迁到 8.0 之后，CTE 在 10 分钟内仍会被
+     * 422 拒掉，而用户无从自查。这里用 {@code probeCalls} 直接观察"下一次取能力是否又探测了一次"。
+     */
+    @Test
+    void repointing_a_datasource_discards_the_cached_capability() throws Exception {
+        assertThat(get("/api/v1/datasources/101", ADMIN_TOKEN).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(stub.probeCalls).as("首次取能力触发一次探测").isEqualTo(1);
+
+        assertThat(put("/api/v1/datasources/101/connection", ADMIN_TOKEN, """
+                {"host":"10.9.9.9","port":3306,"charset":"utf8mb4","timeZone":"+00:00"}
+                """).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+
+        assertThat(get("/api/v1/datasources/101", ADMIN_TOKEN).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(stub.probeCalls).as("改指向后必须重新探测，不能沿用旧结论").isEqualTo(2);
+    }
+
+    /**
+     * 换账号 / 删账号同样会让"能不能连上、连到哪"变化，缓存必须一起失效。
+     *
+     * <p>删账号这条最尖锐：删掉之后 {@code readonlyConnConfig} 会 404，能力只能是"未知"。若缓存没失效，
+     * 详情会继续返回删除前的 5.7 结论——那是纯粹的假信息。
+     */
+    @Test
+    void changing_or_removing_the_readonly_account_discards_the_cached_capability() throws Exception {
+        assertThat(get("/api/v1/datasources/101", ADMIN_TOKEN).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(stub.probeCalls).isEqualTo(1);
+
+        // 换账号：凭证变了，版本可能跟着变（比如换到另一台库的只读账号）。
+        assertThat(put("/api/v1/datasources/101/accounts/readonly", ADMIN_TOKEN, """
+                {"username":"rotated_user","password":"rotated-pass"}
+                """).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(get("/api/v1/datasources/101", ADMIN_TOKEN).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(stub.probeCalls).as("换账号后必须重新探测").isEqualTo(2);
+
+        try {
+            // 删账号：此后无法探测，能力必须是 null 而不是旧结论。
+            assertThat(delete("/api/v1/datasources/101/accounts/readonly", ADMIN_TOKEN).getStatusCode())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+
+            ResponseEntity<String> afterDelete = get("/api/v1/datasources/101", ADMIN_TOKEN);
+            assertThat(afterDelete.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(objectMapper.readTree(afterDelete.getBody()).path("capabilities").isNull())
+                    .as("删账号后不能继续返回删除前的缓存结论")
+                    .isTrue();
+            assertThat(stub.probeCalls).as("没有只读账号时探测根本无法发起").isEqualTo(2);
+        } finally {
+            // 夹具复原：后续用例还要用 101 的只读账号。
+            put("/api/v1/datasources/101/accounts/readonly", ADMIN_TOKEN, """
+                    {"username":"readonly_user","password":"readonly-pass"}
+                    """);
+        }
+    }
+
     private JsonNode getHistory(String token) throws Exception {
         ResponseEntity<String> response = get("/api/v1/history", token);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -359,6 +424,23 @@ class QueryControllerIT extends AbstractMySqlIT {
             headers.setBearerAuth(token);
         }
         return rest.exchange(path, HttpMethod.GET, new HttpEntity<>(headers), String.class);
+    }
+
+    private ResponseEntity<String> put(String path, String token, String body) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        if (token != null) {
+            headers.setBearerAuth(token);
+        }
+        return rest.exchange(path, HttpMethod.PUT, new HttpEntity<>(body, headers), String.class);
+    }
+
+    private ResponseEntity<String> delete(String path, String token) {
+        HttpHeaders headers = new HttpHeaders();
+        if (token != null) {
+            headers.setBearerAuth(token);
+        }
+        return rest.exchange(path, HttpMethod.DELETE, new HttpEntity<>(headers), String.class);
     }
 
     private ResponseEntity<String> post(String token, String body) {

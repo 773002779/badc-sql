@@ -7,6 +7,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.query.DatasourceCapabilityService;
 
 /**
  * 数据源（{@code datasource}）管理。
@@ -20,14 +21,17 @@ public class DataSourceService {
     private final DataSourceMapper dataSourceMapper;
     private final SystemMapper systemMapper;
     private final ConnAccountMapper connAccountMapper;
+    private final DatasourceCapabilityService capabilityService;
 
     public DataSourceService(
             DataSourceMapper dataSourceMapper,
             SystemMapper systemMapper,
-            ConnAccountMapper connAccountMapper) {
+            ConnAccountMapper connAccountMapper,
+            DatasourceCapabilityService capabilityService) {
         this.dataSourceMapper = dataSourceMapper;
         this.systemMapper = systemMapper;
         this.connAccountMapper = connAccountMapper;
+        this.capabilityService = capabilityService;
     }
 
     public List<DataSourceView> listDatasources() {
@@ -98,6 +102,9 @@ public class DataSourceService {
                 OrgRules.requirePort(port),
                 OrgRules.optionalText(charset, OrgRules.DEFAULT_CHARSET, "字符集", 32),
                 OrgRules.optionalText(timeZone, OrgRules.DEFAULT_TIME_ZONE, "连接时区", 64));
+        // 指向变了，之前探测到的版本 / binlog / 在线 DDL 结论不再成立——必须重新探测，
+        // 否则把库从 5.7 换到 8.0 之后，正确的 CTE 还会被"版本不支持"拒掉最长 10 分钟。
+        capabilityService.evict(id);
     }
 
     @Transactional
