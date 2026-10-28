@@ -112,10 +112,23 @@ platform-control/src/main/java/com/badc/sql/control/
 └── risk/ExecWindow.java             # 新增：非窗口期判定
 
 platform-control/src/test/java/com/badc/sql/control/support/
-└── TicketStubExecutor.java          # 新增：工单类 IT 共用的执行器桩
+├── TicketStubExecutor.java          # 新增：工单类 IT 共用的执行器桩
+└── TicketITBase.java                # 新增：工单类 IT 共用的 HTTP / 轮询 / 断言助手
 platform-control/src/test/resources/seed/
 └── ticket-fixtures.sql              # 新增：ops02 / lead01（勿并入 test-fixtures.sql）
 ```
+
+**共享测试支撑（避免 6 个 IT 各抄一份助手）**
+
+`support/TicketITBase extends AbstractMySqlIT` 是工单类 IT 的基类，由任务 7 建立、后续任务按需增补方法，**不要在每个测试类里复制**：
+
+| 任务 | 往基类里加的方法 |
+|---|---|
+| 7 | `postTicket(token, body)`、`status(ticketId)`、`statementsOf(ticketId)`、`body(sql, rollbackSql)` / `bodyFor(datasourceId, sql, rollbackSql)` |
+| 8 | `approve(token, id)`、`reject(token, id, comment)` |
+| 11 | `requestExecution(token, id)`、`awaitTerminal(id)`、`abortReason(id)`、`statementStatuses(id)`、`approvedTicket(String...)` |
+| 12 | `rollback(...)`、`rollbackAs(...)`、`rollbackOf(...)`、`succeededTicket(...)` |
+| 13 | `utcMinusHours(int)` |
 
 **职责边界**：`StatementClassifier`、`PolicyValidator`、`RiskEngine` **纯文本/纯计算**，不连库、不查权限，因此可单测跑满。任何需要连目标库的判断（指纹、快照、估算）都经 `ExecutorClient` 出去。
 
@@ -204,7 +217,7 @@ badcsql:
 
 - [ ] **Step 5: 运行确认通过并提交**
 
-Run: `.\mvnw.cmd -q -pl platform-executor,platform-control -am test "-Dtest=InternalAuthFilterTest+HttpExecutorClientTest+ExecutorErrorsTest"`
+Run: `.\mvnw.cmd -q -pl platform-executor,platform-control -am test "-Dtest=InternalAuthFilterTest,HttpExecutorClientTest,ExecutorErrorsTest"`
 Expected: PASS
 
 ```powershell
@@ -503,6 +516,7 @@ git commit -m "feat(risk): add the sixteen policy rules with BLOCK vs PIN_LEVEL 
   - `record ExplainEstimate(long estimatedRows)`（`-1` 表示无法估算）
   - `SchemaSnapshotter.capture(ConnConfig conn, List<String> tables, String relativeRef) -> SnapshotResult`
   - `SchemaSnapshotter.fingerprint(ConnConfig conn, List<String> tables) -> Map<String, String>`
+  - `ExplainRunner.estimate(ConnConfig conn, String sql) -> ExplainEstimate`（`-1` 表示无法估算）
   - `SnapshotPaths.resolve(String root, String relativeRef) -> Path`、`SnapshotPaths.fileName(String table) -> String`
   - `ExecutorClient.fingerprint(ConnConfig conn, List<String> tables) -> Map<String, String>`
   - 执行器端点：`POST /internal/v1/snapshot`、`POST /internal/v1/fingerprint`、`POST /internal/v1/explain`
@@ -686,7 +700,7 @@ class SchemaSnapshotterIT {
 
 - [ ] **Step 5: 运行确认通过并提交**
 
-Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=SchemaSnapshotterIT" "-Dsurefire.failIfNoSpecifiedTests=false"`，再 `.\mvnw.cmd -q test "-Dtest=SnapshotPathsTest+HttpExecutorClientTest"`
+Run: `.\mvnw.cmd -q -pl platform-executor -am verify "-Dit.test=SchemaSnapshotterIT" "-Dsurefire.failIfNoSpecifiedTests=false"`，再 `.\mvnw.cmd -q test "-Dtest=SnapshotPathsTest,HttpExecutorClientTest"`
 Expected: PASS
 
 ```powershell
@@ -840,7 +854,7 @@ Expected: FAIL — 类不存在。
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am test "-Dtest=RiskEngineTest+StatementClassifierTest+PolicyValidatorTest"`
+Run: `.\mvnw.cmd -q -pl platform-control -am test "-Dtest=RiskEngineTest,StatementClassifierTest,PolicyValidatorTest"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1513,7 +1527,7 @@ class TicketExecutionIT extends AbstractMySqlIT {
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT+TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT,TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
@@ -1562,7 +1576,7 @@ private void abort(long ticketId, String code, Map<String, Object> detail) {
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT+TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
+Run: `.\mvnw.cmd -q -pl platform-control -am verify "-Dit.test=DatasourceExecLockIT,TicketExecutionIT" "-Dsurefire.failIfNoSpecifiedTests=false"`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
