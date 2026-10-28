@@ -20,6 +20,7 @@ class ReadonlyStatementTest {
     @Test
     void cte_over_select_is_readonly() {
         assertThat(QueryService.isReadonlyStatement("with c as (select 1) select * from c")).isTrue();
+        assertThat(QueryService.isReadonlyStatement("with cte as (select 1) select * from cte")).isTrue();
     }
 
     @Test
@@ -30,6 +31,26 @@ class ReadonlyStatementTest {
     @Test
     void cte_over_delete_is_not_readonly() {
         assertThat(QueryService.isReadonlyStatement("with c as (select 1) delete from t")).isFalse();
+        assertThat(QueryService.isReadonlyStatement(
+                "with cte as (select id from t) delete from t2 where id in (select id from cte)")).isFalse();
+    }
+
+    /**
+     * insert ... select 的尾部 select 属于 insert。按"最后一个顶层动词"判会把它放行成只读，那就成了
+     * 一条真实写入通道（只读账号一旦被误授写权限就会落库）。
+     */
+    @Test
+    void cte_over_insert_select_is_not_readonly() {
+        assertThat(QueryService.isReadonlyStatement("with cte as (select 1) insert into t2 select id from cte"))
+                .isFalse();
+        assertThat(QueryService.isReadonlyStatement(
+                "with cte as (select id from t) replace into t2 select id from cte")).isFalse();
+    }
+
+    /** 拿不到顶层动词时 fail-closed：宁可不放行，也不把来历不明的 with 当查询执行。 */
+    @Test
+    void a_with_statement_without_a_top_level_verb_is_not_readonly() {
+        assertThat(QueryService.isReadonlyStatement("with cte as (select 1)")).isFalse();
     }
 
     @Test

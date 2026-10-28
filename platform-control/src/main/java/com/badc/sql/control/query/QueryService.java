@@ -178,7 +178,9 @@ public class QueryService {
             return "select".equals(verb) || "with".equals(verb);
         }
         if ("with".equals(first)) {
-            return "select".equals(lastTopLevelVerb(code));
+            // 取 CTE 之后的第一个顶层动词，而不是最后一个：`with ... insert into t2 select ...` 尾部的
+            // select 属于 insert，按最后一个会把它放行成只读。拿不到动词时 fail-closed（非只读）。
+            return "select".equals(SqlText.firstTopLevelVerb(code));
         }
         return READONLY_KEYWORDS.contains(first);
     }
@@ -196,41 +198,6 @@ public class QueryService {
             return end == i ? null : text.substring(i, end);
         }
         return null;
-    }
-
-    /** WITH 子句之后的真正动词：取括号深度 0 上最后一个增删改查关键字。 */
-    private static String lastTopLevelVerb(String code) {
-        String[] verbs = {"select", "update", "delete", "insert", "replace"};
-        int depth = 0;
-        int lastIndex = -1;
-        String lastVerb = null;
-        for (int i = 0; i < code.length(); i++) {
-            char c = code.charAt(i);
-            if (c == '(') {
-                depth++;
-                continue;
-            }
-            if (c == ')') {
-                depth = Math.max(0, depth - 1);
-                continue;
-            }
-            if (depth != 0 || !Character.isLetter(c)) {
-                continue;
-            }
-            int end = i;
-            while (end < code.length() && Character.isLetter(code.charAt(end))) {
-                end++;
-            }
-            String word = code.substring(i, end);
-            for (String verb : verbs) {
-                if (verb.equals(word) && i > lastIndex) {
-                    lastIndex = i;
-                    lastVerb = verb;
-                }
-            }
-            i = end - 1;
-        }
-        return lastVerb;
     }
 
     /** 查询结果：{@code resultId} 供后续导出 / 结果缓存引用。 */

@@ -26,7 +26,8 @@ import com.badc.sql.common.sql.SqlText;
  *
  * <p><b>{@code with} 开头的 CTE 按顶层动词判性质</b>：{@code with ... select} 是只读，
  * {@code with ... insert/update/delete/replace} 是写语句（{@code ddlAction} 为 {@code NONE}）——
- * 判成只读会让整单基础等级落到 L0（免审批），方向正好错。
+ * 判成只读会让整单基础等级落到 L0（免审批），方向正好错。这里的顶层动词判定与查询接口的只读白名单共用
+ * {@link SqlText#firstTopLevelVerb(String)}，两个入口不会对同一条 SQL 给出相反结论。
  *
  * <p>{@link DdlAction#ALTER_DROP_INDEX} 同时覆盖 alter 形式（{@code alter table t drop index i}）与
  * 顶层形式（{@code drop index i on t}）；{@link DdlAction#ALTER_MODIFY} 同时覆盖 {@code modify} 与
@@ -70,9 +71,6 @@ public final class StatementClassifier {
             "drop", "add", "modify", "change", "convert", "rename", "engine", "algorithm", "lock",
             "comment", "default", "character", "collate", "auto_increment");
 
-    /** {@code with} 之后可能出现的顶层动词：{@code with} 语句的性质由它决定。 */
-    private static final Set<String> STATEMENT_VERBS = Set.of("select", "insert", "update", "delete", "replace");
-
     /**
      * 分类一条 SQL。{@code null} 与空白输入返回"什么都没有"的分类，不抛 NPE。
      *
@@ -100,7 +98,7 @@ public final class StatementClassifier {
                 firstKeyword,
                 ddlAction,
                 structuralDamage,
-                isWriteStatement(tokens, firstKeyword),
+                isWriteStatement(subject, firstKeyword),
                 hasTopLevelKeyword(tokens, "where"),
                 hasTopLevelKeyword(tokens, "limit"),
                 hasCrossDatabaseReference(tokens),
@@ -118,10 +116,13 @@ public final class StatementClassifier {
      * 是否写语句。
      *
      * <p>{@code with} 开头的 CTE 不能只看首关键字：{@code with c as (...) delete from t} 的首关键字是
-     * {@code with}，但它是写语句。判成只读会让整单基础等级落 L0（免审批），方向正好错，所以这里按 CTE
-     * 之后的顶层动词判。
+     * {@code with}，但它是写语句。判成只读会让整单基础等级落 L0（免审批），方向正好错，所以按 CTE 之后的
+     * 顶层动词判——判定与查询接口的只读白名单共用 {@link SqlText#firstTopLevelVerb(String)}，两个入口
+     * 不会给出相反结论。
+     *
+     * <p>拿不到顶层动词时按写语句处理（保守）：宁可多审一次，也不把一条来历不明的语句放成只读。
      */
-    private static boolean isWriteStatement(List<Token> tokens, String firstKeyword) {
+    private static boolean isWriteStatement(String subject, String firstKeyword) {
         if (firstKeyword == null) {
             return false;
         }
@@ -131,24 +132,8 @@ public final class StatementClassifier {
         if (!"with".equals(firstKeyword)) {
             return false;
         }
-        String verb = firstTopLevelVerb(tokens);
-        return verb != null && WRITE_KEYWORDS.contains(verb);
-    }
-
-    /**
-     * CTE 语句的顶层动词：括号深度 0 上第一个 {@code select/insert/update/delete/replace}。
-     *
-     * <p>取<b>第一个</b>而不是最后一个：{@code with c as (...) insert into t select * from c} 尾部的
-     * {@code select} 属于 insert 的一部分，取最后一个会把它误判成只读——正是这条判定要防的方向。
-     * {@code with ... select ... for update} 也因此仍判只读（{@code for update} 不是语句动词）。
-     */
-    private static String firstTopLevelVerb(List<Token> tokens) {
-        for (Token token : tokens) {
-            if (token.depth() == 0 && !token.quoted() && STATEMENT_VERBS.contains(token.lower())) {
-                return token.lower();
-            }
-        }
-        return null;
+        String verb = SqlText.firstTopLevelVerb(SqlText.stripLiteralsAndComments(subject));
+        return verb == null || WRITE_KEYWORDS.contains(verb);
     }
 
     // ------------------------------------------------------------------ DDL 动作

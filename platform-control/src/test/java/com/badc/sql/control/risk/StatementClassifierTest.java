@@ -300,6 +300,12 @@ class StatementClassifierTest {
                 "with cte as (select id from t) insert into t2 select id from cte").writeStatement()).isTrue();
     }
 
+    /** 拿不到顶层动词时按写语句处理（保守）：宁可多审一次，也不放成 L0。 */
+    @Test
+    void a_with_statement_without_a_top_level_verb_is_treated_as_a_write() {
+        assertThat(classifier.classify("with cte as (select 1)").writeStatement()).isTrue();
+    }
+
     // ---- F3：change column 与顶层 drop index ----
 
     @Test

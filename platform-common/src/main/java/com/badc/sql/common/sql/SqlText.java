@@ -2,6 +2,8 @@ package com.badc.sql.common.sql;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * SQL 文本的轻量扫描工具：识别代码字符，把注释与字符串字面量排除在外。
@@ -11,6 +13,9 @@ import java.util.List;
  * 已有 LIMIT。这类<b>假阳性</b>比漏判更伤：用户写对了却被拒或没被限流。
  */
 public final class SqlText {
+
+    /** 决定一条语句性质的顶层动词。 */
+    private static final Set<String> TOP_LEVEL_VERBS = Set.of("select", "insert", "update", "delete", "replace");
 
     private SqlText() {
     }
@@ -105,6 +110,62 @@ public final class SqlText {
         if (!stripped.isEmpty()) {
             statements.add(stripped);
         }
+    }
+
+    /**
+     * 括号深度 0 上<b>第一个</b>出现的 {@code select/insert/update/delete/replace}（小写）；没有返回
+     * {@code null}。入参必须是已剥离注释与字面量的文本（调用方先调
+     * {@link #stripLiteralsAndComments(String)}），否则 {@code 'with ... delete'} 这类字面量会被当成动词。
+     *
+     * <p>存在这个助手是因为"这是不是写语句"有两个调用方（查询接口的只读白名单、变更工单的语句分类），
+     * 两处必须用同一套判定，否则同一条 SQL 会在两个入口得到相反结论。
+     *
+     * <p><b>取第一个而不是最后一个</b>：{@code with cte as (select 1) insert into t2 select id from cte}
+     * 尾部的 {@code select} 属于 insert 的一部分，取最后一个会把它判成只读——那正是最危险的错误方向。
+     * CTE 定义在括号里（深度 &gt; 0），CTE 名与 {@code as}/{@code recursive} 不是动词，都会被自然跳过。
+     */
+    public static String firstTopLevelVerb(String code) {
+        if (code == null || code.isEmpty()) {
+            return null;
+        }
+        int depth = 0;
+        int i = 0;
+        int n = code.length();
+        while (i < n) {
+            char c = code.charAt(i);
+            if (c == '(') {
+                depth++;
+                i++;
+                continue;
+            }
+            if (c == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                i++;
+                continue;
+            }
+            if (!Character.isLetter(c)) {
+                i++;
+                continue;
+            }
+            int end = i;
+            while (end < n && isWordChar(code.charAt(end))) {
+                end++;
+            }
+            if (depth == 0) {
+                String word = code.substring(i, end).toLowerCase(Locale.ROOT);
+                if (TOP_LEVEL_VERBS.contains(word)) {
+                    return word;
+                }
+            }
+            i = end;
+        }
+        return null;
+    }
+
+    private static boolean isWordChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$';
     }
 
     /** 把注释与字面量替换为空格，保留长度与换行，便于按关键字做整体匹配。 */
