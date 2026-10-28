@@ -16,8 +16,8 @@ import com.badc.sql.common.dto.RawResult;
 /**
  * 结果缓存的存活与容量规则：保留 30 分钟、最多 20 条。
  *
- * <p>用可注入的 {@link Clock} 驱动 Caffeine 的 ticker，不靠 {@code Thread.sleep} 等真实时间——
- * 否则这类测试要么很慢，要么不稳定。
+ * <p>用可注入的 {@link Clock} 驱动过期判定，不靠 {@code Thread.sleep} 等真实时间——否则这类测试要么很慢，
+ * 要么不稳定。
  */
 class ResultCacheServiceTest {
 
@@ -64,6 +64,56 @@ class ResultCacheServiceTest {
         assertThat(cache.size()).isLessThanOrEqualTo(20);
         assertThat(cache.get("r0")).as("最旧的应被淘汰").isEmpty();
         assertThat(cache.get("r24")).isPresent();
+    }
+
+    /**
+     * 满仓后再写：新条目<b>必定</b>可读。
+     *
+     * <p>这是不用 W-TinyLFU 准入的理由：它可能在满仓时拒收新条目，用户刚执行完的查询就导不出来了。
+     */
+    @Test
+    void a_write_into_a_full_cache_is_always_readable() {
+        MutableClock clock = new MutableClock(T0);
+        ResultCacheService cache = cacheAt(clock);
+        for (int i = 0; i < 20; i++) {
+            cache.put("r" + i, result("v" + i));
+        }
+        assertThat(cache.size()).isEqualTo(20);
+
+        cache.put("fresh", result("fresh"));
+
+        assertThat(cache.get("fresh")).isPresent();
+        assertThat(cache.size()).isLessThanOrEqualTo(20);
+        assertThat(cache.get("r0")).as("最旧的被淘汰，新写入的不会").isEmpty();
+    }
+
+    /** 重复写入算"最近写入"：不能被当成最旧的立刻淘汰掉。 */
+    @Test
+    void rewriting_an_existing_id_keeps_it_among_the_newest() {
+        MutableClock clock = new MutableClock(T0);
+        ResultCacheService cache = cacheAt(clock);
+        for (int i = 0; i < 20; i++) {
+            cache.put("r" + i, result("v" + i));
+        }
+
+        cache.put("r0", result("again"));
+        cache.put("r20", result("v20"));
+
+        assertThat(cache.get("r0")).isPresent();
+        assertThat(cache.get("r1")).as("真正最旧的被淘汰").isEmpty();
+    }
+
+    /** 过期条目读不到，也不计入条数——{@code size()} 先清理再读数。 */
+    @Test
+    void size_does_not_count_expired_entries() {
+        MutableClock clock = new MutableClock(T0);
+        ResultCacheService cache = cacheAt(clock);
+        cache.put("r1", result("v"));
+        cache.put("r2", result("v"));
+
+        clock.plus(Duration.ofMinutes(31));
+
+        assertThat(cache.size()).isZero();
     }
 
     @Test
