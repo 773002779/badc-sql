@@ -35,6 +35,9 @@ import com.sun.net.httpserver.HttpServer;
  *
  * <p>执行器用 JDK 自带的 {@link HttpServer} 起一个真实 HTTP 端点，而不是 mock {@code RestClient}：
  * 要验的就是真实的 URI 拼装、JSON 序列化与非 2xx 处理。
+ *
+ * <p>内部令牌同理：执行器的 {@code /internal/**} 现在要求 {@code X-Badc-Internal-Token}，
+ * 客户端漏发这个头，单元测试仍然全绿（桩不校验令牌），生产上每一次内部调用却会被 401 挡下。
  */
 class HttpExecutorClientTest {
 
@@ -54,13 +57,14 @@ class HttpExecutorClientTest {
 
     private final AtomicReference<String> lastPath = new AtomicReference<>();
     private final AtomicReference<String> lastBody = new AtomicReference<>();
+    private final AtomicReference<String> lastToken = new AtomicReference<>();
 
     @BeforeEach
     void startExecutor() throws IOException {
         server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
         server.createContext("/internal/v1", this::handle);
         server.start();
-        client = new HttpExecutorClient("http://127.0.0.1:" + server.getAddress().getPort());
+        client = new HttpExecutorClient("http://127.0.0.1:" + server.getAddress().getPort(), "s3cret");
     }
 
     @AfterEach
@@ -129,7 +133,7 @@ class HttpExecutorClientTest {
         try (ServerSocket socket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
             deadPort = socket.getLocalPort();
         }
-        HttpExecutorClient dead = new HttpExecutorClient("http://127.0.0.1:" + deadPort);
+        HttpExecutorClient dead = new HttpExecutorClient("http://127.0.0.1:" + deadPort, "s3cret");
 
         assertThatThrownBy(() -> dead.probe(READONLY_CONN, null))
                 .isInstanceOf(BizException.class)
@@ -167,9 +171,23 @@ class HttpExecutorClientTest {
         assertThat(result.message()).isNull();
     }
 
+    /**
+     * 令牌是构造时挂在 {@code RestClient} 上的默认头，validate 带出去即说明另外两个内部调用也带；
+     * 少了这条，桩不校验令牌，单测全绿而生产上每一次内部调用都会被 401 挡下。
+     */
+    @Test
+    void every_internal_call_carries_the_token() throws Exception {
+        reply.set(new Reply(200, "{\"ok\":true}"));
+
+        client.validate(READONLY_CONN, "select 1", DbVersion.MYSQL_8_0);
+
+        assertThat(lastToken.get()).isEqualTo("s3cret");
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
         lastPath.set(exchange.getRequestURI().getPath());
         lastBody.set(new String(exchange.getRequestBody().readAllBytes(), UTF_8));
+        lastToken.set(exchange.getRequestHeaders().getFirst("X-Badc-Internal-Token"));
         Reply response = reply.get();
         byte[] body = response.body().getBytes(UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "application/json");

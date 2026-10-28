@@ -19,3 +19,7 @@ badcsql:
   jwt:
     # HS256 密钥，至少 32 字节；生产环境必须通过环境变量覆盖。
     secret: "${BADCSQL_JWT_SECRET:badc-sql-local-dev-jwt-secret-change-me-in-production}"
+  executor:
+    # 调执行器 /internal/** 的令牌，必须与执行器的 BADCSQL_INTERNAL_TOKEN 一致。
+    # 不设字面默认值：留空时执行器会拒绝全部内部请求，而不是放行。
+    internal-token: "${BADCSQL_INTERNAL_TOKEN:}"

@@ -32,13 +32,19 @@ public class HttpExecutorClient implements ExecutorClient {
 
     private static final String UNAVAILABLE = "执行器不可用，请稍后重试";
 
+    /** 与执行器 {@code InternalAuthFilter} 约定的内部令牌头。 */
+    private static final String INTERNAL_TOKEN_HEADER = "X-Badc-Internal-Token";
+
     private final RestClient client;
 
-    public HttpExecutorClient(@Value("${badcsql.executor.base-url:http://127.0.0.1:8081}") String baseUrl) {
+    public HttpExecutorClient(
+            @Value("${badcsql.executor.base-url:http://127.0.0.1:8081}") String baseUrl,
+            @Value("${badcsql.executor.internal-token:${BADCSQL_INTERNAL_TOKEN:}}") String internalToken) {
         JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
         factory.setReadTimeout(Duration.ofSeconds(70));
         this.client = RestClient.builder()
                 .baseUrl(baseUrl)
+                .defaultHeader(INTERNAL_TOKEN_HEADER, internalToken)
                 .requestFactory(factory)
                 .build();
     }
