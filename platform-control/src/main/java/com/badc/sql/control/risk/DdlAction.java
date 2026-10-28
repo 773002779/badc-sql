@@ -16,6 +16,16 @@ import java.util.Set;
  * {@link #DROP_PARTITION}），恒为 L3，无下调入口。{@link #ALTER_MODIFY} 不在其列：改列类型是否"收窄"要看
  * 列类型文本，由任务 4 的校验器判定，分类器只负责认出"这条 alter 改了列定义"。
  *
+ * <p>两个动作同时覆盖多种写法：{@link #ALTER_DROP_INDEX} 既覆盖 alter 形式
+ * （{@code alter table t drop index i}）也覆盖顶层形式（{@code drop index i on t}，二者等价）；
+ * {@link #ALTER_MODIFY} 既覆盖 {@code modify}，也覆盖 {@code change [column]}（改名 + 改类型，收窄风险相同）。
+ *
+ * <p>注意"最严重动作"与"是否结构性破坏"不是一回事：{@link #ALTER_MODIFY} 按声明顺序排在
+ * {@link #ALTER_CONVERT_CHARSET} 与 {@link #DROP_PARTITION} 之前，一条 alter 同时含二者时
+ * {@link DdlAction#mostSevere} 会返回 {@link #ALTER_MODIFY}。因此 {@code Classification} 的
+ * {@code structuralDamage} 是按整组动作算的（任一为结构性即为 {@code true}），否则改字符集这类恒 L3 的
+ * 规则会被同一条 alter 里的 modify 掩掉。
+ *
  * <p>{@link #DROP_DATABASE} 也不走等级：它在提交阶段直接 BLOCK，进不到审批，所以不属于上面那套 L3 集合。
  */
 public enum DdlAction {

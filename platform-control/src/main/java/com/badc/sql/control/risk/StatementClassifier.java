@@ -20,17 +20,23 @@ import com.badc.sql.common.sql.SqlText;
  * <p>本类<b>纯文本</b>：无 Spring 依赖、不连库、不读配置，可单元测试跑满。等级判定不在这里——结构性破坏
  * 的七个动作恒为 L3，而 {@code alter modify} 是否收窄、跨库要不要抬级、多语句要不要拦，都由任务 4/6 决定。
  *
+ * <p><b>跨库判定只看表位置</b>：只有 {@code from}/{@code join}/{@code into}/{@code update}/{@code table}
+ * 之后出现的两段式名称（{@code db2.t_order}）才算跨库；{@code where t_order.id = 1}、{@code select o.id}
+ * 里的 {@code x.y} 是列限定，不算。否则日常 {@code update} 会被全部顶到 L3。
+ *
+ * <p><b>{@code with} 开头的 CTE 按顶层动词判性质</b>：{@code with ... select} 是只读，
+ * {@code with ... insert/update/delete/replace} 是写语句（{@code ddlAction} 为 {@code NONE}）——
+ * 判成只读会让整单基础等级落到 L0（免审批），方向正好错。
+ *
+ * <p>{@link DdlAction#ALTER_DROP_INDEX} 同时覆盖 alter 形式（{@code alter table t drop index i}）与
+ * 顶层形式（{@code drop index i on t}）；{@link DdlAction#ALTER_MODIFY} 同时覆盖 {@code modify} 与
+ * {@code change [column]}（改名 + 改类型，收窄风险相同）。
+ *
  * <h2>已知局限</h2>
  * <ul>
  *   <li><b>反引号限定名检测不到跨库</b>：{@code `db2`.`t_order`} 的反引号内容与字符串字面量走同一分支被
- *       掩码，骨架里只剩空格，所以 {@code crossDatabase()} 为 {@code false}。这是尽力而为的判定；任务 6 对
- *       跨库另有兜底（至少 L3），不能只依赖本字段。</li>
- *   <li><b>别名限定列会被当成跨库</b>：{@code t_order.id} 形状与 {@code db2.t_order} 相同，左侧
- *       {@code t_order} 不是关键字，因此判为 {@code true}。这是过判——等级只会更高，方向是安全的。</li>
- *   <li><b>首关键字是 {@code with} 的 CTE 不判为写语句</b>：规则只认首关键字，而
- *       {@code with c as (...) delete from t} 的首关键字是 {@code with}。判成"不是写语句"的方向是安全的
- *       （不会被放行去执行），但它属于本任务范围外的写法——真要支持时，应在这里按
- *       {@link com.badc.sql.control.query.QueryService#isReadonlyStatement(String)} 同类思路补判定。</li>
+ *       掩码，所以 {@code crossDatabase()} 为 {@code false}。这是尽力而为的判定；任务 6 对跨库另有兜底
+ *       （至少 L3），不能只依赖本字段。</li>
  * </ul>
  */
 public final class StatementClassifier {
@@ -49,23 +55,23 @@ public final class StatementClassifier {
     private static final Set<String> INDEX_MODIFIERS = Set.of("unique", "fulltext", "spatial");
 
     /**
-     * 出现在 {@code a.b} 左侧时不足以说明"a 是库名"的词：SQL 关键字、子句开头、常见函数名。
-     *
-     * <p>不在这个表里的左侧标识符一律按库名处理（过判，见类注释）。函数名也列进来是因为 MySQL 允许
-     * {@code schema.func()} 这种写法，右侧是函数时不该算跨库表引用。
+     * 只有这些关键字之后的名称才在<b>表位置</b>上：{@code from}/{@code join}/{@code into}/{@code update}/
+     * {@code table} 之后出现的两段式名称才是跨库表引用。{@code where}/{@code on}/{@code set}/{@code select}
+     * 列表里的 {@code x.y} 是列限定（{@code t_order.id}、{@code o.id}），不是跨库——按字面形态判会把日常
+     * {@code update} 全顶到 L3。
      */
-    private static final Set<String> NON_QUALIFIER_WORDS = Set.of(
-            "select", "insert", "update", "delete", "replace", "merge", "from", "where", "and", "or", "not",
-            "on", "using", "join", "inner", "left", "right", "outer", "cross", "natural", "straight_join",
-            "group", "order", "by", "having", "limit", "offset", "union", "all", "distinct", "as", "into",
-            "values", "value", "set", "table", "database", "schema", "index", "key", "column", "constraint",
-            "primary", "foreign", "unique", "fulltext", "spatial", "check", "default", "partition", "case",
-            "when", "then", "else", "end", "is", "null", "like", "in", "exists", "between", "interval",
-            "character", "charset", "collate", "convert", "cast", "modify", "change", "add", "drop", "alter",
-            "create", "truncate", "rename", "desc", "describe", "explain", "show", "use", "call", "for",
-            "current_date", "current_time", "current_timestamp", "now", "count", "sum", "avg", "min", "max",
-            "if", "ifnull", "coalesce", "concat", "substr", "substring", "date_format", "json_extract",
-            "json_unquote", "length", "lower", "upper", "round", "floor", "ceil", "abs");
+    private static final Set<String> TABLE_POSITION_KEYWORDS = Set.of("from", "join", "into", "update", "table");
+
+    /** 表位置之后遇到这些词说明表列表已结束，后面的 {@code x.y} 是列或表达式，不是表引用。 */
+    private static final Set<String> TABLE_LIST_END = Set.of(
+            "where", "on", "using", "set", "group", "order", "having", "limit", "offset", "union",
+            "values", "value", "select", "for", "columns", "partition", "duplicate", "as",
+            "join", "inner", "left", "right", "outer", "cross", "natural", "straight_join",
+            "drop", "add", "modify", "change", "convert", "rename", "engine", "algorithm", "lock",
+            "comment", "default", "character", "collate", "auto_increment");
+
+    /** {@code with} 之后可能出现的顶层动词：{@code with} 语句的性质由它决定。 */
+    private static final Set<String> STATEMENT_VERBS = Set.of("select", "insert", "update", "delete", "replace");
 
     /**
      * 分类一条 SQL。{@code null} 与空白输入返回"什么都没有"的分类，不抛 NPE。
@@ -81,15 +87,20 @@ public final class StatementClassifier {
         String subject = multipleStatements ? statements.get(0) : original;
         List<Token> tokens = scan(subject);
 
-        DdlAction ddlAction = DdlAction.mostSevere(ddlActions(tokens));
+        EnumSet<DdlAction> actions = ddlActions(tokens);
+        DdlAction ddlAction = DdlAction.mostSevere(actions);
+        // 结构性判定看整组动作，而不是只看"最严重的那个"：声明顺序里 ALTER_MODIFY 排在改字符集与
+        // drop partition 之前，若只看返回值，`modify a int, convert to character set utf8mb4` 会把恒 L3
+        // 的改字符集漏掉。
+        boolean structuralDamage = actions.stream().anyMatch(DdlAction::isStructuralDamage);
         String firstKeyword = firstKeyword(tokens);
 
         return new Classification(
                 multipleStatements,
                 firstKeyword,
                 ddlAction,
-                ddlAction.isStructuralDamage(),
-                isWriteStatement(firstKeyword),
+                structuralDamage,
+                isWriteStatement(tokens, firstKeyword),
                 hasTopLevelKeyword(tokens, "where"),
                 hasTopLevelKeyword(tokens, "limit"),
                 hasCrossDatabaseReference(tokens),
@@ -103,9 +114,41 @@ public final class StatementClassifier {
         return tokens.get(0).lower();
     }
 
-    /** {@code Set.of(...)} 的 {@code contains(null)} 会抛 NPE，首关键字可能为空，先挡一层。 */
-    private static boolean isWriteStatement(String firstKeyword) {
-        return firstKeyword != null && WRITE_KEYWORDS.contains(firstKeyword);
+    /**
+     * 是否写语句。
+     *
+     * <p>{@code with} 开头的 CTE 不能只看首关键字：{@code with c as (...) delete from t} 的首关键字是
+     * {@code with}，但它是写语句。判成只读会让整单基础等级落 L0（免审批），方向正好错，所以这里按 CTE
+     * 之后的顶层动词判。
+     */
+    private static boolean isWriteStatement(List<Token> tokens, String firstKeyword) {
+        if (firstKeyword == null) {
+            return false;
+        }
+        if (WRITE_KEYWORDS.contains(firstKeyword)) {
+            return true;
+        }
+        if (!"with".equals(firstKeyword)) {
+            return false;
+        }
+        String verb = firstTopLevelVerb(tokens);
+        return verb != null && WRITE_KEYWORDS.contains(verb);
+    }
+
+    /**
+     * CTE 语句的顶层动词：括号深度 0 上第一个 {@code select/insert/update/delete/replace}。
+     *
+     * <p>取<b>第一个</b>而不是最后一个：{@code with c as (...) insert into t select * from c} 尾部的
+     * {@code select} 属于 insert 的一部分，取最后一个会把它误判成只读——正是这条判定要防的方向。
+     * {@code with ... select ... for update} 也因此仍判只读（{@code for update} 不是语句动词）。
+     */
+    private static String firstTopLevelVerb(List<Token> tokens) {
+        for (Token token : tokens) {
+            if (token.depth() == 0 && !token.quoted() && STATEMENT_VERBS.contains(token.lower())) {
+                return token.lower();
+            }
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------ DDL 动作
@@ -124,7 +167,9 @@ public final class StatementClassifier {
                         case "database", "schema" -> DdlAction.DROP_DATABASE;
                         case "table" -> DdlAction.DROP_TABLE;
                         case "partition" -> DdlAction.DROP_PARTITION;
-                        // drop index / view / trigger / procedure：是 DDL，但不是这里定义的结构性动作。
+                        // 顶层 drop index 与 alter table ... drop index 等价，归同一个动作。
+                        case "index", "key" -> DdlAction.ALTER_DROP_INDEX;
+                        // drop view / trigger / procedure：是 DDL，但不是这里定义的结构性动作。
                         default -> DdlAction.OTHER_DDL;
                     });
                 }
@@ -196,6 +241,8 @@ public final class StatementClassifier {
                     }
                 }
                 case "modify" -> actions.add(DdlAction.ALTER_MODIFY);
+                // change [column] 同时改名与改类型，收窄风险与 modify 相同，交给任务 4 的收窄判定覆盖。
+                case "change" -> actions.add(DdlAction.ALTER_MODIFY);
                 case "convert" -> {
                     if (isKeywordAt(tokens, i + 1, "to")
                             && (isKeywordAt(tokens, i + 2, "charset")
@@ -342,40 +389,48 @@ public final class StatementClassifier {
     }
 
     /**
-     * 骨架里是否出现 {@code 标识符.标识符} 且左侧不是关键字/函数名。
+     * 是否有跨库表引用：只认<b>表位置</b>上的两段式名称。
      *
-     * <p>反引号限定名被掩码，检测不到（已知局限，见类注释）。
+     * <p>{@code from}/{@code join}/{@code into}/{@code update}/{@code table} 之后出现的 {@code db2.t_order}
+     * 是跨库；{@code where t_order.id = 1}、{@code select o.id ...} 里的 {@code x.y} 是列限定，不算。
+     *
+     * <p>反引号限定名 {@code `db2`.`t_order`} 被掩码，检测不到（已知局限，见类注释）。
      */
     private static boolean hasCrossDatabaseReference(List<Token> tokens) {
-        for (Token token : tokens) {
-            if (token.quoted()) {
+        for (int i = 0; i < tokens.size(); i++) {
+            Token keyword = tokens.get(i);
+            if (keyword.quoted() || !TABLE_POSITION_KEYWORDS.contains(keyword.lower())) {
                 continue;
             }
-            String text = token.text();
-            if (text.indexOf('.') <= 0) {
-                continue;
-            }
-            String[] parts = text.split("\\.", -1);
-            boolean qualified = parts.length >= 2;
-            for (String part : parts) {
-                if (!isBareIdentifier(part)) {
-                    qualified = false;
+            // 表位置的同一层括号内继续找：from t1, db2.t2 与 join db2.t2 都要覆盖。
+            for (int j = i + 1; j < tokens.size(); j++) {
+                Token candidate = tokens.get(j);
+                if (candidate.depth() != keyword.depth()) {
+                    break; // 进入子查询或列定义，表列表已结束
+                }
+                if (candidate.quoted()) {
+                    continue;
+                }
+                if (TABLE_LIST_END.contains(candidate.lower())) {
                     break;
                 }
+                if (isTwoPartQualifiedName(candidate.text())) {
+                    return true;
+                }
             }
-            if (!qualified) {
-                continue;
-            }
-            String left = parts[0];
-            if (Character.isDigit(left.charAt(0))) {
-                continue; // 1.5 之类的数字字面量
-            }
-            if (NON_QUALIFIER_WORDS.contains(left.toLowerCase(Locale.ROOT))) {
-                continue;
-            }
-            return true;
         }
         return false;
+    }
+
+    /** 两段式限定名（{@code db2.t_order}）；三段（{@code db.t.col}）不算表位置上的引用。 */
+    private static boolean isTwoPartQualifiedName(String text) {
+        int dot = text.indexOf('.');
+        if (dot <= 0 || dot == text.length() - 1 || text.indexOf('.', dot + 1) >= 0) {
+            return false;
+        }
+        String left = text.substring(0, dot);
+        String right = text.substring(dot + 1);
+        return isBareIdentifier(left) && isBareIdentifier(right) && !Character.isDigit(left.charAt(0));
     }
 
     // ------------------------------------------------------------------ token 化

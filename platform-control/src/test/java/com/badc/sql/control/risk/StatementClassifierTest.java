@@ -227,4 +227,110 @@ class StatementClassifierTest {
         assertThat(c.table()).isEqualTo("db2.t_order");
         assertThat(c.writeStatement()).isTrue();
     }
+
+    // ---- F1：跨库只按表位置判，列限定/别名限定不算 ----
+
+    @Test
+    void a_qualified_column_in_where_is_not_cross_database() {
+        assertThat(classifier.classify("update t_order set a = 1 where t_order.id = 1").crossDatabase()).isFalse();
+    }
+
+    @Test
+    void an_alias_qualified_column_in_the_select_list_is_not_cross_database() {
+        assertThat(classifier.classify("select o.id from t_order o").crossDatabase()).isFalse();
+    }
+
+    @Test
+    void a_qualified_reference_after_from_is_cross_database() {
+        assertThat(classifier.classify("select id from db2.t_order where id = 1").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_qualified_table_after_join_is_cross_database() {
+        assertThat(classifier.classify(
+                "select o.id from t_order o join db2.t_user u on u.id = o.user_id").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_qualified_table_after_into_is_cross_database() {
+        assertThat(classifier.classify("insert into db2.t_order (a) values (1)").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_qualified_table_after_alter_table_is_cross_database() {
+        assertThat(classifier.classify("alter table db2.t_order add column a int null").crossDatabase()).isTrue();
+    }
+
+    // ---- F2：with-CTE 按顶层动词判是不是写语句 ----
+
+    @Test
+    void cte_over_select_is_not_a_write_statement() {
+        Classification c = classifier.classify("with cte as (select 1) select * from cte");
+        assertThat(c.firstKeyword()).isEqualTo("with");
+        assertThat(c.writeStatement()).isFalse();
+    }
+
+    @Test
+    void cte_over_delete_is_a_write_statement() {
+        Classification c = classifier.classify(
+                "with cte as (select id from t) delete from t2 where id in (select id from cte)");
+        assertThat(c.writeStatement()).isTrue();
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.NONE);
+    }
+
+    @Test
+    void cte_over_update_is_a_write_statement() {
+        assertThat(classifier.classify("with cte as (select id from t) update t2 set a = 1").writeStatement())
+                .isTrue();
+    }
+
+    /** 字符串里的 delete 不是动词；括号里的子查询也不算。 */
+    @Test
+    void a_word_delete_inside_a_literal_or_a_cte_body_does_not_make_it_a_write() {
+        assertThat(classifier.classify(
+                "with cte as (select 1 from t where note = 'delete') select * from cte").writeStatement()).isFalse();
+        assertThat(classifier.classify(
+                "with cte as (select id from t where note = 'update') select * from cte").writeStatement()).isFalse();
+    }
+
+    /** insert ... select 的尾部 select 属于 insert：必须判为写，不能按"最后一个顶层动词"判成只读。 */
+    @Test
+    void cte_over_insert_select_is_a_write_statement() {
+        assertThat(classifier.classify(
+                "with cte as (select id from t) insert into t2 select id from cte").writeStatement()).isTrue();
+    }
+
+    // ---- F3：change column 与顶层 drop index ----
+
+    @Test
+    void change_column_is_treated_as_a_modify() {
+        Classification c = classifier.classify("alter table t_order change column note note_bak varchar(64) not null");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.ALTER_MODIFY);
+        assertThat(c.structuralDamage()).isFalse();
+    }
+
+    @Test
+    void a_top_level_drop_index_is_structural_like_the_alter_form() {
+        Classification c = classifier.classify("drop index idx_note on t_order");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.ALTER_DROP_INDEX);
+        assertThat(c.structuralDamage()).isTrue();
+    }
+
+    /**
+     * 严重度顺序由枚举声明决定，{@code ALTER_MODIFY} 恰好排在改字符集与 drop partition 之前。若只看
+     * "最严重的那个动作"，这两种组合会把结构性硬规则 L3 漏掉——改字符集是恒 L3 的规则，不能因为同一条
+     * alter 里还改了列类型就消失。
+     */
+    @Test
+    void an_alter_that_also_converts_the_charset_is_still_structural() {
+        Classification c = classifier.classify("alter table t_order modify a int, convert to character set utf8mb4");
+        assertThat(c.ddlAction()).as("声明顺序下最严重的动作是 ALTER_MODIFY").isEqualTo(DdlAction.ALTER_MODIFY);
+        assertThat(c.structuralDamage()).as("改字符集仍是恒 L3 的硬规则").isTrue();
+    }
+
+    @Test
+    void an_alter_that_also_drops_a_partition_is_still_structural() {
+        assertThat(classifier.classify("alter table t_order modify a int, drop partition p1").structuralDamage())
+                .isTrue();
+    }
 }
