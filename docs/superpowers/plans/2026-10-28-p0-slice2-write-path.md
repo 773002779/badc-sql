@@ -420,13 +420,18 @@ git commit -m "feat(risk): split statements ignoring literals and pin the nine s
 
 **Interfaces:**
 - Consumes: `StatementClassifier.classify`、`Classification`（任务 3）。
-- Produces: `enum RiskLevel { L0, L1, L2, L3 }`；`record RiskHit(String ruleCode, RiskLevel level, Discipline discipline, String message)`，`enum Discipline { BLOCK, PIN_LEVEL, WARN, INFO }`；`PolicyValidator.validate(String sql, Classification c) -> List<RiskHit>`。
+- Produces:
+  - `enum RiskLevel { L0, L1, L2, L3 }`，带 `static RiskLevel stricter(RiskLevel a, RiskLevel b)`（取序号大者；null 视为 L0）
+  - `enum Discipline { BLOCK, PIN_LEVEL, WARN, INFO }`
+  - `record RiskHit(String ruleCode, Discipline discipline, RiskLevel level, String message)` —— `level` 只在 `PIN_LEVEL` 时有意义，`WARN`/`INFO`/`BLOCK` 传 `null`（类注释写明）
+  - `PolicyValidator.validate(String sql, Classification c, Map<String, Map<String, String>> oldColumnTypesOrNull) -> List<RiskHit>`
+  - `oldColumnTypesOrNull` 的形态是 `{表名: {列名: 类型文本}}`，来自结构快照；**为 null 时不得报错**，按最严分支处理（见 Step 3）
 
 - [ ] **Step 1: 写失败测试 — BLOCK 与 PIN_LEVEL 两种口径不能混**
 
 ```java
 @Test void drop_database_is_blocked_at_submit() {
-    assertThat(validator.validate("drop database order_db", classifier.classify("drop database order_db")))
+    assertThat(validator.validate("drop database order_db", classifier.classify("drop database order_db"), null))
         .singleElement()
         .satisfies(hit -> {
             assertThat(hit.discipline()).isEqualTo(Discipline.BLOCK);
@@ -437,7 +442,7 @@ git commit -m "feat(risk): split statements ignoring literals and pin the nine s
 @Test void multiple_statements_in_one_string_are_blocked() { /* "update t set a=1; delete from t" → BLOCK MULTI_STATEMENT */ }
 
 @Test void an_update_without_where_pins_l3_but_does_not_block() {
-    assertThat(validator.validate("update t_order set a = 1", classifier.classify("update t_order set a = 1")))
+    assertThat(validator.validate("update t_order set a = 1", classifier.classify("update t_order set a = 1"), null))
         .anySatisfy(hit -> {
             assertThat(hit.ruleCode()).isEqualTo("WRITE_WITHOUT_WHERE");
             assertThat(hit.discipline()).isEqualTo(Discipline.PIN_LEVEL);
@@ -447,16 +452,36 @@ git commit -m "feat(risk): split statements ignoring literals and pin the nine s
 
 @Test void drop_table_and_truncate_pin_l3() { /* 各一条 PIN_LEVEL L3 */ }
 
-/** varchar 收窄：bigint→int、varchar(255)→varchar(64) 都是 L3；反过来放宽不是。 */
-@Test void narrowing_a_column_type_pins_l3() {
-    assertThat(validator.validate("alter table t modify column c varchar(64) not null",
-            classifier.classify("alter table t modify column c varchar(64) not null")))
-        .anySatisfy(hit -> assertThat(hit.ruleCode()).isEqualTo("ALTER_MODIFY_NARROWED"));
+/** 有旧类型且是放宽：不算收窄，不得命中 ALTER_MODIFY_NARROWED。 */
+@Test void widening_a_column_type_is_not_narrowing_when_the_old_type_is_known() {
+    Map<String, Map<String, String>> old = Map.of("t", Map.of("c", "varchar(64)"));
+    assertThat(validator.validate("alter table t modify column c varchar(255) not null",
+            classifier.classify("alter table t modify column c varchar(255) not null"), old))
+        .noneSatisfy(hit -> assertThat(hit.ruleCode()).isEqualTo("ALTER_MODIFY_NARROWED"));
 }
 
-@Test void widening_a_column_type_is_not_structural() { /* varchar(64) → varchar(255) → 无该命中 */ }
+/** 有旧类型且是收窄：命中 L3。 */
+@Test void narrowing_a_column_type_pins_l3_when_the_old_type_is_known() {
+    Map<String, Map<String, String>> old = Map.of("t", Map.of("c", "varchar(255)"));
+    assertThat(validator.validate("alter table t modify column c varchar(64) not null",
+            classifier.classify("alter table t modify column c varchar(64) not null"), old))
+        .anySatisfy(hit -> {
+            assertThat(hit.ruleCode()).isEqualTo("ALTER_MODIFY_NARROWED");
+            assertThat(hit.level()).isEqualTo(RiskLevel.L3);
+        });
+}
 
-@Test void select_star_is_only_a_warning() { /* WARN SELECT_STAR，level 不影响最终等级 */ }
+/** 没有旧类型可比：一律按最严，并说明理由——这条用例是"保守分支"的唯一证据，不能省。 */
+@Test void an_unknown_old_type_falls_back_to_l3_with_a_reason() {
+    assertThat(validator.validate("alter table t modify column c varchar(255) not null",
+            classifier.classify("alter table t modify column c varchar(255) not null"), null))
+        .anySatisfy(hit -> {
+            assertThat(hit.ruleCode()).isEqualTo("ALTER_MODIFY_NARROWED");
+            assertThat(hit.message()).contains("无法判定");
+        });
+}
+
+@Test void select_star_is_only_a_warning() { /* WARN SELECT_STAR，level 为 null */ }
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -476,7 +501,12 @@ Expected: FAIL — 类不存在。
 
 `INFO`：`KEYWORD_NOT_UPPERCASE`、`INDENTATION_MESSY`（后者只做"行首混用空格与制表符"这一条可判定的规则，不做风格评分）。
 
-收窄判定：`ALTER_MODIFY` 时从**原文**（非骨架）取 `modify [column] <name> <type>`，同表同列在结构快照里没有类型的场景（本切片无快照输入）用保守规则——`bigint → int|smallint|tinyint`、`varchar(n) → varchar(m)` 且 `m < n`、`char(n) → char(m)` 且 `m < n`、`decimal(p,s) → decimal(p',s')` 且 `p' < p`。匹配不到模式 → 视为收窄（保守，宁可 L3）。
+收窄判定（**这是本任务最容易做错的一处**）：收窄是"前后对比"，而一句 `alter table t modify column c varchar(64)` 里没有旧类型。所以判定必须依赖 `oldColumnTypesOrNull`：
+
+- **给了旧类型**：按原文取 `modify [column] <name> <type>` 与 `{table: {column: oldType}}` 比对——`bigint → int|smallint|tinyint`、`varchar(n) → varchar(m)` 且 `m < n`、`char(n) → char(m)` 且 `m < n`、`decimal(p,s) → decimal(p',s')` 且 `p' < p` 为收窄；放宽或换类型但无法证明收窄 → 不命中。
+- **没给旧类型（`null`）或查不到该列**：`ALTER_MODIFY`/`ALTER_ADD_COLUMN` 之外的任何 `modify`/`change` 一律 `PIN_LEVEL L3`，消息含 `无法判定是否收窄`。
+
+任务 7 会从结构快照填这个参数；在它填上之前，系统对所有 `modify` 都按 L3 处理——这是刻意的保守，不是遗漏。**两条路径都要有用例**，否则这个设计会静悄悄退化成"一律 L3"而无人察觉。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -725,7 +755,7 @@ git commit -m "feat(executor): capture schema snapshots and fingerprints, and es
 - Consumes: `StatementClassifier`、`PolicyValidator`（任务 3、4），`ExecutorClient.explain(ConnConfig, String) -> ExplainEstimate`。
 - Produces:
   - `record RiskAssessment(RiskLevel level, List<RiskHit> hits, String snapshotHash)`
-  - `RiskEngine.assess(RiskRequest request) -> RiskAssessment`；`record RiskRequest(String sql, Classification classification, ExplainEstimate estimate, boolean withinWindow, boolean snapshotEnabled)`
+  - `RiskEngine.assess(RiskRequest request) -> RiskAssessment`；`record RiskRequest(String sql, Classification classification, ExplainEstimate estimate, boolean withinWindow, boolean snapshotEnabled, Map<String, Map<String, String>> oldColumnTypesOrNull)` —— 最后一个参数原样透传给 `PolicyValidator.validate`，任务 7 从结构快照填入；为 `null` 时收窄判定走"无法判定→L3"的保守分支
   - `RiskAssessment.blocked()` → `hits` 中存在 `Discipline.BLOCK`
   - `ExecWindow.isWithin(Instant at) -> boolean`
   - `RiskProperties`：`badcsql.risk.l1-max-rows=100`、`l2-max-rows=1000`、`window-start=20:00`、`window-end=06:00`、`window-zone=Asia/Shanghai`；另有 `RiskProperties.relaxed()` 静态工厂（阈值放到最大，仅供"硬规则不可放宽"的对照用例）
@@ -741,11 +771,11 @@ private final RiskEngine engine = new RiskEngine(new PolicyValidator(), new Risk
 private RiskEngine engineWith(RiskProperties p) { return new RiskEngine(new PolicyValidator(), p); }
 
 private RiskRequest req(String sql, boolean withinWindow) {
-    return new RiskRequest(sql, classifier.classify(sql), new ExplainEstimate(-1), withinWindow, true);
+    return new RiskRequest(sql, classifier.classify(sql), new ExplainEstimate(-1), withinWindow, true, null);
 }
 
 private RiskRequest reqWithEstimate(String sql, long rows, boolean withinWindow) {
-    return new RiskRequest(sql, classifier.classify(sql), new ExplainEstimate(rows), withinWindow, true);
+    return new RiskRequest(sql, classifier.classify(sql), new ExplainEstimate(rows), withinWindow, true, null);
 }
 ```
 
@@ -806,7 +836,7 @@ private RiskRequest reqWithEstimate(String sql, long rows, boolean withinWindow)
 /** 快照关闭升 L3（本切片快照不可关，保留判定以便切片 3 复用）。 */
 @Test void a_disabled_snapshot_grades_l3_and_is_recorded_as_a_hit() {
     RiskRequest r = new RiskRequest("update t set a = 1 where id = 1",
-            classifier.classify("update t set a = 1 where id = 1"), new ExplainEstimate(1), true, false);
+            classifier.classify("update t set a = 1 where id = 1"), new ExplainEstimate(1), true, false, null);
     RiskAssessment a = engine.assess(r);
     assertThat(a.level()).isEqualTo(RiskLevel.L3);
     assertThat(a.hits()).anySatisfy(h -> assertThat(h.ruleCode()).isEqualTo("SNAPSHOT_DISABLED"));
