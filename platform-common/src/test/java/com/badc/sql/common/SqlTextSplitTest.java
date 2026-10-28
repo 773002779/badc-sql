@@ -55,4 +55,37 @@ class SqlTextSplitTest {
         assertThat(SqlText.splitStatements("  \n\t ")).isEmpty();
         assertThat(SqlText.splitStatements(";")).isEmpty();
     }
+
+    // ---- firstTopLevelVerb：两个模块共用的"这是不是写语句"判定的基础 ----
+
+    @Test
+    void first_top_level_verb_is_the_first_verb_outside_parentheses() {
+        assertThat(SqlText.firstTopLevelVerb("with c as (select 1) delete from t")).isEqualTo("delete");
+        assertThat(SqlText.firstTopLevelVerb("with c as (select 1) select * from c")).isEqualTo("select");
+        // insert ... select 的尾部 select 属于 insert：必须返回第一个
+        assertThat(SqlText.firstTopLevelVerb("with c as (select 1) insert into t2 select id from c"))
+                .isEqualTo("insert");
+    }
+
+    @Test
+    void first_top_level_verb_is_lowercased() {
+        assertThat(SqlText.firstTopLevelVerb("SELECT 1")).isEqualTo("select");
+        assertThat(SqlText.firstTopLevelVerb("Update t set a = 1")).isEqualTo("update");
+    }
+
+    /** 词边界：包含动词的更长标识符不算动词。 */
+    @Test
+    void first_top_level_verb_ignores_words_that_merely_contain_a_verb() {
+        assertThat(SqlText.firstTopLevelVerb("selection from t")).isNull();
+        assertThat(SqlText.firstTopLevelVerb("t_select from t")).isNull();
+        assertThat(SqlText.firstTopLevelVerb("updated_at = now()")).isNull();
+    }
+
+    @Test
+    void first_top_level_verb_returns_null_when_there_is_none() {
+        assertThat(SqlText.firstTopLevelVerb(null)).isNull();
+        assertThat(SqlText.firstTopLevelVerb("")).isNull();
+        assertThat(SqlText.firstTopLevelVerb("with c as (select 1)")).isNull();
+        assertThat(SqlText.firstTopLevelVerb("   ")).isNull();
+    }
 }

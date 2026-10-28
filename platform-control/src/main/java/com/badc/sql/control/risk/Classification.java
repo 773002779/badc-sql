@@ -15,11 +15,13 @@ package com.badc.sql.control.risk;
  *                           单独出现时为 {@code false}（收窄由任务 4 判）。
  * @param writeStatement     是否写语句：首关键字属于 {@code insert/update/delete/replace} 或 DDL
  *                           （{@code create/alter/drop/truncate/rename}）；{@code with} 开头的 CTE 按其
- *                           顶层动词判（{@code with ... insert/update/delete/replace} 是写）。
+ *                           顶层动词判（{@code with ... insert/update/delete/replace} 是写）；
+ *                           {@code explain analyze <dml>} 是写（会真的执行），{@code explain <dml>} 不是。
  * @param hasWhere           顶层（括号外、代码里）是否有 {@code where}。子查询里的 {@code where} 不算。
  * @param hasLimit           顶层（括号外、代码里）是否有 {@code limit}。子查询里的 {@code limit} 不算。
- * @param crossDatabase      是否有跨库表引用：只在<b>表位置</b>（{@code from/join/into/update/table} 之后）
- *                           认 {@code db2.t_order} 形式；{@code where t_order.id = 1} 这类列限定不算。
+ * @param crossDatabase      是否有跨库表引用：只在<b>表位置</b>（{@code from/join/into/straight_join/using/
+ *                           table} 之后，或首关键字的 {@code update} 之后）认 {@code db2.t_order} 形式；
+ *                           {@code where t_order.id = 1} 这类列限定不算。别名与逗号分隔的多表列表会被继续检查。
  *                           反引号限定名检测不到，见 {@link StatementClassifier} 的已知局限。
  * @param table              语句作用的目标表，取自<b>原文</b>（剥离后的骨架里表名是空格），反引号已去掉；
  *                           取不到为 {@code null}。

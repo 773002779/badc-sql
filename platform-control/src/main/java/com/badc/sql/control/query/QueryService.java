@@ -175,7 +175,13 @@ public class QueryService {
                 rest = rest.substring(7).stripLeading();
             }
             String verb = firstKeyword(rest);
-            return "select".equals(verb) || "with".equals(verb);
+            if ("with".equals(verb)) {
+                // EXPLAIN [ANALYZE] WITH ...：CTE 的性质看它之后的顶层动词，与下面的 with 分支同一口径。
+                // 只信任 "with" 会让 `explain analyze with cte as (...) delete from t` 通过只读白名单，
+                // 而 EXPLAIN ANALYZE 在 MySQL 里是会真的执行那条 DML 的。
+                return "select".equals(SqlText.firstTopLevelVerb(code));
+            }
+            return "select".equals(verb);
         }
         if ("with".equals(first)) {
             // 取 CTE 之后的第一个顶层动词，而不是最后一个：`with ... insert into t2 select ...` 尾部的

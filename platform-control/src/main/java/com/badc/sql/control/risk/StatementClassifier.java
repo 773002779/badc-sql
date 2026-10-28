@@ -20,18 +20,28 @@ import com.badc.sql.common.sql.SqlText;
  * <p>本类<b>纯文本</b>：无 Spring 依赖、不连库、不读配置，可单元测试跑满。等级判定不在这里——结构性破坏
  * 的七个动作恒为 L3，而 {@code alter modify} 是否收窄、跨库要不要抬级、多语句要不要拦，都由任务 4/6 决定。
  *
- * <p><b>跨库判定只看表位置</b>：只有 {@code from}/{@code join}/{@code into}/{@code update}/{@code table}
- * 之后出现的两段式名称（{@code db2.t_order}）才算跨库；{@code where t_order.id = 1}、{@code select o.id}
- * 里的 {@code x.y} 是列限定，不算。否则日常 {@code update} 会被全部顶到 L3。
+ * <p><b>跨库判定只看表位置</b>：只有 {@code from}/{@code join}/{@code into}/{@code straight_join}/{@code using}/
+ * {@code table}（以及首关键字的 {@code update}）之后出现的两段式名称（{@code db2.t_order}）才算跨库；
+ * {@code where t_order.id = 1}、{@code select o.id} 里的 {@code x.y} 是列限定，不算。别名不是表列表的结束，
+ * 逗号分隔的多表列表会继续检查——{@code update t1 as a, db2.t2 as b set ...} 必须命中。
  *
  * <p><b>{@code with} 开头的 CTE 按顶层动词判性质</b>：{@code with ... select} 是只读，
  * {@code with ... insert/update/delete/replace} 是写语句（{@code ddlAction} 为 {@code NONE}）——
  * 判成只读会让整单基础等级落到 L0（免审批），方向正好错。这里的顶层动词判定与查询接口的只读白名单共用
  * {@link SqlText#firstTopLevelVerb(String)}，两个入口不会对同一条 SQL 给出相反结论。
  *
+ * <p><b>{@code explain} 看有没有 {@code analyze}</b>：{@code explain <dml>} 只出执行计划，不算写；
+ * {@code explain analyze <dml>} 在 MySQL 里会真的执行那条 DML，算写语句（{@code ddlAction} 为 {@code NONE}）。
+ * 这一条与只读白名单的 {@code explain} 分支对齐——否则 {@code explain analyze ... delete} 会被当只读放行。
+ *
+ * <p><b>DDL 动作只从首关键字起扫</b>：{@code select truncate from t} 是合法的只读查询，不能因为列名叫
+ * {@code truncate} 就被判成结构性破坏。
+ *
  * <p>{@link DdlAction#ALTER_DROP_INDEX} 同时覆盖 alter 形式（{@code alter table t drop index i}）与
  * 顶层形式（{@code drop index i on t}）；{@link DdlAction#ALTER_MODIFY} 同时覆盖 {@code modify} 与
- * {@code change [column]}（改名 + 改类型，收窄风险相同）。
+ * {@code change [column]}（改名 + 改类型，收窄风险相同）；{@link DdlAction#RENAME_TABLE} 同时覆盖
+ * {@code rename table a to b} 与 {@code alter table a rename [to|as] b}；{@link DdlAction#DROP_PARTITION}
+ * 同时覆盖 {@code drop partition} 与 {@code truncate partition}（都是整分区数据丢失）。
  *
  * <h2>已知局限</h2>
  * <ul>
@@ -46,6 +56,12 @@ public final class StatementClassifier {
     private static final Set<String> WRITE_KEYWORDS = Set.of(
             "insert", "update", "delete", "replace", "create", "alter", "drop", "truncate", "rename");
 
+    /** 只有首关键字是它们时，这条语句才可能是 DDL；用来挡住 {@code select truncate from t} 这类误判。 */
+    private static final Set<String> DDL_KEYWORDS = Set.of("create", "alter", "drop", "truncate", "rename");
+
+    /** {@code EXPLAIN ANALYZE} 会真的执行其后的语句：这些动词意味着真的写库。 */
+    private static final Set<String> DML_VERBS = Set.of("insert", "update", "delete", "replace");
+
     /** {@code drop/create table} 之后、表名之前可能夹着的词。 */
     private static final Set<String> TABLE_NAME_FILLERS = Set.of("temporary", "if", "not", "exists");
 
@@ -56,20 +72,25 @@ public final class StatementClassifier {
     private static final Set<String> INDEX_MODIFIERS = Set.of("unique", "fulltext", "spatial");
 
     /**
-     * 只有这些关键字之后的名称才在<b>表位置</b>上：{@code from}/{@code join}/{@code into}/{@code update}/
-     * {@code table} 之后出现的两段式名称才是跨库表引用。{@code where}/{@code on}/{@code set}/{@code select}
-     * 列表里的 {@code x.y} 是列限定（{@code t_order.id}、{@code o.id}），不是跨库——按字面形态判会把日常
-     * {@code update} 全顶到 L3。
+     * 只有这些关键字之后的名称才在<b>表位置</b>上：{@code from}/{@code join}/{@code into}/{@code table}/
+     * {@code straight_join}/{@code using} 之后出现的两段式名称才是跨库表引用。{@code where}/{@code on}/
+     * {@code set}/{@code select} 列表里的 {@code x.y} 是列限定（{@code t_order.id}、{@code o.id}），不是跨库。
+     *
+     * <p>{@code update} 不在集合里而是单独判：只有它不是 {@code on duplicate key update} 里的那个
+     * {@code update} 时才算表位置（见 {@link #hasCrossDatabaseReference(List)}），否则普通 upsert 里
+     * {@code update b = c.d} 的 {@code c.d} 会被当成跨库表。
      */
-    private static final Set<String> TABLE_POSITION_KEYWORDS = Set.of("from", "join", "into", "update", "table");
+    private static final Set<String> TABLE_POSITION_KEYWORDS = Set.of(
+            "from", "join", "into", "table", "straight_join", "using");
 
     /** 表位置之后遇到这些词说明表列表已结束，后面的 {@code x.y} 是列或表达式，不是表引用。 */
     private static final Set<String> TABLE_LIST_END = Set.of(
             "where", "on", "using", "set", "group", "order", "having", "limit", "offset", "union",
-            "values", "value", "select", "for", "columns", "partition", "duplicate", "as",
+            "values", "value", "select", "for", "columns", "partition", "duplicate",
             "join", "inner", "left", "right", "outer", "cross", "natural", "straight_join",
             "drop", "add", "modify", "change", "convert", "rename", "engine", "algorithm", "lock",
             "comment", "default", "character", "collate", "auto_increment");
+
 
     /**
      * 分类一条 SQL。{@code null} 与空白输入返回"什么都没有"的分类，不抛 NPE。
@@ -120,6 +141,9 @@ public final class StatementClassifier {
      * 顶层动词判——判定与查询接口的只读白名单共用 {@link SqlText#firstTopLevelVerb(String)}，两个入口
      * 不会给出相反结论。
      *
+     * <p>{@code explain} 要看有没有 {@code analyze}：{@code explain <dml>} 只出执行计划、不执行；
+     * {@code explain analyze <dml>} 在 MySQL 里<b>会真的执行</b>那条语句，所以后者算写语句。
+     *
      * <p>拿不到顶层动词时按写语句处理（保守）：宁可多审一次，也不把一条来历不明的语句放成只读。
      */
     private static boolean isWriteStatement(String subject, String firstKeyword) {
@@ -129,17 +153,51 @@ public final class StatementClassifier {
         if (WRITE_KEYWORDS.contains(firstKeyword)) {
             return true;
         }
-        if (!"with".equals(firstKeyword)) {
+        if ("with".equals(firstKeyword)) {
+            String verb = SqlText.firstTopLevelVerb(SqlText.stripLiteralsAndComments(subject));
+            return verb == null || WRITE_KEYWORDS.contains(verb);
+        }
+        if ("explain".equals(firstKeyword)) {
+            return isWriteUnderExplain(SqlText.stripLiteralsAndComments(subject));
+        }
+        return false;
+    }
+
+    /**
+     * {@code explain analyze <dml>} 会真的执行 DML，算写；{@code explain <dml>}（不带 analyze）只出计划，不算。
+     *
+     * @param code 已剥离注释与字面量的文本，首词必然是 {@code explain}（调用方已确认）
+     */
+    private static boolean isWriteUnderExplain(String code) {
+        String rest = code.stripLeading();
+        int endOfExplain = 0;
+        while (endOfExplain < rest.length() && Character.isLetter(rest.charAt(endOfExplain))) {
+            endOfExplain++;
+        }
+        String after = rest.substring(Math.min(endOfExplain, rest.length())).stripLeading();
+        if (!startsWithWord(after, "analyze")) {
+            return false; // explain <dml>：只出计划，不执行
+        }
+        String verb = SqlText.firstTopLevelVerb(code);
+        return verb == null || DML_VERBS.contains(verb);
+    }
+
+    private static boolean startsWithWord(String text, String word) {
+        if (!text.startsWith(word)) {
             return false;
         }
-        String verb = SqlText.firstTopLevelVerb(SqlText.stripLiteralsAndComments(subject));
-        return verb == null || WRITE_KEYWORDS.contains(verb);
+        int end = word.length();
+        return text.length() == end || !isNameChar(text.charAt(end));
     }
 
     // ------------------------------------------------------------------ DDL 动作
 
     private static EnumSet<DdlAction> ddlActions(List<Token> tokens) {
         EnumSet<DdlAction> actions = EnumSet.noneOf(DdlAction.class);
+        // 只有首 token 是 DDL 关键字时才扫动作：否则 `select truncate from t` 会被判成结构性破坏。
+        if (tokens.isEmpty() || tokens.get(0).quoted() || !DDL_KEYWORDS.contains(tokens.get(0).lower())) {
+            return actions;
+        }
         for (int i = 0; i < tokens.size(); i++) {
             Token token = tokens.get(i);
             if (token.depth() != 0 || token.quoted()) {
@@ -228,6 +286,20 @@ public final class StatementClassifier {
                 case "modify" -> actions.add(DdlAction.ALTER_MODIFY);
                 // change [column] 同时改名与改类型，收窄风险与 modify 相同，交给任务 4 的收窄判定覆盖。
                 case "change" -> actions.add(DdlAction.ALTER_MODIFY);
+                case "rename" -> {
+                    // alter table a rename [to|as] b 等价于 rename table a to b；rename column/index/key
+                    // 只是改名字，不是表级结构破坏（没有可识别动作，最终归 OTHER_DDL）。
+                    String next = lowerAt(tokens, i + 1);
+                    if (!"column".equals(next) && !"index".equals(next) && !"key".equals(next)) {
+                        actions.add(DdlAction.RENAME_TABLE);
+                    }
+                }
+                case "truncate" -> {
+                    // truncate partition 与 drop partition 一样是整分区数据丢失。
+                    if (isKeywordAt(tokens, i + 1, "partition")) {
+                        actions.add(DdlAction.DROP_PARTITION);
+                    }
+                }
                 case "convert" -> {
                     if (isKeywordAt(tokens, i + 1, "to")
                             && (isKeywordAt(tokens, i + 2, "charset")
@@ -376,18 +448,23 @@ public final class StatementClassifier {
     /**
      * 是否有跨库表引用：只认<b>表位置</b>上的两段式名称。
      *
-     * <p>{@code from}/{@code join}/{@code into}/{@code update}/{@code table} 之后出现的 {@code db2.t_order}
-     * 是跨库；{@code where t_order.id = 1}、{@code select o.id ...} 里的 {@code x.y} 是列限定，不算。
+     * <p>{@code from}/{@code join}/{@code into}/{@code straight_join}/{@code using}/{@code table} 之后出现的
+     * {@code db2.t_order} 是跨库；{@code where t_order.id = 1}、{@code select o.id ...} 里的 {@code x.y}
+     * 是列限定，不算。别名（{@code as}）不是表列表的结束，逗号分隔的多表列表会继续被检查，
+     * 所以 {@code update t1 as a, db2.t2 as b set ...} 能命中。
+     *
+     * <p>{@code update} 单独判：只有它不是 {@code on duplicate key update} 里的那个 {@code update} 时才算
+     * 表位置——否则普通 upsert 的 {@code update b = c.d} 会把 {@code c.d} 当成跨库表。
      *
      * <p>反引号限定名 {@code `db2`.`t_order`} 被掩码，检测不到（已知局限，见类注释）。
      */
     private static boolean hasCrossDatabaseReference(List<Token> tokens) {
         for (int i = 0; i < tokens.size(); i++) {
             Token keyword = tokens.get(i);
-            if (keyword.quoted() || !TABLE_POSITION_KEYWORDS.contains(keyword.lower())) {
+            if (keyword.quoted() || !isTablePosition(tokens, i)) {
                 continue;
             }
-            // 表位置的同一层括号内继续找：from t1, db2.t2 与 join db2.t2 都要覆盖。
+            // 表位置的同一层括号内继续找：from t1 as a, db2.t2 与 join db2.t2 都要覆盖。
             for (int j = i + 1; j < tokens.size(); j++) {
                 Token candidate = tokens.get(j);
                 if (candidate.depth() != keyword.depth()) {
@@ -405,6 +482,18 @@ public final class StatementClassifier {
             }
         }
         return false;
+    }
+
+    /** 该 token 是否开启一个表列表：表位置关键字，或不是 {@code on duplicate key update} 的 {@code update}。 */
+    private static boolean isTablePosition(List<Token> tokens, int index) {
+        String word = tokens.get(index).lower();
+        if (TABLE_POSITION_KEYWORDS.contains(word)) {
+            return true;
+        }
+        if (!"update".equals(word)) {
+            return false;
+        }
+        return index == 0 || !"key".equals(tokens.get(index - 1).lower());
     }
 
     /** 两段式限定名（{@code db2.t_order}）；三段（{@code db.t.col}）不算表位置上的引用。 */

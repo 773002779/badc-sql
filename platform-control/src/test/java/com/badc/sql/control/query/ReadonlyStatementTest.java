@@ -59,6 +59,21 @@ class ReadonlyStatementTest {
         assertThat(QueryService.isReadonlyStatement("explain analyze delete from t")).isFalse();
     }
 
+    /** EXPLAIN ANALYZE 会真的执行后面的 DML，所以 CTE 里的写也必须看穿，不能只因为首词是 with 就放行。 */
+    @Test
+    void explain_analyze_over_cte_dml_is_not_readonly() {
+        assertThat(QueryService.isReadonlyStatement("explain analyze with cte as (select 1) delete from t")).isFalse();
+        assertThat(QueryService.isReadonlyStatement("explain analyze with cte as (select 1) update t set x = 1"))
+                .isFalse();
+        assertThat(QueryService.isReadonlyStatement("explain with cte as (select 1) delete from t")).isFalse();
+    }
+
+    @Test
+    void explain_over_cte_select_is_readonly() {
+        assertThat(QueryService.isReadonlyStatement("explain analyze with cte as (select 1) select * from cte")).isTrue();
+        assertThat(QueryService.isReadonlyStatement("explain with cte as (select 1) select * from cte")).isTrue();
+    }
+
     @Test
     void explain_over_select_is_readonly() {
         assertThat(QueryService.isReadonlyStatement("explain select * from t")).isTrue();

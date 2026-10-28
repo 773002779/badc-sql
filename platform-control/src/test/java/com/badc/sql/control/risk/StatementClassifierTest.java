@@ -323,20 +323,142 @@ class StatementClassifierTest {
     }
 
     /**
-     * 严重度顺序由枚举声明决定，{@code ALTER_MODIFY} 恰好排在改字符集与 drop partition 之前。若只看
-     * "最严重的那个动作"，这两种组合会把结构性硬规则 L3 漏掉——改字符集是恒 L3 的规则，不能因为同一条
-     * alter 里还改了列类型就消失。
+     * 严重度顺序必须等于声明顺序（{@link DdlAction} 的契约）：结构性动作全部排在非结构性动作之前，所以
+     * 同一条 alter 里的 {@code convert to charset} 比 {@code modify} 更严重，两者都要被判出来。
      */
     @Test
     void an_alter_that_also_converts_the_charset_is_still_structural() {
         Classification c = classifier.classify("alter table t_order modify a int, convert to character set utf8mb4");
-        assertThat(c.ddlAction()).as("声明顺序下最严重的动作是 ALTER_MODIFY").isEqualTo(DdlAction.ALTER_MODIFY);
-        assertThat(c.structuralDamage()).as("改字符集仍是恒 L3 的硬规则").isTrue();
+        assertThat(c.ddlAction()).as("声明顺序下最严重的动作是改字符集").isEqualTo(DdlAction.ALTER_CONVERT_CHARSET);
+        assertThat(c.structuralDamage()).as("改字符集是恒 L3 的硬规则").isTrue();
     }
 
     @Test
     void an_alter_that_also_drops_a_partition_is_still_structural() {
-        assertThat(classifier.classify("alter table t_order modify a int, drop partition p1").structuralDamage())
-                .isTrue();
+        Classification c = classifier.classify("alter table t_order modify a int, drop partition p1");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.DROP_PARTITION);
+        assertThat(c.structuralDamage()).isTrue();
+    }
+
+    // ---- I1：alter ... rename 与 truncate partition 也属于结构性硬规则 ----
+
+    @Test
+    void alter_table_rename_to_is_structural() {
+        Classification c = classifier.classify("alter table t1 rename to t2");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.RENAME_TABLE);
+        assertThat(c.structuralDamage()).isTrue();
+        assertThat(c.table()).isEqualTo("t1");
+    }
+
+    @Test
+    void alter_table_rename_as_is_structural() {
+        assertThat(classifier.classify("alter table t1 rename as t2").ddlAction()).isEqualTo(DdlAction.RENAME_TABLE);
+    }
+
+    /** 改列名只是改名字，不动数据，不算结构性破坏。 */
+    @Test
+    void alter_table_rename_column_is_not_structural() {
+        Classification c = classifier.classify("alter table t1 rename column a to b");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.OTHER_DDL);
+        assertThat(c.structuralDamage()).isFalse();
+    }
+
+    @Test
+    void alter_table_truncate_partition_is_structural() {
+        Classification c = classifier.classify("alter table t truncate partition p1");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.DROP_PARTITION);
+        assertThat(c.structuralDamage()).isTrue();
+    }
+
+    // ---- I2：别名与逗号分隔的多表列表不能中断跨库检测 ----
+
+    @Test
+    void a_cross_database_table_after_a_comma_with_aliases_is_flagged() {
+        assertThat(classifier.classify("update t1 as a, db2.t2 as b set a.x = 1").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_cross_database_table_after_a_comma_in_from_is_flagged() {
+        assertThat(classifier.classify("select * from t1 as a, db2.t2 as b").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_multi_table_delete_with_aliases_is_flagged() {
+        assertThat(classifier.classify("delete a from t1 as a, db2.t2 as b").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_delete_using_a_cross_database_table_is_flagged() {
+        assertThat(classifier.classify("delete from t1 using t1, db2.t2").crossDatabase()).isTrue();
+    }
+
+    @Test
+    void a_straight_join_across_databases_is_flagged() {
+        assertThat(classifier.classify("select * from t1 straight_join db2.t2").crossDatabase()).isTrue();
+    }
+
+    /** 逗号在 from 之前（select 列表里）不是表列表，不能触发。 */
+    @Test
+    void a_comma_in_the_select_list_is_not_a_table_list() {
+        assertThat(classifier.classify("select a, b from t1").crossDatabase()).isFalse();
+    }
+
+    /** 放开 as 之后仍不能把"别名.列"当跨库：别名后面没有第二张带库名的表。 */
+    @Test
+    void an_alias_with_qualified_columns_is_not_cross_database() {
+        assertThat(classifier.classify("select * from t1 as x where x.id = 1").crossDatabase()).isFalse();
+        assertThat(classifier.classify("update t1 as a set a.x = 1 where a.id = 2").crossDatabase()).isFalse();
+    }
+
+    // ---- I3：EXPLAIN ANALYZE 会真的执行 DML ----
+
+    @Test
+    void explain_analyze_with_delete_is_a_write() {
+        Classification c = classifier.classify("explain analyze with cte as (select 1) delete from t");
+        assertThat(c.writeStatement()).isTrue();
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.NONE);
+    }
+
+    @Test
+    void explain_analyze_delete_is_a_write() {
+        Classification c = classifier.classify("explain analyze delete from t");
+        assertThat(c.writeStatement()).isTrue();
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.NONE);
+    }
+
+    @Test
+    void explain_analyze_select_is_not_a_write() {
+        assertThat(classifier.classify("explain analyze select * from t").writeStatement()).isFalse();
+    }
+
+    /** 不带 analyze 的 explain 只出执行计划，不执行。 */
+    @Test
+    void explain_without_analyze_is_not_a_write() {
+        assertThat(classifier.classify("explain delete from t").writeStatement()).isFalse();
+    }
+
+    // ---- M1：只读查询里的 DDL 词不能触发结构判定 ----
+
+    @Test
+    void a_ddl_word_in_a_select_list_is_not_ddl() {
+        assertThat(classifier.classify("select truncate from t").ddlAction()).isEqualTo(DdlAction.NONE);
+        assertThat(classifier.classify("select truncate from t").structuralDamage()).isFalse();
+        assertThat(classifier.classify("select rename from t").ddlAction()).isEqualTo(DdlAction.NONE);
+    }
+
+    // ---- M2：upsert 的 on duplicate key update 不是表位置 ----
+
+    @Test
+    void an_upsert_on_duplicate_key_is_not_cross_database() {
+        assertThat(classifier.classify("insert into t (a) values (1) on duplicate key update b = c.d").crossDatabase())
+                .isFalse();
+    }
+
+    /** DROP_DATABASE 走 BLOCK 而不是 L3：这条不对称是故意的，钉住它防止被"顺手修掉"。 */
+    @Test
+    void drop_database_is_blocked_but_not_structural_damage() {
+        Classification c = classifier.classify("drop database order_db");
+        assertThat(c.ddlAction()).isEqualTo(DdlAction.DROP_DATABASE);
+        assertThat(c.structuralDamage()).isFalse();
     }
 }
