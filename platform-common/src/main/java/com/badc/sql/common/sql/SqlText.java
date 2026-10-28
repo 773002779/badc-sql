@@ -1,5 +1,8 @@
 package com.badc.sql.common.sql;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * SQL 文本的轻量扫描工具：识别代码字符，把注释与字符串字面量排除在外。
  *
@@ -70,6 +73,38 @@ public final class SqlText {
             i++;
         }
         return isCode;
+    }
+
+    /**
+     * 按顶层 {@code ;} 切分，返回用户原文的片段（只去掉两端空白，不做任何改写）。
+     *
+     * <p>{@code ;} 只有在 {@link #codeMask(String)} 判定为代码位置时才算分隔符：字符串、注释、反引号
+     * 标识符里的分号都是正文内容。{@code insert into t values ('a;b')} 因此仍是一条语句。
+     *
+     * <p>空段（连续分号、纯空白、首尾分号）一律丢弃；{@code null} 与空白输入返回空列表。
+     */
+    public static List<String> splitStatements(String sql) {
+        if (sql == null || sql.isEmpty()) {
+            return List.of();
+        }
+        boolean[] isCode = codeMask(sql);
+        List<String> statements = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i < sql.length(); i++) {
+            if (isCode[i] && sql.charAt(i) == ';') {
+                addIfNotBlank(statements, sql.substring(start, i));
+                start = i + 1;
+            }
+        }
+        addIfNotBlank(statements, sql.substring(start));
+        return statements;
+    }
+
+    private static void addIfNotBlank(List<String> statements, String piece) {
+        String stripped = piece.strip();
+        if (!stripped.isEmpty()) {
+            statements.add(stripped);
+        }
     }
 
     /** 把注释与字面量替换为空格，保留长度与换行，便于按关键字做整体匹配。 */
