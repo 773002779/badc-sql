@@ -14,8 +14,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.regex.Pattern;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -37,9 +38,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * <p>落盘在快照根目录下的 {@code ref} 子目录，两个文件：
  * <ul>
  *   <li>{@code schema.sql}：各表 {@code SHOW CREATE TABLE} 原文，以 {@code -- <表名>} 分隔；</li>
- *   <li>{@code schema.json}：{@code tables} 数组，每项含 {@code table}、{@code createSql}、
- *       {@code columns}（name/type/nullable/default/comment）、{@code indexes}（name/unique/columns）、
- *       {@code triggers}（name/statement）与 {@code rowCountEstimate}。</li>
+ *   <li>{@code schema.json}：{@code requestedTables}（请求过的表，去重）与 {@code tables} 数组，每项含
+ *       {@code table}、{@code createSql}、{@code columns}（name/type/nullable/default/comment）、
+ *       {@code indexes}（name/unique/columns）、{@code triggers}（name/statement）与
+ *       {@code rowCountEstimate}。</li>
  * </ul>
  *
  * <p>失败与"表不存在"必须分开：抓取失败（连不上、没权限）抛 {@code BizException}，调用方据此禁止执行；
@@ -54,6 +56,9 @@ public class SchemaSnapshotter {
     /** 表不存在：新建表场景下"前置状态为空"，不是抓取失败。 */
     private static final int TABLE_NOT_FOUND = 1146;
     private static final String MISSING_TABLE_SQL_STATE = "42S02";
+
+    /** {@code SHOW CREATE TABLE} 里的自增计数：随插入增长，不属于结构（见 {@link #normalize}）。 */
+    private static final Pattern AUTO_INCREMENT_COUNTER = Pattern.compile("(ENGINE=\\S+) AUTO_INCREMENT=\\d+");
 
     private static final int SCHEMA_QUERY_TIMEOUT_SECONDS = 30;
 
@@ -71,6 +76,9 @@ public class SchemaSnapshotter {
     /**
      * 抓取结构快照并落盘。
      *
+     * <p>落盘<b>不是原子的</b>：两个文件顺序写，第二个写失败会留下单文件的孤儿快照。安全语义不受影响
+     * （异常照抛 → 调用方禁止执行），孤儿文件交给 180 天保留期的清理任务。
+     *
      * @param conn        目标库连接配置（已解密）
      * @param tables      需要抓取的表；为空表示这一单不涉及已有表
      * @param relativeRef 控制面给的相对引用，最终路径由 {@link SnapshotPaths#resolve} 校验
@@ -79,16 +87,13 @@ public class SchemaSnapshotter {
      */
     public SnapshotResult capture(ConnConfig conn, List<String> tables, String relativeRef) {
         Path directory = SnapshotPaths.resolve(root.toString(), relativeRef);
-        List<String> requested = tables == null ? List.of() : tables;
+        List<String> requestedTables = distinctTables(tables);
 
         List<TableSnapshot> snapshots = new ArrayList<>();
         Map<String, String> fingerprints = new LinkedHashMap<>();
         try (Connection connection = open(conn)) {
             String schemaName = schemaName(connection, conn);
-            for (String table : requested) {
-                if (table == null) {
-                    continue;
-                }
+            for (String table : requestedTables) {
                 String createSql = showCreateTable(connection, table);
                 if (createSql == null) {
                     continue;
@@ -97,7 +102,7 @@ public class SchemaSnapshotter {
                 fingerprints.put(table, SnapshotPaths.sha256Hex(normalize(createSql)));
             }
             Files.createDirectories(directory);
-            long byteSize = write(directory, snapshots);
+            long byteSize = write(directory, snapshots, requestedTables);
             return new SnapshotResult(relativeRef, fingerprints, byteSize);
         } catch (SQLException e) {
             throw failure(e);
@@ -109,19 +114,16 @@ public class SchemaSnapshotter {
     /**
      * 取各表的结构指纹。
      *
-     * <p>每表一次 {@code SHOW CREATE TABLE}，规范化（统一换行、去行尾空白、忽略大小写）后取 sha256。
+     * <p>每表一次 {@code SHOW CREATE TABLE}，规范化（统一换行、去行尾空白、剔除自增计数）后取 sha256。
      * 表不存在时该表<b>不进 map</b>也不抛异常；全部不存在返回空 map。
      *
      * @throws BizException 连接失败或权限不足——空 map 只能表示"表不存在"，不能表示"库连不上"
      */
     public Map<String, String> fingerprint(ConnConfig conn, List<String> tables) {
-        List<String> requested = tables == null ? List.of() : tables;
+        List<String> requestedTables = distinctTables(tables);
         Map<String, String> fingerprints = new LinkedHashMap<>();
         try (Connection connection = open(conn)) {
-            for (String table : requested) {
-                if (table == null) {
-                    continue;
-                }
+            for (String table : requestedTables) {
                 String createSql = showCreateTable(connection, table);
                 if (createSql == null) {
                     continue;
@@ -135,13 +137,21 @@ public class SchemaSnapshotter {
     }
 
     /**
-     * 指纹的规范化：换行统一为 {@code \n}、每行去行尾空白、去末尾空行、忽略大小写。
+     * 指纹的规范化：统一换行为 {@code \n}、每行去行尾空白、去末尾空行，并剔除随数据增长的
+     * {@code AUTO_INCREMENT=N} 计数。
      *
-     * <p>忽略大小写是为了让 5.7 / 8.0 与不同会话下的关键字大小写差异不产生"假漂移"；代价是
-     * 仅大小写不同的表名改动（{@code T} → {@code t}）看不出来，这在本平台的命名规范下可接受。
+     * <p><b>不做大小写折叠</b>：{@code SHOW CREATE TABLE} 由服务端生成、关键字固定大写，同一实例两次抓取
+     * 不存在"格式大小写不同"这回事；折叠只会让 {@code DEFAULT 'ABC'} → {@code 'abc'}、仅大小写不同的
+     * 表改名或注释改动这类真实变更从指纹里消失（漂移检测失效）。
+     *
+     * <p>{@code AUTO_INCREMENT=N} 属于数据侧状态而不是结构：正常写入的业务表在"提交 → 审批 → 执行"之间
+     * 几乎必然插入过数据，若把它算进指纹，好工单会被误判成"结构已漂移"。这里按
+     * {@code ENGINE=<engine> AUTO_INCREMENT=<n>} 的固定形态剔除，只去掉数字与它前面的空格。
      */
     static String normalize(String createSql) {
-        String unified = createSql.replace("\r\n", "\n").replace('\r', '\n');
+        String unified = AUTO_INCREMENT_COUNTER.matcher(
+                        createSql.replace("\r\n", "\n").replace('\r', '\n'))
+                .replaceFirst("$1");
         StringBuilder normalized = new StringBuilder(unified.length());
         for (String line : unified.split("\n", -1)) {
             normalized.append(stripTrailing(line)).append('\n');
@@ -150,7 +160,7 @@ public class SchemaSnapshotter {
         while (end > 0 && normalized.charAt(end - 1) == '\n') {
             end--;
         }
-        return normalized.substring(0, end).toLowerCase(Locale.ROOT);
+        return normalized.substring(0, end);
     }
 
     private static String stripTrailing(String line) {
@@ -312,7 +322,8 @@ public class SchemaSnapshotter {
         }
     }
 
-    private long write(Path directory, List<TableSnapshot> snapshots) throws IOException {
+    private long write(Path directory, List<TableSnapshot> snapshots, List<String> requestedTables)
+            throws IOException {
         StringBuilder schemaSql = new StringBuilder();
         for (TableSnapshot snapshot : snapshots) {
             // 表名可能含换行，注释行里必须压平；真实表名仍原样保存在 schema.json 里。
@@ -322,10 +333,22 @@ public class SchemaSnapshotter {
         Path sqlFile = directory.resolve(SCHEMA_SQL);
         Files.writeString(sqlFile, schemaSql.toString(), StandardCharsets.UTF_8);
 
+        // 请求了哪些表要显式记下来：任务 11 靠"在请求里但不在 tables 里"判定前置状态为空，
+        // 只让它隐含在 tables 数组的缺失里，调用方就得靠猜。
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("requestedTables", requestedTables);
+        document.put("tables", snapshots);
         Path jsonFile = directory.resolve(SCHEMA_JSON);
-        json.writerWithDefaultPrettyPrinter().writeValue(jsonFile.toFile(), Map.of("tables", snapshots));
+        json.writerWithDefaultPrettyPrinter().writeValue(jsonFile.toFile(), document);
 
         return Files.size(sqlFile) + Files.size(jsonFile);
+    }
+
+    /** 去重、去 null，保持入参顺序：重复表名会让 schema.sql / schema.json 出现重复段落。 */
+    private static List<String> distinctTables(List<String> tables) {
+        return tables == null
+                ? List.of()
+                : tables.stream().filter(Objects::nonNull).distinct().toList();
     }
 
     private static String commentSafe(String table) {

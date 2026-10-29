@@ -13,8 +13,8 @@ import com.badc.sql.common.error.BizException;
  * 快照路径的越狱防护。
  *
  * <p>快照引用来自控制面（{@code {systemId}/{datasourceId}/{ticketId}/{changeSeq}}），一旦这里只是
- * "拼字符串"，一个 {@code ../../} 就能让执行器把文件写到根目录之外。表名则<b>永远不参与路径</b>：
- * MySQL 允许表名带反引号、点号甚至斜杠，把它拼进路径等于把库里的命名变成文件系统指令。
+ * "拼字符串"，一个 {@code ../../} 就能让执行器把文件写到根目录之外。表名不参与路径：MySQL 允许表名带
+ * 反引号、点号甚至斜杠，把它拼进路径等于把库里的命名变成文件系统指令。
  */
 class SnapshotPathsTest {
 
@@ -36,14 +36,6 @@ class SnapshotPathsTest {
     void an_absolute_ref_is_refused() {
         assertThatThrownBy(() -> SnapshotPaths.resolve(ROOT, "/etc/passwd"))
                 .isInstanceOf(BizException.class);
-    }
-
-    /** 表名可以带反引号与点号，但它只参与文件名哈希，不参与路径拼接。 */
-    @Test
-    void a_table_name_never_reaches_the_path() {
-        String name = SnapshotPaths.fileName("weird`name.with.dot");
-        assertThat(name).matches("[0-9a-f]{16}");
-        assertThat(name).doesNotContain("weird").doesNotContain(".").doesNotContain("`");
     }
 
     /** 反斜杠在 Windows 上是分隔符，必须比斜杠更早拒绝。 */
@@ -82,11 +74,5 @@ class SnapshotPathsTest {
     void a_ref_with_an_illegal_character_is_refused() {
         assertThatThrownBy(() -> SnapshotPaths.resolve(ROOT, "1/\u0000/2"))
                 .isInstanceOf(BizException.class);
-    }
-
-    @Test
-    void the_same_table_always_gets_the_same_file_name() {
-        assertThat(SnapshotPaths.fileName("t_order")).isEqualTo(SnapshotPaths.fileName("t_order"));
-        assertThat(SnapshotPaths.fileName("t_order")).isNotEqualTo(SnapshotPaths.fileName("t_order2"));
     }
 }

@@ -10,3 +10,6 @@ badcsql:
     # 控制面调 /internal/** 时必须带同一个令牌；留空即拒绝全部内部请求（fail-closed）。
     # 不设字面默认值：本机默认可用的令牌会被带到生产。
     token: "${BADCSQL_INTERNAL_TOKEN:}"
+  snapshot:
+    # 结构快照根目录：须独占、租户不可写（路径校验是词法的，挡不住预置的 symlink）。
+    root: "${BADCSQL_SNAPSHOT_ROOT:/data/snapshot}"

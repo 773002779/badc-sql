@@ -24,8 +24,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * Spring 容器，因此<b>无法证明过滤器真的被注册进了容器</b>。这里起真实上下文与真实端口，用真实 HTTP
  * 打 {@code /internal/v1/fingerprint}——即使同名的过滤器忘了注册、或注册在错误的 URL 模式上，也会红。
  *
- * <p>第三个用例刻意用不可达的目标库：令牌正确时请求会走到执行器逻辑并因为连不上库失败，<b>只要不是 401
- * 就说明闸门放行</b>；反过来，若哪天过滤器被误删，这条会以 200/500 通过而前两条会红。
+ * <p>令牌正确的用例刻意用不可达的目标库：请求会走到执行器逻辑、因连不上库返回 500
+ * {@code INTERNAL_ERROR}。断言必须是"500 + INTERNAL_ERROR"而不是"不是 401"——后者放得过一个路径写错的 404，
+ * 那等于什么都没证明。反过来，若哪天过滤器被误删，前两条会红。
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -73,13 +74,15 @@ class InternalEndpointAuthIT {
         assertThat(json.readTree(response.getBody()).path("code").asText()).isEqualTo("UNAUTHORIZED");
     }
 
+    /** 请求确实穿过了闸门、进到了控制器：连不上目标库 → 执行器的 500 INTERNAL_ERROR，而不是 404/401。 */
     @Test
-    void the_right_token_gets_past_the_gate() {
+    void the_right_token_gets_past_the_gate() throws Exception {
         ResponseEntity<String> response = post(BODY_WITH_UNREACHABLE_DB, TOKEN);
 
         assertThat(response.getStatusCode())
-                .as("放行后允许因目标库不可达而失败，但不能是 401")
-                .isNotEqualTo(HttpStatus.UNAUTHORIZED);
+                .as("路径写错会得到 404，令牌被拒会得到 401；只有真进了控制器才是库不可达的 500")
+                .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        assertThat(json.readTree(response.getBody()).path("code").asText()).isEqualTo("INTERNAL_ERROR");
     }
 
     /** 过闸之后请求确实进了控制器：缺少连接配置按既有口径回 400。 */

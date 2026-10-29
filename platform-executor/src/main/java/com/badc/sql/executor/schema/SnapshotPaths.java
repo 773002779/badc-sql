@@ -18,15 +18,12 @@ import com.badc.sql.common.error.ErrorCode;
  * {@code badcsql.snapshot.root} 之下展开：归一化后必须仍以根为前缀，且不允许以 {@code /}、{@code \}
  * 或盘符开头。只做字符串拼接的实现会被 {@code ../../} 写到根目录之外。
  *
- * <p><b>表名永远不参与路径</b>：MySQL 表名可以带反引号、点号甚至斜杠，把它拼进路径等于把库里的命名
- * 变成文件系统指令。表名只用来算 {@link #fileName(String)} 的哈希，真实表名写在文件内容里。
+ * <p><b>表名不参与路径</b>：快照路径完全由这里的 {@code relativeRef} 决定，表名只出现在 SQL 与文件内容里
+ * （MySQL 表名可以带反引号、点号甚至斜杠，把它拼进路径等于把库里的命名变成文件系统指令）。
  */
 public final class SnapshotPaths {
 
     private static final Pattern DRIVE_PREFIX = Pattern.compile("^[A-Za-z]:");
-
-    /** 文件名取 sha256 前 16 位十六进制：碰撞概率足够低，又不至于让文件名过长。 */
-    private static final int FILE_NAME_HEX_CHARS = 16;
 
     private SnapshotPaths() {
     }
@@ -71,19 +68,6 @@ public final class SnapshotPaths {
             throw illegal();
         }
         return resolved;
-    }
-
-    /**
-     * 表名 → 文件名（不含扩展名）。
-     *
-     * @param table 真实表名，允许包含反引号、点号等对文件系统有意义的字符
-     * @return {@code sha256(table)} 的前 16 位小写十六进制
-     */
-    public static String fileName(String table) {
-        if (table == null || table.isEmpty()) {
-            throw new BizException(ErrorCode.INVALID_ARGUMENT, "表名不合法");
-        }
-        return sha256Hex(table).substring(0, FILE_NAME_HEX_CHARS);
     }
 
     /** 表结构指纹的散列函数；包内共用，避免快照与指纹各写一份实现。 */

@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -29,12 +30,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 /**
  * 真实 MySQL 上的结构快照与指纹。
  *
- * <p>沿用执行器既有风格（见 {@code QueryRunnerIT}）：纯 JUnit、不起 Spring 上下文、固定 schema、
- * 裸 JDBC。要钉住的不是"能跑通"，而是三件容易做错的事：
+ * <p>沿用执行器既有风格（见 {@code QueryRunnerIT}）：纯 JUnit、不起 Spring 上下文、随机 schema、
+ * 裸 JDBC。要钉住的不是"能跑通"，而是几件容易做错的事：
  * <ul>
  *   <li>抓取只读元数据，<b>不扫表</b>、不执行待估算的语句；</li>
  *   <li>表不存在不是失败（新建表），空指纹不能和"抓取失败"混为一谈；</li>
- *   <li>加列必须改变指纹，否则漂移检测形同虚设。</li>
+ *   <li>结构变了指纹必须变（加列、只改字面量大小写），数据变了指纹不能变（自增计数）。</li>
  * </ul>
  */
 class SchemaSnapshotterIT {
@@ -43,7 +44,9 @@ class SchemaSnapshotterIT {
     private static final int PORT = 3306;
     private static final String USER = "root";
     private static final String PASS = "root";
-    private static final String SCHEMA = "badc_test_snapshot";
+    /** 每类一个随机 schema（同 {@code AbstractMySqlIT} 的 {@code badc_test_<8位随机>}），并行/残留不会撞。 */
+    private static final String SCHEMA =
+            "badc_test_snapshot_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
 
     @TempDir
     static Path tempRoot;
@@ -101,13 +104,31 @@ class SchemaSnapshotterIT {
                 .as("加列之后指纹必须变，否则漂移检测形同虚设").isNotEqualTo(before);
     }
 
+    /**
+     * I1 回归：{@code AUTO_INCREMENT=N} 随插入增长。热表在"提交 → 审批 → 执行"之间几乎必然被插入，
+     * 若它进指纹，工单会被误判成"结构已漂移"而中止。
+     */
+    @Test
+    void auto_increment_growth_does_not_change_the_fingerprint() throws Exception {
+        execute("create table t_auto (id bigint not null auto_increment primary key, v int null)");
+        String before = snapshotter.fingerprint(conn, List.of("t_auto")).get("t_auto");
+
+        execute("insert into t_auto (v) values (1)");
+
+        assertThat(rawCreateTable("t_auto"))
+                .as("前提：插入后服务端确实会输出自增计数，否则本用例什么也没证明")
+                .contains("AUTO_INCREMENT=");
+        assertThat(snapshotter.fingerprint(conn, List.of("t_auto")).get("t_auto"))
+                .as("自增计数属于数据侧状态，不属于结构").isEqualTo(before);
+    }
+
     /** 新建表 / drop 之后的表：不存在不是失败，返回空指纹，由调用方记录"前置状态为空"。 */
     @Test
     void a_missing_table_yields_an_empty_fingerprint_instead_of_failing() {
         assertThat(snapshotter.fingerprint(conn, List.of("does_not_exist"))).isEmpty();
     }
 
-    /** 抓快照时表不存在同理：文件照写（空快照），不抛异常。 */
+    /** 抓快照时表不存在同理：文件照写（空快照），不抛异常；"请求过"必须留在 json 里。 */
     @Test
     void capturing_a_missing_table_writes_empty_snapshot_files_instead_of_failing() throws Exception {
         SnapshotResult result = snapshotter.capture(conn, List.of("does_not_exist"), "9/9/9/9");
@@ -117,6 +138,13 @@ class SchemaSnapshotterIT {
         assertThat(tempRoot.resolve("9/9/9/9/schema.json")).exists();
         assertThat(result.byteSize()).isPositive();
         assertThat(Files.readString(tempRoot.resolve("9/9/9/9/schema.sql"))).isEmpty();
+
+        JsonNode document = new ObjectMapper()
+                .readTree(Files.readString(tempRoot.resolve("9/9/9/9/schema.json")));
+        assertThat(document.path("tables")).as("没有前置结构的表不进 tables").isEmpty();
+        List<String> requested = new ArrayList<>();
+        document.path("requestedTables").forEach(node -> requested.add(node.asText()));
+        assertThat(requested).as("任务 11 靠它判定前置状态为空").containsExactly("does_not_exist");
     }
 
     @Test
@@ -131,11 +159,16 @@ class SchemaSnapshotterIT {
                 """);
         execute("create trigger trg_json before insert on t_json for each row set new.amount = 0");
 
-        snapshotter.capture(conn, List.of("t_json"), "2/3/4/5");
+        // 重复表名只抓一次：请求清单与 tables 都只应出现一项。
+        snapshotter.capture(conn, List.of("t_json", "t_json"), "2/3/4/5");
 
-        JsonNode tables = new ObjectMapper()
-                .readTree(Files.readString(tempRoot.resolve("2/3/4/5/schema.json")))
-                .path("tables");
+        JsonNode document = new ObjectMapper()
+                .readTree(Files.readString(tempRoot.resolve("2/3/4/5/schema.json")));
+        List<String> requested = new ArrayList<>();
+        document.path("requestedTables").forEach(node -> requested.add(node.asText()));
+        assertThat(requested).containsExactly("t_json");
+
+        JsonNode tables = document.path("tables");
         assertThat(tables).hasSize(1);
 
         JsonNode table = tables.get(0);
@@ -186,12 +219,42 @@ class SchemaSnapshotterIT {
                 .as("语句本身不合法时给 -1，由调用方按最严处理").isEqualTo(-1L);
     }
 
-    /** 待估算的语句是 DDL 时 EXPLAIN 会报错：给 -1，并且绝不能把表建出来。 */
+    /**
+     * "EXPLAIN 不执行原语句"必须用看得见的效果证明：估一次 {@code update ... set v = v + 1}，行值不能变。
+     * 只断言行数估算非负证明不了任何事——执行了也照样有估算。
+     */
     @Test
     void an_explain_never_executes_the_statement_itself() throws Exception {
+        execute("create table t_probe (id bigint primary key, v int not null)");
+        execute("insert into t_probe values (1, 10)");
+
+        assertThat(new ExplainRunner().estimate(conn, "update t_probe set v = v + 1 where id = 1")
+                .estimatedRows()).isGreaterThanOrEqualTo(0L);
+        assertThat(probeValue(1L))
+                .as("EXPLAIN 执行了原语句：v 被加了 1").isEqualTo(10);
+
+        // DDL 连 EXPLAIN 都不支持：给 -1，且表不能被建出来。
         assertThat(new ExplainRunner().estimate(conn, "create table t_should_not_exist (id int)")
                 .estimatedRows()).isEqualTo(-1L);
         assertThat(tableExists("t_should_not_exist")).isFalse();
+    }
+
+    private static int probeValue(long id) throws Exception {
+        try (Connection c = DriverManager.getConnection(MySqlAdapter.url(conn), USER, PASS);
+             PreparedStatement s = c.prepareStatement("select v from t_probe where id = ?")) {
+            s.setLong(1, id);
+            try (ResultSet rs = s.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : -1;
+            }
+        }
+    }
+
+    private static String rawCreateTable(String table) throws Exception {
+        try (Connection c = DriverManager.getConnection(MySqlAdapter.url(conn), USER, PASS);
+             Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("show create table " + table)) {
+            return rs.next() ? rs.getString(2) : null;
+        }
     }
 
     private static void execute(String sql) throws Exception {
