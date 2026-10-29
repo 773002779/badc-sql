@@ -26,6 +26,7 @@ import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.executor.adapter.mysql.MySqlAdapter;
+import com.badc.sql.executor.util.SqlErrorMessages;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -59,14 +60,6 @@ public class SchemaSnapshotter {
 
     /** {@code SHOW CREATE TABLE} 里的自增计数：随插入增长，不属于结构（见 {@link #normalize}）。 */
     private static final Pattern AUTO_INCREMENT_COUNTER = Pattern.compile("(ENGINE=\\S+) AUTO_INCREMENT=\\d+");
-
-    /**
-     * MySQL 错误消息里的账号与主机，形如 {@code 'readonly_user'@'10.1.2.3'}。
-     *
-     * <p>这类消息（如 28000 access denied）会经控制面 {@code ExecutorErrors} 一路透到研发看到的响应体，
-     * 等于把 host 与账号一起交出去。只打掉这一形态，其余诊断文本保持原样。
-     */
-    private static final Pattern CREDENTIALS_IN_MESSAGE = Pattern.compile("'[^']*'@'[^']*'");
 
     private static final int SCHEMA_QUERY_TIMEOUT_SECONDS = 30;
 
@@ -369,6 +362,7 @@ public class SchemaSnapshotter {
      * <p>连接类错误（SQLState {@code 08xxx}）不回显原始消息，避免把 host 带进响应；其余错误保留
      * {@code SQLState} 与错误码，让控制面能说清"为什么没抓到快照"（权限、库不存在等），但消息里的
      * {@code '账号'@'主机'} 必须先脱敏——权限类错误（28000）的原文会把两者一起带给研发。
+     * 脱敏统一走 {@link SqlErrorMessages#sanitize(String)}，不要在这里另写一份。
      */
     static BizException failure(SQLException e) {
         String state = e.getSQLState() == null ? "" : e.getSQLState();
@@ -378,17 +372,7 @@ public class SchemaSnapshotter {
         }
         return new BizException(ErrorCode.INTERNAL_ERROR,
                 "结构快照抓取失败（SQLState=" + state + ", errorCode=" + e.getErrorCode()
-                        + "）：" + sanitizeMessage(e.getMessage()), e);
-    }
-
-    /**
-     * 把 MySQL 消息里的 {@code '账号'@'主机'} 替换成 {@code '***'@'***'}。
-     *
-     * <p>只替换这一种形态：诸如 {@code Unknown database 'order_db'} 或语法片段应当保留，否则消息就失去了
-     * 排障价值。{@code null} 归一成空串，避免拼出 "null"。
-     */
-    static String sanitizeMessage(String message) {
-        return message == null ? "" : CREDENTIALS_IN_MESSAGE.matcher(message).replaceAll("'***'@'***'");
+                        + "）：" + SqlErrorMessages.sanitize(e.getMessage()), e);
     }
 
     /** 单表快照的 JSON 结构。 */

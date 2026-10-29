@@ -23,6 +23,7 @@ import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.executor.adapter.mysql.MySqlAdapter;
+import com.badc.sql.executor.util.SqlErrorMessages;
 
 /**
  * 只读查询执行。
@@ -139,15 +140,23 @@ public class QueryRunner {
         return normalized.substring(0, dot) + "." + millis + "Z";
     }
 
-    private static BizException translate(SQLException e) {
+    /**
+     * 数据库异常翻译。
+     *
+     * <p>包级可见而非 {@code private}：单测要钉住"错误消息里不能带账号与主机"，为可测性放宽。
+     */
+    static BizException translate(SQLException e) {
         // 1044/1142 是权限；08xxx 是连接类；其余归为执行失败。消息里不带连接串与账号。
         String state = e.getSQLState() == null ? "" : e.getSQLState();
         if (state.startsWith("08")) {
             return new BizException(ErrorCode.INTERNAL_ERROR, "数据源不可达，请确认网络与白名单", e);
         }
         if ("42000".equals(state) || "07001".equals(state)) {
-            return new BizException(ErrorCode.INVALID_ARGUMENT, "SQL 语法或参数错误：" + e.getMessage(), e);
+            return new BizException(ErrorCode.INVALID_ARGUMENT,
+                    "SQL 语法或参数错误：" + SqlErrorMessages.sanitize(e.getMessage()), e);
         }
-        return new BizException(ErrorCode.INTERNAL_ERROR, "查询执行失败：" + e.getMessage(), e);
+        // 28000（access denied）落在这里：原文含 '账号'@'主机'，必须脱敏后才能进 BizException。
+        return new BizException(ErrorCode.INTERNAL_ERROR,
+                "查询执行失败：" + SqlErrorMessages.sanitize(e.getMessage()), e);
     }
 }

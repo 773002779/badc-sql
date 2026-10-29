@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
 import java.util.Map;
@@ -14,6 +15,8 @@ import org.junit.jupiter.api.Test;
 
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.error.BizException;
+import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.executor.adapter.mysql.MySqlAdapter;
 
 /**
@@ -134,5 +137,39 @@ class QueryRunnerIT {
         assertThat(result.columns()).extracting(c -> c.name()).containsExactly("id", "nullable_col");
         List<String> types = result.columns().stream().map(c -> c.type()).toList();
         assertThat(types).allMatch(t -> t != null && !t.isBlank());
+    }
+
+    /**
+     * 28000 的 access denied 会落到 {@code translate} 的"其他"分支：消息必须脱敏。
+     *
+     * <p>纯函数用例，用构造的 {@link SQLException} 即可，不必真造一次鉴权失败——这里不验"库怎么拒绝"，
+     * 只验"拒绝消息怎么进 {@code BizException}"。
+     */
+    @Test
+    void access_denied_never_carries_the_account_or_host_into_the_message() {
+        BizException e = QueryRunner.translate(
+                new SQLException("Access denied for user 'root'@'127.0.0.1' (using password: YES)", "28000", 1045));
+
+        assertThat(e.code()).isEqualTo(ErrorCode.INTERNAL_ERROR);
+        assertThat(e.getMessage())
+                .contains("查询执行失败")
+                .contains("'***'@'***'")
+                .doesNotContain("root")
+                .doesNotContain("127.0.0.1");
+    }
+
+    /** 42000 分支同样会拼原始消息：语法诊断要留着，但账号与主机不能留。 */
+    @Test
+    void syntax_errors_keep_the_diagnostics_but_mask_credentials_too() {
+        BizException e = QueryRunner.translate(new SQLException(
+                "You have an error in your SQL syntax; check near 'root'@'127.0.0.1'", "42000", 1064));
+
+        assertThat(e.code()).isEqualTo(ErrorCode.INVALID_ARGUMENT);
+        assertThat(e.getMessage())
+                .contains("SQL 语法或参数错误")
+                .contains("You have an error in your SQL syntax")
+                .contains("'***'@'***'")
+                .doesNotContain("root")
+                .doesNotContain("127.0.0.1");
     }
 }
