@@ -533,6 +533,11 @@ class QueryControllerIT extends AbstractMySqlIT {
             }
             return validateResult;
         }
+
+        @Override
+        public Map<String, String> fingerprint(ConnConfig conn, List<String> tables) {
+            throw new UnsupportedOperationException("查询测试不走这个入口");
+        }
     }
 
     @TestConfiguration

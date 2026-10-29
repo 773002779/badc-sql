@@ -9,6 +9,8 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.AfterEach;
@@ -172,7 +174,28 @@ class HttpExecutorClientTest {
     }
 
     /**
-     * 令牌是构造时挂在 {@code RestClient} 上的默认头，validate 带出去即说明另外两个内部调用也带；
+     * 指纹入口的三处接错点：路径、请求体里表名挂在 {@code tables} 数组下、返回的 map 被解析出来。
+     *
+     * <p>路径写错是 404；字段名写成 {@code tableNames} 之类是 400 或静默的空结果；返回体解析不对则
+     * 漂移检测拿到空 map——会被误读成"表不存在"，正是提交与执行判定的分叉点。
+     */
+    @Test
+    void fingerprint_posts_the_tables_array_and_parses_the_returned_map() throws Exception {
+        reply.set(new Reply(200, "{\"t_order\":\"fp-1\",\"t_item\":\"fp-2\"}"));
+
+        Map<String, String> fingerprints = client.fingerprint(READONLY_CONN, List.of("t_order", "t_item"));
+
+        assertThat(lastPath.get()).isEqualTo("/internal/v1/fingerprint");
+        JsonNode sent = MAPPER.readTree(lastBody.get());
+        assertThat(sent.path("conn").path("dbName").asText()).isEqualTo("order_db");
+        assertThat(sent.path("tables").get(0).asText()).isEqualTo("t_order");
+        assertThat(sent.path("tables").get(1).asText()).isEqualTo("t_item");
+
+        assertThat(fingerprints).containsEntry("t_order", "fp-1").containsEntry("t_item", "fp-2");
+    }
+
+    /**
+     * 令牌是构造时挂在 {@code RestClient} 上的默认头，validate 带出去即说明其余内部调用也带；
      * 少了这条，桩不校验令牌，单测全绿而生产上每一次内部调用都会被 401 挡下。
      */
     @Test

@@ -1,5 +1,8 @@
 package com.badc.sql.control.query;
 
+import java.util.List;
+import java.util.Map;
+
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
@@ -37,4 +40,19 @@ public interface ExecutorClient {
      * @throws com.badc.sql.common.error.BizException 执行器不可用（不是"SQL 不合法"，后者由返回值表达）
      */
     ValidationResult validate(ConnConfig conn, String sql, DbVersion version);
+
+    /**
+     * 取这些表的表结构指纹（表名 → sha256）。
+     *
+     * <p><b>空 map 只表示"这些表都不存在"</b>，也就是它们会被新建；连接失败、权限不足、执行器不可用
+     * 一律由 {@link com.badc.sql.common.error.BizException} 表达，绝不降级成空 map。调用方据此区分
+     * "新建表"与"库不可达"：前者按无前置结构处理，后者必须中止——两者处理方式相反，混淆会把一次
+     * 探测失败当成"表不存在"，进而在错误的库上继续工单。
+     *
+     * @param conn   连接配置（执行期连接，含解密后的密码）
+     * @param tables 要取指纹的表名；返回的 map 只含实际存在的表
+     * @return 表名 → 结构指纹；不含不存在的表
+     * @throws com.badc.sql.common.error.BizException 库不可达、权限不足或执行器不可用
+     */
+    Map<String, String> fingerprint(ConnConfig conn, List<String> tables);
 }

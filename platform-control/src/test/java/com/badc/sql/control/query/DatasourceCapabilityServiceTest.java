@@ -9,6 +9,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -218,6 +220,11 @@ class DatasourceCapabilityServiceTest {
         @Override
         public ValidationResult validate(ConnConfig conn, String sql, DbVersion version) {
             throw new UnsupportedOperationException("能力缓存不应发起版本校验");
+        }
+
+        @Override
+        public Map<String, String> fingerprint(ConnConfig conn, List<String> tables) {
+            throw new UnsupportedOperationException("能力缓存不应取指纹");
         }
     }
 }

@@ -2,6 +2,8 @@ package com.badc.sql.control.query;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -23,7 +25,7 @@ import com.badc.sql.common.error.ErrorCode;
  * <p>超时设置：连接 2s（执行器在同机房，连不上就是真不可用），读 70s（要大于执行器的 60s 语句超时，
  * 否则控制面先放弃、执行器还在跑）。
  *
- * <p>三个内部调用（query / probe / validate）共用同一套错误还原：非 2xx 一律交给
+ * <p>四个内部调用（query / probe / validate / fingerprint）共用同一套错误还原：非 2xx 一律交给
  * {@link ExecutorErrors} 把执行器的 {@code {code,message}} 还原成 {@link BizException}，
  * 连不上才是"执行器不可用"。各写一套的结果是同一类故障在不同入口给出不同提示，用户无从判断。
  */
@@ -68,6 +70,14 @@ public class HttpExecutorClient implements ExecutorClient {
                 "执行器返回空的校验结果");
     }
 
+    @Override
+    @SuppressWarnings("unchecked")
+    public Map<String, String> fingerprint(ConnConfig conn, List<String> tables) {
+        // 空 map 是"这些表都不存在"的合法答案，只有响应体为空才是故障；连接/权限问题走异常。
+        return (Map<String, String>) post("/internal/v1/fingerprint", new FingerprintCall(conn, tables),
+                Map.class, "执行器返回空的指纹结果");
+    }
+
     /**
      * 发一个内部调用并把结果映射成 {@code type}。
      *
@@ -109,5 +119,9 @@ public class HttpExecutorClient implements ExecutorClient {
 
     /** 执行器的校验入参；{@code dbVersion} 为空表示版本未知，执行器不做版本判定。 */
     public record ValidateCall(String sql, DbVersion dbVersion) {
+    }
+
+    /** 执行器的指纹入参；返回的 map 只含实际存在的表，不存在的表不会出现。 */
+    public record FingerprintCall(ConnConfig conn, List<String> tables) {
     }
 }
