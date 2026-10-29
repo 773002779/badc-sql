@@ -14,6 +14,7 @@ import org.springframework.web.client.ResourceAccessException;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -25,7 +26,7 @@ import com.badc.sql.common.error.ErrorCode;
  * <p>超时设置：连接 2s（执行器在同机房，连不上就是真不可用），读 70s（要大于执行器的 60s 语句超时，
  * 否则控制面先放弃、执行器还在跑）。
  *
- * <p>四个内部调用（query / probe / validate / fingerprint）共用同一套错误还原：非 2xx 一律交给
+ * <p>五个内部调用（query / probe / validate / fingerprint / explain）共用同一套错误还原：非 2xx 一律交给
  * {@link ExecutorErrors} 把执行器的 {@code {code,message}} 还原成 {@link BizException}，
  * 连不上才是"执行器不可用"。各写一套的结果是同一类故障在不同入口给出不同提示，用户无从判断。
  */
@@ -79,6 +80,19 @@ public class HttpExecutorClient implements ExecutorClient {
     }
 
     /**
+     * EXPLAIN 行数估算。
+     *
+     * <p>响应体里的 {@code estimatedRows} 为 {@code -1} 是<b>正常结果</b>（估不出来），不是"0 行"：
+     * 只有响应体为空才是故障。这一点与 {@code fingerprint} 的空 map 是同一个坑——把"没算出来"
+     * 当成一个合法的零值，风险分级就会少给两级审批。
+     */
+    @Override
+    public ExplainEstimate explain(ConnConfig conn, String sql) {
+        return post("/internal/v1/explain", new ExplainCall(conn, sql), ExplainEstimate.class,
+                "执行器返回空的估算结果");
+    }
+
+    /**
      * 发一个内部调用并把结果映射成 {@code type}。
      *
      * @param emptyResultMessage 执行器 2xx 却没有响应体时的错误消息
@@ -123,5 +137,9 @@ public class HttpExecutorClient implements ExecutorClient {
 
     /** 执行器的指纹入参；返回的 map 只含实际存在的表，不存在的表不会出现。 */
     public record FingerprintCall(ConnConfig conn, List<String> tables) {
+    }
+
+    /** 执行器的 EXPLAIN 入参；执行器只发 {@code explain <sql>}，不会执行原语句。 */
+    public record ExplainCall(ConnConfig conn, String sql) {
     }
 }

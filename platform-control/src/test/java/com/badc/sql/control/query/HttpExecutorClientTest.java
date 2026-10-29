@@ -20,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
@@ -239,6 +240,63 @@ class HttpExecutorClientTest {
         client.validate(READONLY_CONN, "select 1", DbVersion.MYSQL_8_0);
 
         assertThat(lastToken.get()).isEqualTo("s3cret");
+    }
+
+    /**
+     * EXPLAIN 入口的接错点：路径、请求体字段 {@code sql}、返回值解析。
+     *
+     * <p>路径写错是 404（写成 GET 则是 405）；请求体字段名写成 {@code statement} 之类是 400 或静默的空结果；
+     * 返回体解析不对则风险分级拿到 0 行，一条更新百万行的语句会被判成 L1（少两级审批）。
+     */
+    @Test
+    void explain_posts_the_sql_and_parses_the_estimated_rows() throws Exception {
+        reply.set(new Reply(200, "{\"estimatedRows\":42}"));
+
+        ExplainEstimate estimate = client.explain(
+                READONLY_CONN, "update t_order set a = 1 where id = 1");
+
+        assertThat(lastMethod.get()).isEqualTo("POST");
+        assertThat(lastPath.get()).isEqualTo("/internal/v1/explain");
+        JsonNode sent = MAPPER.readTree(lastBody.get());
+        assertThat(sent.path("sql").asText()).isEqualTo("update t_order set a = 1 where id = 1");
+        assertThat(sent.path("conn").path("dbName").asText()).isEqualTo("order_db");
+
+        assertThat(estimate.estimatedRows()).isEqualTo(42);
+    }
+
+    /**
+     * {@code -1} 是"估不出来"的合法答案，必须原样带回风险分级（后者据此判 L3）。
+     *
+     * <p>若客户端把 {@code -1} 归一成 0 或丢掉，引擎会把一条无法估算的语句当成"0 行"，判 L1。
+     */
+    @Test
+    void explain_passes_the_unknown_estimate_through_instead_of_zeroing_it() {
+        reply.set(new Reply(200, "{\"estimatedRows\":-1}"));
+
+        assertThat(client.explain(READONLY_CONN, "update t join u on u.id = t.id set t.a = 1")
+                .estimatedRows()).isEqualTo(-1L);
+    }
+
+    /** 2xx 但响应体为空是"执行器坏了"，不是"0 行"：风险分级不能拿一个假估算继续算。 */
+    @Test
+    void explain_fails_loudly_when_the_executor_returns_an_empty_body() {
+        reply.set(new Reply(200, ""));
+
+        assertThatThrownBy(() -> client.explain(READONLY_CONN, "update t set a = 1 where id = 1"))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("空的估算结果");
+    }
+
+    /** 非 2xx 走 {@link ExecutorErrors}：原样还原执行器的 code 与消息。 */
+    @Test
+    void explain_restores_the_executor_error_instead_of_a_zero_estimate() {
+        reply.set(new Reply(500, """
+                {"code":"INTERNAL_ERROR","message":"执行器 EXPLAIN 失败（SQLState=42000）"}
+                """));
+
+        assertThatThrownBy(() -> client.explain(READONLY_CONN, "update t set a = 1 where id = 1"))
+                .isInstanceOf(BizException.class)
+                .satisfies(e -> assertThat(((BizException) e).getMessage()).contains("42000"));
     }
 
     private void handle(HttpExchange exchange) throws IOException {

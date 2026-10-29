@@ -6,6 +6,7 @@ import java.util.Map;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
 
@@ -55,4 +56,22 @@ public interface ExecutorClient {
      * @throws com.badc.sql.common.error.BizException 库不可达、权限不足或执行器不可用
      */
     Map<String, String> fingerprint(ConnConfig conn, List<String> tables);
+
+    /**
+     * 取一条语句的 EXPLAIN 行数估算，供风险分级按行数分档。
+     *
+     * <p>执行器只发 {@code explain <sql>}，<b>绝不执行原语句</b>；估算不出来时返回 {@code -1}
+     * （见 {@link com.badc.sql.common.dto.ExplainEstimate}），调用方必须把 {@code -1} 当"最严"处理，
+     * 不能当 0 行——两者在风险分级上差两级审批。
+     *
+     * <p>返回值是 {@code -1} 而不是抛异常：语句不合法、某行 {@code rows} 为 NULL 都属于"估不出来"，
+     * 是正常结果而不是故障。库不可达、权限不足、执行器不可用才由
+     * {@link com.badc.sql.common.error.BizException} 表达。
+     *
+     * @param conn 只读账号的连接配置（EXPLAIN 不写库，用只读账号即可）
+     * @param sql  待估算的语句原文
+     * @return 行数估算；{@code -1} 表示无法估算
+     * @throws com.badc.sql.common.error.BizException 库不可达、权限不足或执行器不可用
+     */
+    ExplainEstimate explain(ConnConfig conn, String sql);
 }

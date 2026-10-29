@@ -7,6 +7,7 @@ import java.util.Map;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -36,6 +37,17 @@ public class TicketStubExecutor implements ExecutorClient {
     /** 让 fingerprint 抛 {@code BizException}，模拟库不可达 / 权限不足（区别于"表不存在"的空 map）。 */
     public boolean fingerprintThrows;
 
+    /**
+     * EXPLAIN 的行数估算；默认 1，让 {@code update ... where id = 1} 这类典型语句落在 L1——工单测试要的是
+     * 提交流程本身，不该被一个虚构的大行数顶到 L3 去走两级审批。
+     *
+     * <p>要造"风险随估算升级"的用例改这个字段即可；{@code -1}（无法估算）也要能设。
+     */
+    public ExplainEstimate explainEstimate = new ExplainEstimate(1);
+
+    /** 最近一次估算的入参语句，供用例断言控制面把哪条语句拿去估算了。 */
+    public String lastExplainedSql;
+
     @Override
     public RawResult query(ConnConfig conn, String sql, int maxRows) {
         throw new UnsupportedOperationException("工单测试不走这个入口");
@@ -59,5 +71,11 @@ public class TicketStubExecutor implements ExecutorClient {
             throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器不可用，请稍后重试");
         }
         return fingerprints;
+    }
+
+    @Override
+    public ExplainEstimate explain(ConnConfig conn, String sql) {
+        this.lastExplainedSql = sql;
+        return explainEstimate;
     }
 }

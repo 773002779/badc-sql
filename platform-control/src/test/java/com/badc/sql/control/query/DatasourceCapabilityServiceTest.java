@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -225,6 +226,11 @@ class DatasourceCapabilityServiceTest {
         @Override
         public Map<String, String> fingerprint(ConnConfig conn, List<String> tables) {
             throw new UnsupportedOperationException("能力缓存不应取指纹");
+        }
+
+        @Override
+        public ExplainEstimate explain(ConnConfig conn, String sql) {
+            throw new UnsupportedOperationException("能力缓存不应做行数估算");
         }
     }
 }
