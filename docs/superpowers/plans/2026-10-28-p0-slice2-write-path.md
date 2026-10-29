@@ -611,7 +611,7 @@ public record ExplainCall(ConnConfig conn, String sql) {}
 
 `SchemaSnapshotter` 的根目录从配置取：`@Value("${badcsql.snapshot.root:/data/snapshot}")`，测试里用 `@TempDir` 显式构造。
 
-控制面侧：`ExecutorClient` 加 `Map<String, String> fingerprint(ConnConfig conn, List<String> tables)`，`HttpExecutorClient` 打 `POST /internal/v1/fingerprint` 并复用既有 `post(...)`。**这一步会打断所有 `ExecutorClient` 的测试桩**（至少 `QueryControllerIT.StubExecutor`）——必须同时补上方法体，否则控制面测试编译不过；那里只做 `throw new UnsupportedOperationException("查询测试不走这个入口")`，不铺无用的假数据。
+控制面侧：`ExecutorClient` 加 `Map<String, String> fingerprint(ConnConfig conn, List<String> tables)`，`HttpExecutorClient` 打 `POST /internal/v1/fingerprint` 并复用既有 `post(...)`。**这一步会打断 `ExecutorClient` 的全部测试桩——是三个，不是两个**：`QueryControllerIT.StubExecutor`、`DatasourceCapabilityServiceTest.RecordingExecutor`、以及本任务新建的 `support/TicketStubExecutor`。前两个只做 `throw new UnsupportedOperationException(...)`（各写一句为什么这个入口不该被它们触发），不铺无用的假数据；否则控制面测试源码编译不过。
 
 工单类 IT 需要的是一个真正可用的桩，且会被任务 7/8/11/13 四个测试类共用。在 `support/TicketStubExecutor.java` 建一份，本任务先给到 `fingerprint`：
 
@@ -877,7 +877,7 @@ Expected: FAIL — 类不存在。
 
 `ExecWindow.isWithin(Instant at)`：把 `at` 转到 `window-zone`，取 `LocalTime`；`start <= end` 时区间为 `[start, end)`，跨零点时（`20:00`–`06:00`）为 `>= start || < end`。
 
-`ExecutorClient` 加 `ExplainEstimate explain(ConnConfig conn, String sql)`，`HttpExecutorClient` 实现 `POST /internal/v1/explain`，复用既有 `post(...)` 与 `ExecutorErrors`。两个桩都要补：`QueryControllerIT.StubExecutor` 抛 `UnsupportedOperationException`；`support/TicketStubExecutor` 加可设置字段 `ExplainEstimate explainEstimate = new ExplainEstimate(1)`，默认让 `update ... where id = 1` 落到 L1。
+`ExecutorClient` 加 `ExplainEstimate explain(ConnConfig conn, String sql)`，`HttpExecutorClient` 实现 `POST /internal/v1/explain`，复用既有 `post(...)` 与 `ExecutorErrors`。**三个桩都要补**：`QueryControllerIT.StubExecutor` 与 `DatasourceCapabilityServiceTest.RecordingExecutor` 抛 `UnsupportedOperationException`；`support/TicketStubExecutor` 加可设置字段 `ExplainEstimate explainEstimate = new ExplainEstimate(1)`，默认让 `update ... where id = 1` 落到 L1。
 
 `RiskProperties` 是 `@ConfigurationProperties(prefix = "badcsql.risk")` 的 record，在 `ControlApplication` 上加 `@ConfigurationPropertiesScan`（或 `@EnableConfigurationProperties(RiskProperties.class)`），否则 `RiskEngine` 注入不到它、单测之外的路径会在启动期失败。`relaxed()` 把 `l1MaxRows`/`l2MaxRows` 设为 `Integer.MAX_VALUE`，窗口设为 `00:00`–`23:59`。
 
