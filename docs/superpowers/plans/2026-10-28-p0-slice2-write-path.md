@@ -547,7 +547,7 @@ git commit -m "feat(risk): add the sixteen policy rules with BLOCK vs PIN_LEVEL 
   - `SchemaSnapshotter.capture(ConnConfig conn, List<String> tables, String relativeRef) -> SnapshotResult`
   - `SchemaSnapshotter.fingerprint(ConnConfig conn, List<String> tables) -> Map<String, String>`
   - `ExplainRunner.estimate(ConnConfig conn, String sql) -> ExplainEstimate`（`-1` 表示无法估算）
-  - `SnapshotPaths.resolve(String root, String relativeRef) -> Path`、`SnapshotPaths.fileName(String table) -> String`
+  - `SnapshotPaths.resolve(String root, String relativeRef) -> Path`
   - `ExecutorClient.fingerprint(ConnConfig conn, List<String> tables) -> Map<String, String>`
   - 执行器端点：`POST /internal/v1/snapshot`、`POST /internal/v1/fingerprint`、`POST /internal/v1/explain`
 
@@ -570,11 +570,10 @@ class SnapshotPathsTest {
             .isInstanceOf(BizException.class);
     }
 
-    /** 表名可以带反引号与点号，但它只参与文件名哈希，不参与路径拼接。 */
-    @Test void a_table_name_never_reaches_the_path() {
-        String name = SnapshotPaths.fileName("weird`name.with.dot");
-        assertThat(name).matches("[0-9a-f]{16}");
-        assertThat(name).doesNotContain("weird").doesNotContain(".").doesNotContain("`");
+    /** 前缀必须按路径元素比较：`/data/snapshotX` 不能冒充 `/data/snapshot`。 */
+    @Test void a_sibling_directory_sharing_the_prefix_is_refused() {
+        assertThatThrownBy(() -> SnapshotPaths.resolve("/data/snapshot", "../snapshotX/1"))
+            .isInstanceOf(BizException.class);
     }
 }
 ```
@@ -588,7 +587,7 @@ Expected: FAIL — 类不存在。
 
 `SnapshotPaths.resolve`：`Path.of(relativeRef).normalize()` 后必须仍以 `Path.of(root).normalize()` 为前缀，且 `relativeRef` 不含 `\`、不以 `/` 或 `:` 开头。不满足 → `BizException(INVALID_ARGUMENT, "快照路径不合法")`。
 
-`SnapshotPaths.fileName(table)`：表名只用来做 `sha256(table)` 前 16 位，文件内保存真实表名——**表名永远不参与路径**。
+**表名永远不参与路径**：落盘路径只由 `relativeRef`（`{systemId}/{datasourceId}/{ticketId}/{changeSeq}`）决定，表名只出现在 `schema.sql` / `schema.json` 的内容里。原计划里的 `SnapshotPaths.fileName` 已删除——本布局没有逐表文件，留一个无人调用的"表名→文件名"映射会让人误以为路径安全靠它保证。
 
 `SchemaSnapshotter.capture`：对每个表执行
 
