@@ -58,6 +58,7 @@ class HttpExecutorClientTest {
     private final AtomicReference<Reply> reply = new AtomicReference<>(new Reply(200, ""));
 
     private final AtomicReference<String> lastPath = new AtomicReference<>();
+    private final AtomicReference<String> lastMethod = new AtomicReference<>();
     private final AtomicReference<String> lastBody = new AtomicReference<>();
     private final AtomicReference<String> lastToken = new AtomicReference<>();
 
@@ -174,10 +175,10 @@ class HttpExecutorClientTest {
     }
 
     /**
-     * 指纹入口的三处接错点：路径、请求体里表名挂在 {@code tables} 数组下、返回的 map 被解析出来。
+     * 指纹入口的接错点：HTTP 方法、路径、请求体里表名挂在 {@code tables} 数组下、返回的 map 被解析出来。
      *
-     * <p>路径写错是 404；字段名写成 {@code tableNames} 之类是 400 或静默的空结果；返回体解析不对则
-     * 漂移检测拿到空 map——会被误读成"表不存在"，正是提交与执行判定的分叉点。
+     * <p>路径写错是 404（写成 GET 则是 405）；字段名写成 {@code tableNames} 之类是 400 或静默的空结果；
+     * 返回体解析不对则漂移检测拿到空 map——会被误读成"表不存在"，正是提交与执行判定的分叉点。
      */
     @Test
     void fingerprint_posts_the_tables_array_and_parses_the_returned_map() throws Exception {
@@ -185,6 +186,8 @@ class HttpExecutorClientTest {
 
         Map<String, String> fingerprints = client.fingerprint(READONLY_CONN, List.of("t_order", "t_item"));
 
+        // 执行器只暴露 @PostMapping：方法写错时 path/body 断言都可能仍然通过。
+        assertThat(lastMethod.get()).isEqualTo("POST");
         assertThat(lastPath.get()).isEqualTo("/internal/v1/fingerprint");
         JsonNode sent = MAPPER.readTree(lastBody.get());
         assertThat(sent.path("conn").path("dbName").asText()).isEqualTo("order_db");
@@ -192,6 +195,37 @@ class HttpExecutorClientTest {
         assertThat(sent.path("tables").get(1).asText()).isEqualTo("t_item");
 
         assertThat(fingerprints).containsEntry("t_order", "fp-1").containsEntry("t_item", "fp-2");
+    }
+
+    /**
+     * 2xx 但响应体为空是"执行器坏了"，不是"表都不存在"。
+     *
+     * <p>这条分支必须抛：若将来被改成 {@code return Map.of()}，"库不可达"会被记成"无表"，漂移检测
+     * 空转通过，而空 map 在控制面语义里正是"这些表都不存在"。
+     */
+    @Test
+    void fingerprint_fails_loudly_when_the_executor_returns_an_empty_body() {
+        reply.set(new Reply(200, ""));
+
+        assertThatThrownBy(() -> client.fingerprint(READONLY_CONN, List.of("t_order")))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("空的指纹结果");
+    }
+
+    /** 非 2xx 要走 {@link ExecutorErrors}：原样还原执行器的 code 与消息，绝不能吞成空 map。 */
+    @Test
+    void fingerprint_restores_the_executor_error_instead_of_an_empty_map() {
+        reply.set(new Reply(500, """
+                {"code":"INTERNAL_ERROR","message":"执行器取指纹失败（SQLState=28000）"}
+                """));
+
+        assertThatThrownBy(() -> client.fingerprint(READONLY_CONN, List.of("t_order")))
+                .isInstanceOf(BizException.class)
+                .satisfies(e -> {
+                    BizException biz = (BizException) e;
+                    assertThat(biz.code()).isEqualTo(ErrorCode.INTERNAL_ERROR);
+                    assertThat(biz.getMessage()).contains("28000");
+                });
     }
 
     /**
@@ -209,6 +243,7 @@ class HttpExecutorClientTest {
 
     private void handle(HttpExchange exchange) throws IOException {
         lastPath.set(exchange.getRequestURI().getPath());
+        lastMethod.set(exchange.getRequestMethod());
         lastBody.set(new String(exchange.getRequestBody().readAllBytes(), UTF_8));
         lastToken.set(exchange.getRequestHeaders().getFirst("X-Badc-Internal-Token"));
         Reply response = reply.get();

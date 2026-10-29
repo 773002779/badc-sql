@@ -9,6 +9,8 @@ import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
+import com.badc.sql.common.error.BizException;
+import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.query.ExecutorClient;
 
 /**
@@ -31,6 +33,9 @@ public class TicketStubExecutor implements ExecutorClient {
     /** 最近一次取指纹的入参表名，供用例断言控制面传了什么。 */
     public List<String> lastFingerprintTables = List.of();
 
+    /** 让 fingerprint 抛 {@code BizException}，模拟库不可达 / 权限不足（区别于"表不存在"的空 map）。 */
+    public boolean fingerprintThrows;
+
     @Override
     public RawResult query(ConnConfig conn, String sql, int maxRows) {
         throw new UnsupportedOperationException("工单测试不走这个入口");
@@ -48,7 +53,11 @@ public class TicketStubExecutor implements ExecutorClient {
 
     @Override
     public Map<String, String> fingerprint(ConnConfig conn, List<String> tables) {
-        this.lastFingerprintTables = tables;
+        // 复制入参：持有调用方的列表会让"调用后列表被改"变成桩里的假历史。
+        this.lastFingerprintTables = List.copyOf(tables);
+        if (fingerprintThrows) {
+            throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器不可用，请稍后重试");
+        }
         return fingerprints;
     }
 }
