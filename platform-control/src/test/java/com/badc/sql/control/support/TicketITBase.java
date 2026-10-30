@@ -24,6 +24,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.jdbc.datasource.init.DatabasePopulatorUtils;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
@@ -43,9 +44,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * <p><b>窗口固定为全天</b>：默认业务窗口是 20:00–06:00，测试若在窗口外跑，一条估算 1 行的 update 会被
  * 升到 L2，等级断言就会随执行时刻变化。工单测试要验证的是提交流程，不是窗口判定（那由
  * {@code RiskEngineTest} 覆盖），所以这里用 {@link TestPropertySource} 把窗口铺满。
+ *
+ * <p><b>本类必须 {@link DirtiesContext}（AFTER_CLASS）</b>：每个测试类用 {@link AbstractMySqlIT} 各自建
+ * 一个随机 schema 并在类结束后 DROP，但 Spring 的上下文缓存只按 {@code @DynamicPropertySource} 的
+ * <b>方法</b>区分（不按解析出的 URL）。多个工单 IT 都继承本类的同一个方法，于是后跑的类会复用前一个类
+ * 的上下文、连向前一个类已 DROP 的库，请求全部变成 500 "Unknown database"。关掉上下文复用后，每个类都
+ * 用自己新建的 schema。只有 {@code TicketSubmitIT} 一个子类时这个问题不会显现，加入 {@code TicketQueryIT}
+ * 后才暴露。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Import(TicketStubExecutorConfig.class)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @TestPropertySource(properties = {
         "badcsql.risk.window-start=00:00",
@@ -147,6 +156,26 @@ public abstract class TicketITBase extends AbstractMySqlIT {
         }
         return rest.exchange("/api/v1/tickets", HttpMethod.POST,
                 new HttpEntity<>(body, headers), String.class);
+    }
+
+    /** 按页取工单列表，返回原始 HTTP 响应（用例自己断言状态码与正文）。 */
+    protected ResponseEntity<String> listTickets(String token, int page, int size) {
+        return rest.exchange("/api/v1/tickets?page=" + page + "&size=" + size, HttpMethod.GET,
+                new HttpEntity<>(bearer(token)), String.class);
+    }
+
+    /** 取工单详情，返回原始 HTTP 响应（403/404 也要能拿到错误体）。 */
+    protected ResponseEntity<String> detail(String token, long id) {
+        return rest.exchange("/api/v1/tickets/" + id, HttpMethod.GET,
+                new HttpEntity<>(bearer(token)), String.class);
+    }
+
+    private static HttpHeaders bearer(String token) {
+        HttpHeaders headers = new HttpHeaders();
+        if (token != null) {
+            headers.setBearerAuth(token);
+        }
+        return headers;
     }
 
     /** 工单当前状态；不存在时返回 {@code null}。 */

@@ -5,9 +5,12 @@ import java.util.List;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.badc.sql.common.error.BizException;
@@ -17,7 +20,8 @@ import com.badc.sql.control.security.CurrentUser;
 /**
  * 变更工单接口。
  *
- * <p>本切片（任务 7a）只有提交 {@code POST /api/v1/tickets}；详情与列表由任务 7b 接在同一控制器上。
+ * <p>提交（任务 7a）与详情/列表（任务 7b）挂在同一个控制器上：三者共享 {@code /api/v1/tickets} 前缀与
+ * JWT 身份来源。业务判断全部在服务层——控制器只负责取当前用户、转发参数。
  *
  * <p><b>请求体不接收 {@code systemId}/{@code moduleId}</b>：归属由服务端从数据源与授权链推导（见
  * {@link TicketAssignmentService}），前端传得越多错得越多。同样不接收 {@code submitterId}——身份只来自
@@ -28,9 +32,32 @@ import com.badc.sql.control.security.CurrentUser;
 public class TicketController {
 
     private final TicketService ticketService;
+    private final TicketQueryService queryService;
 
-    public TicketController(TicketService ticketService) {
+    public TicketController(TicketService ticketService, TicketQueryService queryService) {
         this.ticketService = ticketService;
+        this.queryService = queryService;
+    }
+
+    /**
+     * 当前用户可见的工单，按创建时间倒序。
+     *
+     * @param page 页码，默认 1
+     * @param size 页大小，默认 20，上限 100
+     */
+    @GetMapping
+    public TicketQueryService.TicketPage list(
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        return queryService.list(CurrentUser.id(), page, size);
+    }
+
+    /**
+     * 工单详情：存在但无权 403、不存在 404，两者严格区分。
+     */
+    @GetMapping("/{id}")
+    public TicketQueryService.TicketDetail detail(@PathVariable long id) {
+        return queryService.detail(CurrentUser.id(), id);
     }
 
     /**
