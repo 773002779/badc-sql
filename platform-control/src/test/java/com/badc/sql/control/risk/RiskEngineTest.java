@@ -56,6 +56,10 @@ class RiskEngineTest {
         return assessment.hits().stream().filter(hit -> hit.ruleCode().equals(ruleCode)).toList();
     }
 
+    private static List<String> ruleCodes(RiskAssessment assessment) {
+        return assessment.hits().stream().map(RiskHit::ruleCode).toList();
+    }
+
     // ------------------------------------------------------------------ 硬规则不可放宽
 
     @Test
@@ -84,20 +88,47 @@ class RiskEngineTest {
     // ------------------------------------------------------------------ BLOCK
 
     /**
-     * BLOCK 命中的 {@code level} 是 {@code null}。若先把所有命中的 level 合并成等级（null 当 L0），
-     * {@code drop database} 会算出 <b>L0（只读、无需审批）</b>——一条被硬禁止的语句拿到"无需审批"的评级。
-     * 所以必须先看 discipline、再看等级：有 BLOCK 就直接 L3 并标记不可提交。
+     * 这条只证明"BLOCK 会被上报、工单不可提交"，<b>证明不了"BLOCK 优先于等级合并"</b>：
+     * {@code drop database} 走 {@code ddlLevel} 的兜底分支本来就会得到 L3，把 {@code assess} 里的
+     * {@code RiskLevel.L3} 换成 {@code baseLevel(request)} 也照样通过。顺序由下一条用例承重。
      */
     @Test
     void a_blocking_rule_is_reported_and_the_ticket_cannot_be_submitted() {
         RiskAssessment a = engine.assess(req("drop database x", true));
 
         assertThat(a.blocked()).isTrue();
-        // 若先合并等级（BLOCK 命中的 level 是 null，会被当成 L0），这里会是 L0——一条被硬禁止的语句反而"无需审批"。
-        assertThat(a.level()).isNotEqualTo(RiskLevel.L0);
         assertThat(a.level()).isEqualTo(RiskLevel.L3);
         assertThat(withCode(a, "DROP_DATABASE")).singleElement()
                 .satisfies(hit -> assertThat(hit.discipline()).isEqualTo(Discipline.BLOCK));
+    }
+
+    /**
+     * <b>唯一能触发 L0 陷阱的输入</b>：有 BLOCK 命中，且非 BLOCK 路径算出的基础等级是 L0。
+     *
+     * <p>{@code select 1; drop table t} 的分类只看第一条语句（多语句时其余字段只描述第一条，见
+     * {@link Classification}），于是 {@code writeStatement=false}、{@code ddlAction=NONE}——基础等级是
+     * <b>L0</b>；而 {@code multipleStatements} 命中 {@code MULTI_STATEMENT} 的 BLOCK。
+     *
+     * <p>若把 BLOCK 判断挪到等级合并之后（例如 {@code assess} 里改用 {@code baseLevel(request)}），
+     * 这条含 {@code drop table} 的语句会得到 <b>L0（只读、无需审批）</b>。`drop database` 承担不了这个证明，
+     * 它自己的基础等级就是 L3。
+     */
+    @Test
+    void a_blocked_statement_whose_base_level_is_l0_still_grades_l3() {
+        String sql = "select 1; drop table t";
+        Classification classification = classifier.classify(sql);
+
+        // 前提（也就是这条用例的承重点）：分类只看第一条语句，非 BLOCK 路径会得到 L0。
+        assertThat(classification.multipleStatements()).isTrue();
+        assertThat(classification.writeStatement()).isFalse();
+        assertThat(classification.ddlAction()).isEqualTo(DdlAction.NONE);
+
+        RiskAssessment a = engine.assess(
+                new RiskRequest(sql, classification, new ExplainEstimate(1), true, true, null));
+
+        assertThat(a.blocked()).isTrue();
+        // 把 BLOCK 判断移到等级合并之后，这里会退化成 L0——一条含 drop table 的语句拿到"无需审批"。
+        assertThat(a.level()).isEqualTo(RiskLevel.L3);
     }
 
     /** 多语句拼接同样在提交阶段被拒绝，不是"按第一条算个等级再审批"。 */
@@ -381,9 +412,32 @@ class RiskEngineTest {
     /** 改了一个字但等级没变：哈希必须变，否则"风险未变"校验会放行被改过的语句。 */
     @Test
     void the_snapshot_hash_changes_when_the_sql_changes() {
-        assertThat(engine.assess(reqWithEstimate("update t set a = 1 where id = 1", 1L, true)).snapshotHash())
-                .isNotEqualTo(engine.assess(reqWithEstimate("update t set a = 2 where id = 1", 1L, true))
-                        .snapshotHash());
+        RiskAssessment before = engine.assess(reqWithEstimate("update t set a = 1 where id = 1", 1L, true));
+        RiskAssessment after = engine.assess(reqWithEstimate("update t set a = 2 where id = 1", 1L, true));
+
+        // 前提：等级与规则码都没变，差异只在 SQL 文本——哈希变的原因只能是 SQL。
+        assertThat(before.level()).isEqualTo(after.level()).isEqualTo(RiskLevel.L1);
+        assertThat(ruleCodes(before)).isEqualTo(ruleCodes(after));
+        assertThat(before.snapshotHash()).isNotEqualTo(after.snapshotHash());
+    }
+
+    /**
+     * 等级是哈希的<b>独立分量</b>：SQL 与规则码都不变、只有等级不同时，哈希也必须不同。
+     *
+     * <p>没有这条用例，从哈希材料里删掉 {@code level.name()} 也全绿——而"风险等级从 L2 升到 L3"恰恰是
+     * 执行前最需要被发现的变化（审批链从一级变成两级）。
+     */
+    @Test
+    void the_snapshot_hash_changes_when_only_the_level_changes() {
+        String sql = "update t set a = 1 where b = 2";
+        RiskAssessment l2 = engine.assess(reqWithEstimate(sql, 500L, true));
+        RiskAssessment l3 = engine.assess(reqWithEstimate(sql, 5_000L, true));
+
+        assertThat(l2.level()).isEqualTo(RiskLevel.L2);
+        assertThat(l3.level()).isEqualTo(RiskLevel.L3);
+        // 前提：同一条 SQL → 同一组规则码。等级是两者唯一的差异。
+        assertThat(ruleCodes(l2)).isEqualTo(ruleCodes(l3));
+        assertThat(l2.snapshotHash()).isNotEqualTo(l3.snapshotHash());
     }
 
     @Test
@@ -398,7 +452,8 @@ class RiskEngineTest {
         RiskAssessment inside = engine.assess(req("drop table t_order", true));
         RiskAssessment outside = engine.assess(req("drop table t_order", false));
 
-        assertThat(inside.level()).isEqualTo(outside.level());
+        assertThat(inside.level()).isEqualTo(outside.level()).isEqualTo(RiskLevel.L3);
+        assertThat(ruleCodes(inside)).isNotEqualTo(ruleCodes(outside));
         assertThat(inside.snapshotHash()).isNotEqualTo(outside.snapshotHash());
     }
 
