@@ -1,5 +1,6 @@
 package com.badc.sql.control.support;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,6 +49,17 @@ public class TicketStubExecutor implements ExecutorClient {
     /** 最近一次估算的入参语句，供用例断言控制面把哪条语句拿去估算了。 */
     public String lastExplainedSql;
 
+    /** explain 的调用次数：DDL 不该被估算，应为 0。 */
+    public int explainCalls;
+
+    /**
+     * explain 使用的连接账号名，按调用顺序。
+     *
+     * <p>用来钉住"按语句类型选账号"：DML 必须走 dml 账号（只读账号 EXPLAIN 写语句会被 MySQL 以 1142
+     * 拒绝 → {@code -1} → 整单误判 L3），只读语句走 readonly 账号。
+     */
+    public List<String> explainedUsernames = new ArrayList<>();
+
     /**
      * 恢复默认状态。字段是 public 的，用例改完不还原就会把状态漏给下一个用例；统一在这里复位，
      * 免得每个测试类各写一遍且漏掉某个字段。
@@ -58,6 +70,8 @@ public class TicketStubExecutor implements ExecutorClient {
         fingerprintThrows = false;
         explainEstimate = new ExplainEstimate(1);
         lastExplainedSql = null;
+        explainCalls = 0;
+        explainedUsernames = new ArrayList<>();
     }
 
     @Override
@@ -87,7 +101,9 @@ public class TicketStubExecutor implements ExecutorClient {
 
     @Override
     public ExplainEstimate explain(ConnConfig conn, String sql) {
+        this.explainCalls++;
         this.lastExplainedSql = sql;
+        this.explainedUsernames.add(conn == null ? null : conn.username());
         return explainEstimate;
     }
 }

@@ -30,7 +30,7 @@ class TicketSubmitValidatorTest {
         assertThat(validated.hasDdl()).isTrue();
         assertThat(validated.hasDmlWrite()).isFalse();
         assertThat(validated.statements()).singleElement()
-                .satisfies(statement -> assertThat(statement.statementType()).isEqualTo("CREATE_TABLE"));
+                .satisfies(statement -> assertThat(statement.statementType()).isEqualTo("CREATE"));
     }
 
     @Test
@@ -90,7 +90,7 @@ class TicketSubmitValidatorTest {
     }
 
     @Test
-    void statement_types_use_the_ddl_action_then_the_keyword() {
+    void statement_types_use_the_short_verb_from_the_first_keyword() {
         ValidatedSubmission validated = TicketSubmitValidator.validate(command(
                 List.of("drop table t_order", "update t_order set a=1 where id=1"),
                 TicketSubmitValidator.DROP_TABLE_CONFIRMATION,
@@ -98,7 +98,38 @@ class TicketSubmitValidatorTest {
 
         assertThat(validated.statements())
                 .extracting(TicketSubmitValidator.ValidatedStatement::statementType)
-                .containsExactly("DROP_TABLE", "UPDATE");
+                .containsExactly("DROP", "UPDATE");
+    }
+
+    /** BLOCK 先于必填项：不给标题也该先看到"drop database 被拒绝"，而不是"标题不能为空"。 */
+    @Test
+    void a_blocked_statement_is_reported_before_missing_metadata() {
+        SubmitCommand command = new SubmitCommand(101L, null, null, null, null,
+                List.of("drop database order_db"), null);
+
+        assertThatThrownBy(() -> TicketSubmitValidator.validate(command))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("drop database");
+    }
+
+    @Test
+    void a_change_reason_longer_than_the_limit_is_refused() {
+        SubmitCommand command = new SubmitCommand(101L, "标题", "x".repeat(2001), null, null,
+                List.of("select 1"), TOMORROW);
+
+        assertThatThrownBy(() -> TicketSubmitValidator.validate(command))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("变更原因长度不能超过 2000");
+    }
+
+    @Test
+    void a_rollback_plan_longer_than_the_limit_is_refused() {
+        SubmitCommand command = new SubmitCommand(101L, "标题", "原因", "p".repeat(20001), null,
+                List.of("create table t_new (id int)"), TOMORROW);
+
+        assertThatThrownBy(() -> TicketSubmitValidator.validate(command))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("回滚方案长度不能超过 20000");
     }
 
     private static SubmitCommand command(List<String> statements, String rollbackPlan, String rollbackSql) {

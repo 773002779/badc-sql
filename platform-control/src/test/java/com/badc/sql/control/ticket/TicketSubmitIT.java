@@ -10,7 +10,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
+import com.badc.sql.common.dto.ExplainEstimate;
+import com.badc.sql.control.risk.RiskAssessment;
+import com.badc.sql.control.risk.RiskEngine;
+import com.badc.sql.control.risk.StatementClassifier;
 import com.badc.sql.control.support.TicketITBase;
+import com.badc.sql.control.ticket.exec.StatementFingerprint;
 import com.fasterxml.jackson.databind.JsonNode;
 
 /**
@@ -40,7 +45,7 @@ class TicketSubmitIT extends TicketITBase {
     @Test
     void a_dml_ticket_without_rollback_sql_is_refused() {
         assertBadRequest(postTicket(DEV_TOKEN, body("update t_order set a=1 where id=1", null)), "回滚 SQL");
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     @Test
@@ -48,7 +53,7 @@ class TicketSubmitIT extends TicketITBase {
         assertBadRequest(
                 postTicket(DEV_TOKEN, body("create table t_new (id int)", null, null)),
                 "回滚方案");
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     @Test
@@ -56,7 +61,7 @@ class TicketSubmitIT extends TicketITBase {
         assertBadRequest(
                 postTicket(DEV_TOKEN, body("drop table t_order", "重建表", null)),
                 "将从快照重建表结构");
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     // ------------------------------------------------------------------ BLOCK 与回滚 SQL 静态检查
@@ -67,7 +72,7 @@ class TicketSubmitIT extends TicketITBase {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(response.getBody()).contains("drop database");
-        assertThat(ticketCount()).as("BLOCK 不允许落任何行").isZero();
+        assertNothingPersisted();
     }
 
     @Test
@@ -76,7 +81,7 @@ class TicketSubmitIT extends TicketITBase {
                 postTicket(DEV_TOKEN,
                         body("update t_order set a=1 where id=1", "update t_other set a=0 where id=1")),
                 "回滚 SQL 未命中目标表");
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     @Test
@@ -85,7 +90,7 @@ class TicketSubmitIT extends TicketITBase {
                 postTicket(DEV_TOKEN,
                         body("update t_order set a=1 where id=1", "drop database order_db")),
                 "drop database");
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     // ------------------------------------------------------------------ 分级与落库
@@ -104,7 +109,7 @@ class TicketSubmitIT extends TicketITBase {
         assertThat(body.path("riskLevel").asText()).isEqualTo("L3");
         assertThat(body.path("statements")).hasSize(1);
         assertThat(body.path("statements").get(0).path("seq").asInt()).isEqualTo(1);
-        assertThat(body.path("statements").get(0).path("statementType").asText()).isEqualTo("DROP_TABLE");
+        assertThat(body.path("statements").get(0).path("statementType").asText()).isEqualTo("DROP");
         assertThat(body.path("statements").get(0).path("riskLevel").asText()).isEqualTo("L3");
 
         assertThat(status(id)).isEqualTo("REVIEWING_L1");
@@ -112,9 +117,16 @@ class TicketSubmitIT extends TicketITBase {
         assertThat(columnOf(id, "ticket_type")).isEqualTo("NORMAL");
         assertThat(jdbc.queryForObject("select snapshot_enabled from ticket where id = ?", Integer.class, id))
                 .isEqualTo(1);
-        assertThat(columnOf(id, "statement_fingerprint")).matches("[0-9a-f]{64}");
-        assertThat(columnOf(id, "risk_snapshot_hash")).matches("[0-9a-f]{64}");
-        assertThat(columnOf(id, "risk_snapshot_json")).contains("DROP_TABLE").contains("\"level\":\"L3\"");
+        String sql = "drop table t_order";
+        assertThat(columnOf(id, "statement_fingerprint"))
+                .isEqualTo(StatementFingerprint.of(ORDER_DATASOURCE_ID, List.of(sql)));
+        // I2：哈希必须能被测试代码用同一套公开入口原样重算，不能只靠 64 位正则。
+        TicketRiskSnapshot.Snapshot expected = snapshotFor(sql, -1);
+        assertThat(columnOf(id, "risk_snapshot_hash"))
+                .isEqualTo(TicketRiskSnapshot.hash(expected, List.of(sql)));
+        assertThat(columnOf(id, "risk_snapshot_json"))
+                .isEqualTo(TicketRiskSnapshot.json(expected));
+        assertThat(stub.explainCalls).as("DDL 不估算，不该白跑一次网络往返").isZero();
         assertThat(columnOf(id, "submitter_id")).isEqualTo("1");
         assertThat(columnOf(id, "system_id")).isEqualTo("1");
         assertThat(columnOf(id, "module_id")).isEqualTo("201");
@@ -123,7 +135,7 @@ class TicketSubmitIT extends TicketITBase {
         assertThat(statements).hasSize(1);
         assertThat(statements.get(0).seqNo()).isEqualTo(1);
         assertThat(statements.get(0).sqlText()).isEqualTo("drop table t_order");
-        assertThat(statements.get(0).statementType()).isEqualTo("DROP_TABLE");
+        assertThat(statements.get(0).statementType()).isEqualTo("DROP");
         assertThat(statements.get(0).riskLevel()).isEqualTo("L3");
         assertThat(statements.get(0).status()).isEqualTo("PENDING");
 
@@ -152,6 +164,9 @@ class TicketSubmitIT extends TicketITBase {
         long id = idOf(response);
 
         assertThat(columnOf(id, "risk_level")).isEqualTo("L3");
+        // 混合工单只估 DML：truncate 是 DDL，不该被送去 explain。
+        assertThat(stub.explainCalls).isEqualTo(1);
+        assertThat(stub.explainedUsernames).containsExactly("dml_user");
 
         List<StatementRow> statements = statementsOf(id);
         assertThat(statements).hasSize(2);
@@ -208,22 +223,92 @@ class TicketSubmitIT extends TicketITBase {
         assertThat(response.getStatusCode().is5xxServerError())
                 .as("执行器故障必须是失败，不能降级成空指纹")
                 .isTrue();
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
+    }
+
+    // ------------------------------------------------------------------ 估算账号（C1）
+
+    /**
+     * DML 必须用 dml 账号估算：只读账号对 {@code EXPLAIN UPDATE} 会被 MySQL 以 1142 拒绝，执行器吞成
+     * {@code -1} 后整单会被误判 L3（L1/L2 分档在真实环境失效）。这里同时钉住"估算 500 → L2"。
+     */
+    @Test
+    void a_dml_ticket_is_explained_with_the_dml_account_and_graded_by_its_estimate() {
+        stub.explainEstimate = new ExplainEstimate(500);
+        String sql = "update t_order set status = 0 where id = 1";
+
+        ResponseEntity<String> response = postTicket(DEV_TOKEN,
+                body(sql, "update t_order set status = 1 where id = 1"));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(stub.explainedUsernames).containsExactly("dml_user");
+        assertThat(stub.explainCalls).isEqualTo(1);
+
+        long id = idOf(response);
+        assertThat(columnOf(id, "risk_level")).isEqualTo("L2");
+        TicketRiskSnapshot.Snapshot expected = snapshotFor(sql, 500);
+        assertThat(columnOf(id, "risk_snapshot_hash"))
+                .isEqualTo(TicketRiskSnapshot.hash(expected, List.of(sql)));
+        assertThat(columnOf(id, "risk_snapshot_json")).isEqualTo(TicketRiskSnapshot.json(expected));
+        assertThat(columnOf(id, "statement_fingerprint"))
+                .isEqualTo(StatementFingerprint.of(ORDER_DATASOURCE_ID, List.of(sql)));
+    }
+
+    /** DDL 的影响面不由行数决定：不估算，自然也不该向执行器发 explain。 */
+    @Test
+    void a_ddl_ticket_is_not_sent_to_explain() {
+        ResponseEntity<String> response = postTicket(DEV_TOKEN,
+                body("drop table t_order", "将从快照重建表结构", null));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(stub.explainCalls).isZero();
+        assertThat(stub.explainedUsernames).isEmpty();
+    }
+
+    /** 有 DML 却没有 dml 账号：400 说清原因，不能静默降级成 L3，也不能留下任何行。 */
+    @Test
+    void a_dml_ticket_without_a_dml_account_is_refused() {
+        jdbc.update("delete from conn_account where datasource_id = ? and account_type = 'dml'",
+                ORDER_DATASOURCE_ID);
+        try {
+            ResponseEntity<String> response = postTicket(DEV_TOKEN,
+                    body("update t_order set a=1 where id=1", "update t_order set a=0 where id=1"));
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(response.getBody()).contains("未配置 dml 账号");
+            assertNothingPersisted();
+        } finally {
+            addDmlAccount();
+        }
+    }
+
+    /** 只读语句仍用只读账号：不要为了一条 select 去要写权限。 */
+    @Test
+    void a_read_only_statement_is_explained_with_the_readonly_account() {
+        ResponseEntity<String> response = postTicket(DEV_TOKEN, body("select 1", null));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(stub.explainedUsernames).containsExactly("readonly_user");
+        assertThat(stub.explainCalls).isEqualTo(1);
+        assertThat(columnOf(idOf(response), "risk_level")).isEqualTo("L0");
     }
 
     // ------------------------------------------------------------------ 权限
 
     @Test
-    void an_operator_cannot_submit_a_developer_ticket() {
-        assertThat(postTicket(OPS_TOKEN, body("update t_order set a=1 where id=1", "x")).getStatusCode())
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(ticketCount()).isZero();
+    void operators_and_the_lead_cannot_submit_a_developer_ticket() {
+        for (String token : List.of(OPS_TOKEN, OPS02_TOKEN, LEAD01_TOKEN)) {
+            assertThat(postTicket(token, body("update t_order set a=1 where id=1", "x")).getStatusCode())
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+        assertNothingPersisted();
     }
 
     @Test
     void an_admin_cannot_submit_a_developer_ticket() {
         assertThat(postTicket(ADMIN_TOKEN, body("update t_order set a=1 where id=1", "x")).getStatusCode())
                 .isEqualTo(HttpStatus.FORBIDDEN);
+        assertNothingPersisted();
     }
 
     /** 研发只能对自己可见的数据源提单（存在但无权 → 403）。 */
@@ -233,7 +318,7 @@ class TicketSubmitIT extends TicketITBase {
                 bodyFor(999L, "update pay_db.t set a=1", "x"));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     /** 不存在的库是 404，与"存在但无权"的 403 区分开。 */
@@ -243,7 +328,7 @@ class TicketSubmitIT extends TicketITBase {
                 bodyFor(12345L, "update t_order set a=1 where id=1", "update t_order set a=0 where id=1"));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(ticketCount()).isZero();
+        assertNothingPersisted();
     }
 
     // ------------------------------------------------------------------ L3 终审可用性
@@ -258,7 +343,7 @@ class TicketSubmitIT extends TicketITBase {
 
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
             assertThat(response.getBody()).contains("组长");
-            assertThat(ticketCount()).isZero();
+            assertNothingPersisted();
         } finally {
             jdbc.update("""
                     insert into sys_system_operator (id, system_id, user_id, operator_type)
@@ -344,8 +429,12 @@ class TicketSubmitIT extends TicketITBase {
 
     // ------------------------------------------------------------------ helpers
 
-    private int ticketCount() {
-        return jdbc.queryForObject("select count(*) from ticket", Integer.class);
+    /** 用与生产同一套公开入口重算某条语句的整单快照（I2：哈希不能只靠正则）。 */
+    private TicketRiskSnapshot.Snapshot snapshotFor(String sql, long estimatedRows) {
+        RiskAssessment assessment = riskEngine.assess(new RiskEngine.RiskRequest(
+                sql, new StatementClassifier().classify(sql),
+                new ExplainEstimate(estimatedRows), true, true, null));
+        return TicketRiskSnapshot.of(assessment.level(), List.of(assessment));
     }
 
     private String columnOf(long ticketId, String column) {

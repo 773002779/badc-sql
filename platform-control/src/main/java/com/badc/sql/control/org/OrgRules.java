@@ -18,6 +18,8 @@ final class OrgRules {
     static final String DEFAULT_CHARSET = "utf8mb4";
     static final String DEFAULT_TIME_ZONE = "+00:00";
     static final String READONLY_ACCOUNT = "readonly";
+    /** 写语句的 EXPLAIN 与执行都要用 dml 账号：只读账号没有写权限，MySQL 会回 1142。 */
+    static final String DML_ACCOUNT = "dml";
 
     private static final Set<String> ACCOUNT_TYPES = Set.of("readonly", "dml", "ddl", "onlineddl");
 

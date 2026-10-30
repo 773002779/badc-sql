@@ -54,6 +54,11 @@ public final class TicketSubmitValidator {
 
     private static final int STATEMENT_TYPE_MAX_LENGTH = 32;
 
+    /** 与 V3 的列宽/列类型对齐：title VARCHAR(200)、change_reason TEXT、rollback_plan TEXT。 */
+    private static final int TITLE_MAX_LENGTH = 200;
+    private static final int CHANGE_REASON_MAX_LENGTH = 2000;
+    private static final int ROLLBACK_PLAN_MAX_LENGTH = 20000;
+
     private TicketSubmitValidator() {
     }
 
@@ -66,11 +71,6 @@ public final class TicketSubmitValidator {
         if (command == null) {
             throw new BizException(ErrorCode.INVALID_ARGUMENT, "请求体不能为空");
         }
-        requireText(command.title(), "工单标题", 200);
-        requireText(command.changeReason(), "变更原因", 0);
-        if (command.expectedExecuteAt() == null) {
-            throw new BizException(ErrorCode.INVALID_ARGUMENT, "期望执行时间不能为空");
-        }
 
         List<String> statements = command.statements();
         if (statements.isEmpty()) {
@@ -81,6 +81,8 @@ public final class TicketSubmitValidator {
                     "单工单语句上限 " + MAX_STATEMENTS + " 条，当前 " + statements.size() + " 条");
         }
 
+        // BLOCK 前置：一条被硬禁止的语句（drop database / 一条语句多个分号）先于任何必填项被拒绝，
+        // 否则用户会先看到"标题不能为空"，改完标题再被拒一次。
         List<ValidatedStatement> validated = new ArrayList<>(statements.size());
         Set<String> targetTables = new LinkedHashSet<>();
         boolean hasDmlWrite = false;
@@ -118,6 +120,15 @@ public final class TicketSubmitValidator {
         }
         if (!isBlank(command.rollbackSql())) {
             validateRollbackSql(command.rollbackSql(), targetTables);
+        }
+
+        // 必填与长度放最后：BLOCK / 回滚 SQL 的硬错误先返回；长度上限仍要在落库前拦住，
+        // 否则 >64KB 的文本会在 INSERT 时炸成 500（V3 里 change_reason / rollback_plan 是 TEXT）。
+        requireText(command.title(), "工单标题", TITLE_MAX_LENGTH);
+        requireText(command.changeReason(), "变更原因", CHANGE_REASON_MAX_LENGTH);
+        requireOptionalText(command.rollbackPlan(), "回滚方案", ROLLBACK_PLAN_MAX_LENGTH);
+        if (command.expectedExecuteAt() == null) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT, "期望执行时间不能为空");
         }
 
         return new ValidatedSubmission(List.copyOf(validated), List.copyOf(targetTables),
@@ -187,6 +198,16 @@ public final class TicketSubmitValidator {
         }
     }
 
+    private static void requireOptionalText(String value, String field, int maxLength) {
+        if (value == null) {
+            return;
+        }
+        if (value.strip().length() > maxLength) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                    field + "长度不能超过 " + maxLength + " 个字符");
+        }
+    }
+
     private static boolean isBlank(String value) {
         return value == null || value.isBlank();
     }
@@ -201,25 +222,23 @@ public final class TicketSubmitValidator {
     public record ValidatedStatement(int seq, String sql, Classification classification) {
 
         /**
-         * {@code ticket_statement.statement_type}：DDL 用动作短名（{@code DROP_TABLE}、{@code ALTER_TABLE}
-         * 这类），DML 用首关键字大写。{@code with}/{@code explain} 开头时剥出真实顶层动词——把一条 CTE
+         * {@code ticket_statement.statement_type}：与 V3 列注释一致，存语句的短动词
+         * （{@code SELECT|INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|TRUNCATE}），而不是更细的
+         * {@link DdlAction} 名。{@code with}/{@code explain} 开头时剥出真实顶层动词——把一条 CTE
          * {@code delete} 记成 {@code WITH} 会让详情页看不出它删了数据。
          */
         public String statementType() {
-            String type;
-            if (classification.ddlAction() != DdlAction.NONE) {
-                type = classification.ddlAction().name();
-            } else {
-                String first = classification.firstKeyword();
-                if (first == null) {
-                    type = "UNKNOWN";
-                } else if ("with".equals(first) || "explain".equals(first)) {
-                    String verb = SqlText.firstTopLevelVerb(SqlText.stripLiteralsAndComments(sql));
-                    type = (verb == null ? first : verb).toUpperCase(Locale.ROOT);
-                } else {
-                    type = first.toUpperCase(Locale.ROOT);
+            String type = classification.firstKeyword();
+            if (type == null) {
+                return "UNKNOWN";
+            }
+            if ("with".equals(type) || "explain".equals(type)) {
+                String verb = SqlText.firstTopLevelVerb(SqlText.stripLiteralsAndComments(sql));
+                if (verb != null) {
+                    type = verb;
                 }
             }
+            type = type.toUpperCase(Locale.ROOT);
             return type.length() <= STATEMENT_TYPE_MAX_LENGTH
                     ? type
                     : type.substring(0, STATEMENT_TYPE_MAX_LENGTH);

@@ -14,6 +14,8 @@ import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.org.ConnAccountService;
 import com.badc.sql.control.query.ExecutorClient;
+import com.badc.sql.control.risk.Classification;
+import com.badc.sql.control.risk.DdlAction;
 import com.badc.sql.control.risk.Discipline;
 import com.badc.sql.control.risk.RiskAssessment;
 import com.badc.sql.control.risk.RiskEngine;
@@ -91,7 +93,11 @@ public class TicketService {
         Assignment assignment = assignmentService.assign(submitterId, command.datasourceId());
         ValidatedSubmission validated = TicketSubmitValidator.validate(command);
 
-        // 3 步：指纹 + 估算都在事务外。readonlyConnConfig 缺只读账号时抛 NOT_FOUND，同样不落任何行。
+        // 3 步：指纹与估算都在事务外。写语句必须用 dml 账号估算：MySQL 要求 EXPLAIN UPDATE/INSERT/DELETE
+        // 具备对应写权限，只读账号会拿到 1142，执行器吞成 -1，风险引擎就会把每条 DML 判成 L3。
+        boolean hasDmlWrite = validated.statements().stream()
+                .anyMatch(statement -> isDmlWrite(statement.classification()));
+        ConnConfig dml = hasDmlWrite ? dmlConnOrRefuse(command.datasourceId()) : null;
         ConnConfig readonly = connAccountService.readonlyConnConfig(command.datasourceId());
         Map<String, String> tableFingerprints = tableFingerprints(readonly, validated.targetTables());
 
@@ -100,7 +106,7 @@ public class TicketService {
         List<RiskLevel> statementLevels = new ArrayList<>(validated.statements().size());
         RiskLevel ticketLevel = RiskLevel.L0;
         for (ValidatedStatement statement : validated.statements()) {
-            ExplainEstimate estimate = executorClient.explain(readonly, statement.sql());
+            ExplainEstimate estimate = estimateFor(statement, readonly, dml);
             RiskAssessment assessment = riskEngine.assess(new RiskEngine.RiskRequest(
                     statement.sql(),
                     statement.classification(),
@@ -138,6 +144,50 @@ public class TicketService {
 
         return new SubmitResult(ticketId, TicketStatus.REVIEWING_L1, ticketLevel,
                 summaries(validated, statementLevels));
+    }
+
+    /**
+     * 按语句类型选估算账号，DDL 干脆不估。
+     *
+     * <ul>
+     *   <li><b>DDL</b>（{@code ddlAction != NONE}）→ 直接 {@code -1}，<b>不发 explain</b>：DDL 的影响面不由
+     *       行数决定，{@code EXPLAIN CREATE/ALTER/DROP} 本身没有意义；结构性动作恒 L3，非结构性动作按
+     *       {@link DdlAction} 分档，都不需要估算，省一次网络往返。</li>
+     *   <li><b>DML</b>（{@code writeStatement && ddlAction == NONE}）→ <b>dml 账号</b>。只读账号对
+     *       {@code EXPLAIN UPDATE/INSERT/DELETE} 会得到 MySQL 1142，执行器吞成 {@code -1}，
+     *       整张工单就被误判成 L3——L1/L2 分档在真实环境彻底失效。</li>
+     *   <li><b>只读语句</b> → 只读账号。</li>
+     * </ul>
+     */
+    private ExplainEstimate estimateFor(ValidatedStatement statement, ConnConfig readonly, ConnConfig dml) {
+        if (statement.classification().ddlAction() != DdlAction.NONE) {
+            return new ExplainEstimate(-1);
+        }
+        ConnConfig conn = statement.classification().writeStatement() ? dml : readonly;
+        ExplainEstimate estimate = executorClient.explain(conn, statement.sql());
+        return estimate == null ? new ExplainEstimate(-1) : estimate;
+    }
+
+    private static boolean isDmlWrite(Classification classification) {
+        return classification.writeStatement() && classification.ddlAction() == DdlAction.NONE;
+    }
+
+    /**
+     * 取 dml 账号；缺失时给 400 而不是让它退化成 L3。
+     *
+     * <p>没有 dml 账号的数据源本来也执行不了写（任务 11 需要它），提前失败比返回一个"因为估不出来所以
+     * L3"的假等级更好：后者会让用户以为这条语句风险很高，而真正的问题是数据源没配好。
+     */
+    private ConnConfig dmlConnOrRefuse(long datasourceId) {
+        try {
+            return connAccountService.dmlConnConfig(datasourceId);
+        } catch (BizException e) {
+            if (e.code() == ErrorCode.NOT_FOUND) {
+                throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                        "数据源 " + datasourceId + " 未配置 dml 账号，无法估算影响行数，也就无法定级");
+            }
+            throw e;
+        }
     }
 
     /**

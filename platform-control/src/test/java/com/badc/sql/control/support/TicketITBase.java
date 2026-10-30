@@ -30,6 +30,7 @@ import org.springframework.test.context.TestPropertySource;
 
 import com.badc.sql.common.sql.SqlText;
 import com.badc.sql.control.crypto.CredentialCipher;
+import com.badc.sql.control.risk.RiskEngine;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
@@ -74,8 +75,12 @@ public abstract class TicketITBase extends AbstractMySqlIT {
     @Autowired
     protected TicketStubExecutor stub;
 
+    /** 与生产同一个引擎 bean（窗口由 {@link TestPropertySource} 铺满全天）。 */
     @Autowired
-    private CredentialCipher credentialCipher;
+    protected RiskEngine riskEngine;
+
+    @Autowired
+    protected CredentialCipher credentialCipher;
 
     @DynamicPropertySource
     static void datasource(DynamicPropertyRegistry registry) {
@@ -96,6 +101,35 @@ public abstract class TicketITBase extends AbstractMySqlIT {
                 insert into conn_account (id, datasource_id, account_type, username, password_cipher)
                 values (1, 101, 'readonly', 'readonly_user', ?)
                 """, credentialCipher.encrypt("readonly-pass"));
+        // 写语句的 EXPLAIN 必须用 dml 账号：只读账号会被 MySQL 以 1142 拒绝，估算变 -1、整单误判 L3。
+        addDmlAccount();
+    }
+
+    /**
+     * 数据源 101 的 dml 账号。测试里要造"没有 dml 账号"的用例会先删掉它，再在 {@code finally} 里调本方法恢复。
+     */
+    protected void addDmlAccount() {
+        jdbc.update("delete from conn_account where datasource_id = ? and account_type = 'dml'",
+                ORDER_DATASOURCE_ID);
+        jdbc.update("""
+                insert into conn_account (id, datasource_id, account_type, username, password_cipher)
+                values (2, 101, 'dml', 'dml_user', ?)
+                """, credentialCipher.encrypt("dml-pass"));
+    }
+
+    /**
+     * 断言提交失败后六张工单表全为空。
+     *
+     * <p>只查 {@code ticket} 不够：这些表之间没有外键，子表（语句/事件/快照/确认/执行锁）的孤儿行不会让
+     * {@code ticket} 的计数变化。BLOCK 与执行器故障两条用例必须都没留下任何一行。
+     */
+    protected void assertNothingPersisted() {
+        for (String table : List.of("ticket", "ticket_statement", "ticket_event",
+                "schema_snapshot", "risk_acknowledgement", "datasource_exec_lock")) {
+            assertThat(jdbc.queryForObject("select count(*) from " + table, Integer.class))
+                    .as("%s 不应有任何行", table)
+                    .isZero();
+        }
     }
 
     @BeforeEach

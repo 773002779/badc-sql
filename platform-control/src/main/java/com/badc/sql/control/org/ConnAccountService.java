@@ -45,12 +45,29 @@ public class ConnAccountService {
      * <p><b>仅供服务端内部调用</b>，绝不可作为任何 {@code /api/**} 的返回值。
      */
     public ConnConfig readonlyConnConfig(long datasourceId) {
+        return connConfig(datasourceId, OrgRules.READONLY_ACCOUNT, "数据源 %d 未配置只读账号");
+    }
+
+    /**
+     * 读取数据源的 dml 账号并解密，供控制面内部调用（写语句的 EXPLAIN 估算与执行）。
+     *
+     * <p><b>写语句为什么不能借只读账号估算</b>：MySQL 的 {@code EXPLAIN UPDATE/INSERT/DELETE} 要求对应写
+     * 权限，只授 SELECT 的账号会拿到 {@code ERROR 1142 (command denied)}；执行器把它吞成
+     * {@code ExplainEstimate(-1)}，风险引擎就会把每条 DML 判成 L3——L1/L2 分档在真实环境里彻底失效。
+     *
+     * <p><b>仅供服务端内部调用</b>，绝不可作为任何 {@code /api/**} 的返回值。
+     */
+    public ConnConfig dmlConnConfig(long datasourceId) {
+        return connConfig(datasourceId, OrgRules.DML_ACCOUNT, "数据源 %d 未配置 dml 账号");
+    }
+
+    private ConnConfig connConfig(long datasourceId, String accountType, String missingMessageFormat) {
         DataSourceEntity datasource = dataSourceMapper.findById(datasourceId)
                 .orElseThrow(() -> OrgRules.notFound("数据源", datasourceId));
         ConnAccountEntity account = connAccountMapper
-                .findByDatasourceAndType(datasourceId, OrgRules.READONLY_ACCOUNT)
+                .findByDatasourceAndType(datasourceId, accountType)
                 .orElseThrow(() -> new BizException(ErrorCode.NOT_FOUND,
-                        "数据源 " + datasourceId + " 未配置只读账号"));
+                        missingMessageFormat.formatted(datasourceId)));
         return new ConnConfig(
                 datasource.host(),
                 datasource.port(),
