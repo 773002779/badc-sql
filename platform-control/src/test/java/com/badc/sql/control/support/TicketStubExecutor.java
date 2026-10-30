@@ -48,6 +48,18 @@ public class TicketStubExecutor implements ExecutorClient {
     /** 最近一次估算的入参语句，供用例断言控制面把哪条语句拿去估算了。 */
     public String lastExplainedSql;
 
+    /**
+     * 恢复默认状态。字段是 public 的，用例改完不还原就会把状态漏给下一个用例；统一在这里复位，
+     * 免得每个测试类各写一遍且漏掉某个字段。
+     */
+    public void reset() {
+        fingerprints = new LinkedHashMap<>(Map.of("t_order", "fp-1"));
+        lastFingerprintTables = List.of();
+        fingerprintThrows = false;
+        explainEstimate = new ExplainEstimate(1);
+        lastExplainedSql = null;
+    }
+
     @Override
     public RawResult query(ConnConfig conn, String sql, int maxRows) {
         throw new UnsupportedOperationException("工单测试不走这个入口");
