@@ -29,7 +29,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *   <li>提交人不能审自己的单 → 403；</li>
  *   <li>必须是该工单所属系统的运维（{@code sys_system_operator}）→ 403；</li>
  *   <li>管理员一律不能审 → 403（§4.2：管理员只配置与授权）；</li>
- *   <li>按当前状态与整单等级分流（见 {@link #approve}）。</li>
+ *   <li>按当前状态与整单等级分流，判定这一级该由谁审（{@link #requireLevelReviewer}，批准与驳回共用）。</li>
  * </ol>
  *
  * <h2>为什么 L3 的一级排除组长</h2>
@@ -102,6 +102,9 @@ public class TicketReviewService {
     /**
      * 审批通过一张待审工单。
      *
+     * <p>级别与角色由 {@link #requireLevelReviewer} 判定（与 {@link #reject} 共用同一份实现）；本方法只补齐
+     * "批准"特有的目标状态与终审可用性检查。
+     *
      * <ul>
      *   <li>{@code REVIEWING_L1} + {@code L3} → 一级（主/备运维）→ {@code REVIEWING_L2}，落 {@code review_level=1}；</li>
      *   <li>{@code REVIEWING_L1} + 非 L3 → 一级（运维或组长）→ {@code APPROVED}，置 {@code approved_at}；</li>
@@ -119,38 +122,24 @@ public class TicketReviewService {
         String role = userRoleService.roleOf(reviewerId);
         String normalized = normalizeComment(comment);
 
-        int level;
-        TicketStatus to;
-        if (from == TicketStatus.REVIEWING_L1) {
-            level = 1;
-            if (L3.equals(ticket.riskLevel())) {
-                // 组长不做 L3 的一级：两级按角色分开，单组长系统不会把 L3 单卡在二级。
-                requireRole(role, L3_FIRST_LEVEL_ROLES, "L3 工单的一级审核只能由主运维或备运维执行");
-                requireLeadStillPresent(ticket.systemId());
-                to = TicketStatus.REVIEWING_L2;
-            } else {
-                requireRole(role, SINGLE_LEVEL_ROLES, "只有该系统的运维或组长可以审核工单");
-                to = TicketStatus.APPROVED;
-            }
-        } else {
-            // requireReviewable 已保证只剩 REVIEWING_L2。
-            level = 2;
-            requireRole(role, LEAD_ONLY, "L3 工单的终审只能由运维组长执行");
-            requireDifferentFromLevelOne(ticketId, reviewerId);
-            to = TicketStatus.APPROVED;
+        LevelPlan plan = requireLevelReviewer(ticket, reviewerId, role, from);
+        if (plan.approvalTarget() == TicketStatus.REVIEWING_L2) {
+            // 只有"批准并转入二级"才需要终审可用；直接驳回一张 L3 不该被无组长挡住。
+            requireLeadStillPresent(ticket.systemId());
         }
-
-        TicketStateMachine.assertTransition(from, to);
+        TicketStateMachine.assertTransition(from, plan.approvalTarget());
         // 一级的确认阶段是 REVIEW，二级是 L3_REVIEW（V3 的 ck_risk_acknowledgement_stage）。
-        apply(ticket, reviewerId, level, TicketReviewMapper.DECISION_APPROVED, normalized, to, true);
-        return new ReviewOutcome(ticketId, to, ticket.riskLevel());
+        apply(ticket, reviewerId, plan.level(), TicketReviewMapper.DECISION_APPROVED, normalized,
+                plan.approvalTarget(), true);
+        return new ReviewOutcome(ticketId, plan.approvalTarget(), ticket.riskLevel());
     }
 
     /**
      * 驳回一张待审工单：状态 → {@code REJECTED}。
      *
-     * <p>权限判定与 {@link #approve} 的前 5 步完全一致（状态 / 自审 / 归属 / 管理员），但<b>不做</b>按角色分级：
-     * 驳回不会让工单进入下一级，任何本系统运维都能驳回。审核意见必填（≥1 字）。
+     * <p>权限判定与 {@link #approve} <b>完全一致</b>：同样是前 5 步（状态 / 自审 / 归属 / 管理员）+ 共用的
+     * {@link #requireLevelReviewer} 角色闸。L3 的二级终审既包括"批准执行"也包括"驳回不执行"，让一级运维
+     * 替组长驳回等于跳过终审；同一人也不能在两级各占一行。审核意见必填（≥1 字）。
      *
      * @param comment 驳回原因，去除首尾空白后不得为空
      * @throws BizException 404 / 403 / 400（意见为空）/ 409（状态已变或该级已有审核记录）
@@ -163,9 +152,9 @@ public class TicketReviewService {
         }
 
         TicketStatus from = TicketStatus.valueOf(ticket.status());
-        int level = from == TicketStatus.REVIEWING_L1 ? 1 : 2;
+        LevelPlan plan = requireLevelReviewer(ticket, reviewerId, userRoleService.roleOf(reviewerId), from);
         TicketStateMachine.assertTransition(from, TicketStatus.REJECTED);
-        apply(ticket, reviewerId, level, TicketReviewMapper.DECISION_REJECTED, normalized,
+        apply(ticket, reviewerId, plan.level(), TicketReviewMapper.DECISION_REJECTED, normalized,
                 TicketStatus.REJECTED, false);
         return new ReviewOutcome(ticketId, TicketStatus.REJECTED, ticket.riskLevel());
     }
@@ -198,6 +187,34 @@ public class TicketReviewService {
             throw new BizException(ErrorCode.FORBIDDEN, "管理员只负责配置与授权，不参与工单审批");
         }
         return ticket;
+    }
+
+    /**
+     * 这一级该由谁来审——{@link #approve} 与 {@link #reject} <b>唯一</b>的角色判定。
+     *
+     * <p>抽成一份的原因是驳回同样具有级别语义：L3 的二级终审既包括"批准执行"也包括"驳回不执行"。若在
+     * {@code reject} 里另写一份角色判断，两份迟早分叉（本会话已因"同一判断多处实现"出过事故）。
+     *
+     * <p>返回审核级别与"若批准"的目标状态；驳回时目标状态由调用方固定为 {@code REJECTED}，这里不看。
+     * 组长可用性（{@link #requireLeadStillPresent}）刻意留在 {@code approve}：它只约束"转入二级"，
+     * 不该妨碍在无组长时直接驳回一张 L3。
+     *
+     * @throws BizException 角色不符 / 二级与一级同一人 → 403
+     */
+    private LevelPlan requireLevelReviewer(TicketEntity ticket, long reviewerId, String role, TicketStatus from) {
+        if (from == TicketStatus.REVIEWING_L1) {
+            if (L3.equals(ticket.riskLevel())) {
+                // 组长不做 L3 的一级：两级按角色分开，单组长系统不会把 L3 单卡在二级。
+                requireRole(role, L3_FIRST_LEVEL_ROLES, "L3 工单的一级审核只能由主运维或备运维执行");
+                return new LevelPlan(1, TicketStatus.REVIEWING_L2);
+            }
+            requireRole(role, SINGLE_LEVEL_ROLES, "只有该系统的运维或组长可以审核工单");
+            return new LevelPlan(1, TicketStatus.APPROVED);
+        }
+        // requireReviewable 已保证只剩 REVIEWING_L2。
+        requireRole(role, LEAD_ONLY, "L3 工单的终审只能由运维组长执行");
+        requireDifferentFromLevelOne(ticket.id(), reviewerId);
+        return new LevelPlan(2, TicketStatus.APPROVED);
     }
 
     private static void requireRole(String role, Set<String> allowed, String message) {
@@ -322,5 +339,14 @@ public class TicketReviewService {
      * @param riskLevel 整单风险等级（未变，前端刷新状态时一并拿到）
      */
     public record ReviewOutcome(long id, TicketStatus status, String riskLevel) {
+    }
+
+    /**
+     * 这一级由谁来审、以及批准后会到哪里。
+     *
+     * @param level          审核级别（1 = 运维一级，2 = 组长终审）
+     * @param approvalTarget 批准时的目标状态；驳回时由调用方固定为 {@code REJECTED}
+     */
+    private record LevelPlan(int level, TicketStatus approvalTarget) {
     }
 }

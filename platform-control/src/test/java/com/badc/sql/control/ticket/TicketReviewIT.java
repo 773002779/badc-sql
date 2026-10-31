@@ -294,6 +294,76 @@ class TicketReviewIT extends TicketITBase {
         assertThat(reviewCount(id)).isEqualTo(1);
     }
 
+    // ------------------------------------------------------------------ 驳回同样按级别分角色
+
+    /**
+     * L3 的第二级是组长终审，它既包括"批准执行"也包括"驳回不执行"。一级运维替组长做这个决定，等于终审
+     * 环节被跳过——只是方向是拒绝。
+     */
+    @Test
+    void an_operator_cannot_reject_an_l3_ticket_at_level_two() {
+        long id = l3Ticket();
+        assertThat(approve(OPS02_TOKEN, id, "一级通过").getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> response = reject(OPS02_TOKEN, id, "主运维替组长驳回");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(status(id)).isEqualTo("REVIEWING_L2");
+        assertThat(reviewLevels(id)).containsExactly(1);
+    }
+
+    @Test
+    void a_lead_can_reject_an_l3_ticket_at_level_two() throws Exception {
+        long id = l3Ticket();
+        assertThat(approve(OPS02_TOKEN, id, "一级通过").getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> response = reject(LEAD01_TOKEN, id, "组长终审驳回");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(objectMapper.readTree(response.getBody()).path("status").asText()).isEqualTo("REJECTED");
+        assertThat(status(id)).isEqualTo("REJECTED");
+        assertThat(reviewLevels(id)).containsExactly(1, 2);
+        assertThat(reviewerIdAt(id, 1)).isEqualTo(4L);
+        assertThat(reviewerIdAt(id, 2)).isEqualTo(5L);
+        assertThat(decisionAt(id, 2)).isEqualTo("REJECTED");
+        assertThat(jdbc.queryForObject("select approved_at from ticket where id = ?", Timestamp.class, id))
+                .isNull();
+        // 驳回不是风险知悉：不写 L3_REVIEW 确认行。
+        assertThat(ackStages(id)).containsExactly("SUBMIT", "REVIEW");
+        Map<String, Object> audit = jdbc.queryForMap("""
+                select action, payload_json from audit_event
+                 where event_type = 'TICKET_REJECTED' and object_id = ?
+                """, String.valueOf(id));
+        assertThat(audit.get("action")).isEqualTo("reject");
+        assertThat((String) audit.get("payload_json"))
+                .contains("组长终审驳回")
+                .contains("\"reviewLevel\":2");
+    }
+
+    /**
+     * §4.3-2「两级不可同一人」的独立用例。
+     *
+     * <p>按当前单值角色模型，ops02 是主运维，二级角色闸已经会挡住他——那样这条用例就测不到"同一人"规则
+     * 本身。这里在批完一级后把 ops02 的角色临时改成 {@code OPS_LEAD}（模拟角色模型将来变多值／账号同时
+     * 具备两种资格），让角色闸放行，唯一能拦住他的就是"二级不得等于一级审核人"这道纵深防御。
+     */
+    @Test
+    void an_operator_who_signed_level_one_cannot_reject_level_two() {
+        long id = l3Ticket();
+        assertThat(approve(OPS02_TOKEN, id, "一级通过").getStatusCode()).isEqualTo(HttpStatus.OK);
+        jdbc.update("update sys_user set role = 'OPS_LEAD' where id = 4");
+        try {
+            ResponseEntity<String> response = reject(OPS02_TOKEN, id, "同一人驳回终审");
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(response.getBody()).contains("同一人");
+            assertThat(status(id)).isEqualTo("REVIEWING_L2");
+            assertThat(reviewLevels(id)).containsExactly(1);
+        } finally {
+            jdbc.update("update sys_user set role = 'PRIMARY_OPS' where id = 4");
+        }
+    }
+
     // ------------------------------------------------------------------ 乐观并发与重复审核
 
     @Test
@@ -359,6 +429,28 @@ class TicketReviewIT extends TicketITBase {
             assertThat(status(id)).isEqualTo("REVIEWING_L1");
             assertThat(reviewCount(id)).isZero();
             assertThat(ackStages(id)).containsExactly("SUBMIT");
+        } finally {
+            jdbc.update("""
+                    insert into sys_system_operator (id, system_id, user_id, operator_type)
+                    values (11, 1, 5, 'LEAD')
+                    """);
+        }
+    }
+
+    /**
+     * 组长被撤销时，驳回一张 L3 必须仍然可用：组长可用性只约束"批准并转入二级"，不该把唯一的止损动作
+     * （驳回）也堵死。这道非对称是刻意设计，用例把它钉住。
+     */
+    @Test
+    void an_l3_ticket_can_still_be_rejected_when_the_system_has_no_lead() {
+        long id = l3Ticket();
+        jdbc.update("delete from sys_system_operator where system_id = 1 and operator_type = 'LEAD'");
+        try {
+            ResponseEntity<String> response = reject(OPS02_TOKEN, id, "系统已无组长，先驳回");
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(status(id)).isEqualTo("REJECTED");
+            assertThat(decisionAt(id, 1)).isEqualTo("REJECTED");
         } finally {
             jdbc.update("""
                     insert into sys_system_operator (id, system_id, user_id, operator_type)
