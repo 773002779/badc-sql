@@ -52,6 +52,9 @@ class RiskAckIT extends TicketITBase {
     /** 模拟"工单的风险在两次确认之间变了"：换一个合法的 64 位十六进制哈希。 */
     private static final String CHANGED_HASH = "b".repeat(64);
 
+    /** 请求体里的伪造哈希：端点必须忽略它。与工单当前值、{@link #CHANGED_HASH} 都不同。 */
+    private static final String FORGED_HASH = "d".repeat(64);
+
     @Autowired
     private RiskAckService riskAckService;
 
@@ -79,7 +82,7 @@ class RiskAckIT extends TicketITBase {
         assertThat(body.path("ticketId").asLong()).isEqualTo(id);
         assertThat(body.path("stage").asText()).as("端点只有执行阶段").isEqualTo("EXECUTE");
         assertThat(body.path("riskSnapshotHash").asText())
-                .as("哈希必须取自工单当前值，而不是请求体")
+                .as("哈希必须取自工单当前值")
                 .isEqualTo(riskSnapshotHashOf(id));
         Instant acknowledgedAt = Instant.parse(body.path("acknowledgedAt").asText());
 
@@ -96,6 +99,36 @@ class RiskAckIT extends TicketITBase {
 
         // 提交写了一行 SUBMIT，审批写了一行 REVIEW，执行前确认补一行 EXECUTE。
         assertThat(ackStages(id)).containsExactly("SUBMIT", "REVIEW", "EXECUTE");
+    }
+
+    /**
+     * 请求体里的 {@code riskSnapshotHash} / {@code stage} 是伪造值：端点必须当它不存在。
+     *
+     * <p>这条用例的全部价值在于"有人把请求体接上时它会红"——只断言"响应等于工单值"而没有真正喂过伪造值，
+     * 等于没证明哈希不是从请求体来的。{@link #ack} 发的空体测不到这一点。
+     */
+    @Test
+    void a_hash_supplied_in_the_request_body_is_ignored() throws Exception {
+        long id = approvedTicket();
+        String ticketHash = riskSnapshotHashOf(id);
+
+        ResponseEntity<String> response = postJson(DEV_TOKEN, "/api/v1/tickets/" + id + "/risk-ack",
+                "{\"riskSnapshotHash\":\"" + FORGED_HASH + "\",\"stage\":\"SUBMIT\"}");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.path("stage").asText()).as("阶段由服务端固定").isEqualTo("EXECUTE");
+        assertThat(body.path("riskSnapshotHash").asText())
+                .as("响应哈希必须来自工单，而不是请求体")
+                .isEqualTo(ticketHash)
+                .isNotEqualTo(FORGED_HASH);
+
+        Map<String, Object> row = latestExecuteAck(id);
+        assertThat(row.get("stage")).isEqualTo("EXECUTE");
+        assertThat(row.get("risk_snapshot_hash"))
+                .as("落库哈希必须来自工单，而不是请求体")
+                .isEqualTo(ticketHash)
+                .isNotEqualTo(FORGED_HASH);
     }
 
     // ------------------------------------------------------------------ 执行前校验
@@ -176,6 +209,24 @@ class RiskAckIT extends TicketITBase {
                 Integer.class)).isEmpty();
     }
 
+    /**
+     * 状态闸是"只有 APPROVED 放行"，不是"只拦 REVIEWING_*"。
+     *
+     * <p>今天的实现是 {@code !APPROVED} 通吃；这条用例防止将来有人把它收窄成"审核中才拦"，那样已进入
+     * {@code EXECUTING} 的单还能再确认一次，执行前的比对就可能被后写的确认覆盖。
+     */
+    @Test
+    void a_ticket_that_has_already_started_executing_cannot_be_acknowledged() {
+        long id = approvedTicket();
+        jdbc.update("update ticket set status = 'EXECUTING' where id = ?", id);
+
+        ResponseEntity<String> response = ack(OPS02_TOKEN, id);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).contains("EXECUTING");
+        assertThat(executeAckCount(id)).isZero();
+    }
+
     @Test
     void acknowledging_a_missing_ticket_is_not_found() {
         ResponseEntity<String> response = ack(OPS02_TOKEN, 987654L);
@@ -199,16 +250,48 @@ class RiskAckIT extends TicketITBase {
         assertThat(executeAckCount(foreign)).isZero();
     }
 
-    /** §4.2：管理员只配置与授权，不可进入执行链——即使被误配成某系统的运维也不行。 */
+    /** 组长也是该系统的运维（{@code sys_system_operator} 里的 LEAD），可以确认执行风险。 */
+    @Test
+    void a_lead_of_the_ticket_system_can_acknowledge() {
+        long id = approvedTicket();
+
+        ResponseEntity<String> response = ack(LEAD01_TOKEN, id);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(((Number) latestExecuteAck(id).get("operator_id")).longValue()).isEqualTo(5L);
+    }
+
+    /**
+     * §4.2：管理员只配置与授权，不可进入执行链。
+     *
+     * <p>两段式：admin01 本来就没有任何系统的归属，只测这一点的话 403 无法区分是 ADMIN 闸还是归属闸挡的。
+     * 第二段临时给他插一条系统 1 的归属行（{@code finally} 删除），让归属判定放行，此时仍必须 403，且理由
+     * 必须是"管理员"而不是"只有提交人或运维"——这才是"ADMIN 先于归属"那个顺序的证据。
+     */
     @Test
     void an_admin_cannot_acknowledge() {
         long id = approvedTicket();
 
-        ResponseEntity<String> response = ack(ADMIN_TOKEN, id);
+        ResponseEntity<String> byMembership = ack(ADMIN_TOKEN, id);
+        assertThat(byMembership.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(byMembership.getBody()).contains("管理员");
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(response.getBody()).contains("管理员");
-        assertThat(executeAckCount(id)).isZero();
+        jdbc.update("""
+                insert into sys_system_operator (system_id, user_id, operator_type)
+                values (1, 3, 'BACKUP')
+                """);
+        try {
+            ResponseEntity<String> byAdminGate = ack(ADMIN_TOKEN, id);
+
+            assertThat(byAdminGate.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(byAdminGate.getBody())
+                    .as("归属判定已放行，剩下的必须是 ADMIN 闸")
+                    .contains("管理员")
+                    .doesNotContain("只有提交人");
+            assertThat(executeAckCount(id)).isZero();
+        } finally {
+            jdbc.update("delete from sys_system_operator where system_id = 1 and user_id = 3");
+        }
     }
 
     /** 研发只能确认自己提交的单：把提交人改成另一个研发，原提交人再确认就是 403。 */
