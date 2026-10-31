@@ -20,8 +20,8 @@ import com.badc.sql.control.security.CurrentUser;
 /**
  * 变更工单接口。
  *
- * <p>提交（任务 7a）与详情/列表（任务 7b）挂在同一个控制器上：三者共享 {@code /api/v1/tickets} 前缀与
- * JWT 身份来源。业务判断全部在服务层——控制器只负责取当前用户、转发参数。
+ * <p>提交（任务 7a）、详情/列表（任务 7b）与审批链（任务 8）挂在同一个控制器上：它们共享
+ * {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断全部在服务层——控制器只负责取当前用户、转发参数。
  *
  * <p><b>请求体不接收 {@code systemId}/{@code moduleId}</b>：归属由服务端从数据源与授权链推导（见
  * {@link TicketAssignmentService}），前端传得越多错得越多。同样不接收 {@code submitterId}——身份只来自
@@ -33,10 +33,13 @@ public class TicketController {
 
     private final TicketService ticketService;
     private final TicketQueryService queryService;
+    private final TicketReviewService reviewService;
 
-    public TicketController(TicketService ticketService, TicketQueryService queryService) {
+    public TicketController(TicketService ticketService, TicketQueryService queryService,
+            TicketReviewService reviewService) {
         this.ticketService = ticketService;
         this.queryService = queryService;
+        this.reviewService = reviewService;
     }
 
     /**
@@ -73,6 +76,34 @@ public class TicketController {
         TicketService.SubmitResult result =
                 ticketService.submit(CurrentUser.id(), request.toCommand());
         return ResponseEntity.status(HttpStatus.CREATED).body(result);
+    }
+
+    /**
+     * 审批通过。业务判定（状态、自审、归属、角色分级、乐观并发）全部在 {@link TicketReviewService}。
+     *
+     * @return 200 + {@code {id, status, riskLevel}}，{@code status} 是更新后的状态
+     */
+    @PostMapping("/{id}/approve")
+    public TicketReviewService.ReviewOutcome approve(
+            @PathVariable long id,
+            @RequestBody(required = false) ReviewRequest request) {
+        return reviewService.approve(CurrentUser.id(), id, request == null ? null : request.comment());
+    }
+
+    /**
+     * 驳回。{@code comment} 必填（≥1 字），为空由服务层给出 400。
+     *
+     * @return 200 + {@code {id, status, riskLevel}}，{@code status} 恒为 {@code REJECTED}
+     */
+    @PostMapping("/{id}/reject")
+    public TicketReviewService.ReviewOutcome reject(
+            @PathVariable long id,
+            @RequestBody(required = false) ReviewRequest request) {
+        return reviewService.reject(CurrentUser.id(), id, request == null ? null : request.comment());
+    }
+
+    /** 审核请求体：只有审核意见，没有身份与级别（级别由服务端按状态与整单等级判定）。 */
+    public record ReviewRequest(String comment) {
     }
 
     /**
