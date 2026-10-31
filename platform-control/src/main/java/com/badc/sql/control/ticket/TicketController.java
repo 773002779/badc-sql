@@ -16,12 +16,14 @@ import org.springframework.web.bind.annotation.RestController;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.security.CurrentUser;
+import com.badc.sql.control.web.RequestMetadata;
 
 /**
  * 变更工单接口。
  *
- * <p>提交（任务 7a）、详情/列表（任务 7b）与审批链（任务 8）挂在同一个控制器上：它们共享
- * {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断全部在服务层——控制器只负责取当前用户、转发参数。
+ * <p>提交（任务 7a）、详情/列表（任务 7b）、审批链（任务 8）与执行前风险确认（任务 9）挂在同一个控制器上：
+ * 它们共享 {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断全部在服务层——控制器只负责取当前用户、
+ * 转发参数。
  *
  * <p><b>请求体不接收 {@code systemId}/{@code moduleId}</b>：归属由服务端从数据源与授权链推导（见
  * {@link TicketAssignmentService}），前端传得越多错得越多。同样不接收 {@code submitterId}——身份只来自
@@ -34,12 +36,14 @@ public class TicketController {
     private final TicketService ticketService;
     private final TicketQueryService queryService;
     private final TicketReviewService reviewService;
+    private final RiskAckService riskAckService;
 
     public TicketController(TicketService ticketService, TicketQueryService queryService,
-            TicketReviewService reviewService) {
+            TicketReviewService reviewService, RiskAckService riskAckService) {
         this.ticketService = ticketService;
         this.queryService = queryService;
         this.reviewService = reviewService;
+        this.riskAckService = riskAckService;
     }
 
     /**
@@ -104,6 +108,23 @@ public class TicketController {
 
     /** 审核请求体：只有审核意见，没有身份与级别（级别由服务端按状态与整单等级判定）。 */
     public record ReviewRequest(String comment) {
+    }
+
+    /**
+     * 执行前的风险确认。
+     *
+     * <p><b>请求体为空</b>：阶段固定为 {@code EXECUTE}，哈希由服务端取工单当前值。任何"客户端传哈希/阶段"
+     * 的设计都等于让客户端决定自己确认了什么，见 {@link RiskAckService} 的类注释。
+     *
+     * <p>{@code ip}/{@code user_agent} 与提交、审批一样从当前请求取（{@link RequestMetadata}，内部读
+     * {@code HttpServletRequest} 的 {@code getRemoteAddr()} 与 {@code User-Agent} 并截断到列宽）。
+     *
+     * @return 200 + {@code {ticketId, stage, riskSnapshotHash, acknowledgedAt}}
+     */
+    @PostMapping("/{id}/risk-ack")
+    public RiskAckService.AckOutcome acknowledgeRisk(@PathVariable long id) {
+        RequestMetadata.Client client = RequestMetadata.current();
+        return riskAckService.acknowledgeExecution(CurrentUser.id(), id, client.ip(), client.userAgent());
     }
 
     /**
