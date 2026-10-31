@@ -18,6 +18,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
+import com.badc.sql.control.support.JwtTestSupport;
 import com.badc.sql.control.support.TicketITBase;
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -38,6 +39,13 @@ class TicketReviewIT extends TicketITBase {
     private static final String L1_ROLLBACK_SQL = "update t_order set a=0 where id=1";
     private static final String L3_SQL = "drop table t_order";
     private static final String L3_ROLLBACK_PLAN = "将从快照重建表结构";
+
+    /** 备运维（本类按需补，验证 BACKUP_OPS 对 L3 一级与单级审核都有效）。 */
+    private static final String BACKUP_TOKEN = JwtTestSupport.token(6L, "backup01");
+
+    /** 与 seed 夹具一致的 BCrypt 哈希（明文 Passw0rd!）。 */
+    private static final String PASSWORD_HASH =
+            "$2b$10$TznpaUV2xFOaY3aN9B0lpe0H6sbVMVrDBekF4fxgICSl5BcU9SVGW";
 
     @Autowired
     private TicketReviewMapper reviewMapper;
@@ -161,6 +169,8 @@ class TicketReviewIT extends TicketITBase {
 
         assertThat(approve(DEV_TOKEN, id, "自己审").getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(status(id)).isEqualTo("REVIEWING_L1");
+        assertThat(reviewCount(id)).isZero();
+        assertThat(ackStages(id)).containsExactly("SUBMIT");
     }
 
     /**
@@ -221,16 +231,70 @@ class TicketReviewIT extends TicketITBase {
         assertThat(reviewCount(id)).isZero();
     }
 
-    /** 管理员只能配置与授权，不参与审批（§4.2）。 */
+    /**
+     * 管理员只能配置与授权，不参与审批（§4.2）。
+     *
+     * <p>夹具里 admin01 没有 {@code sys_system_operator} 归属，第一段 403 来自"不是本系统运维"的成员判定。
+     * 为了让 {@code TicketReviewService} 里那道显式 ADMIN 闸真正执行，这里临时给他插一条归属行
+     * （{@code try/finally} 删除）：成员判定放行后，必须仍然 403，且消息是 ADMIN 那条而不是成员那条。
+     */
     @Test
     void an_admin_cannot_review() {
         long id = l1Ticket();
 
-        ResponseEntity<String> response = approve(ADMIN_TOKEN, id, "管理员审批");
+        ResponseEntity<String> byMembership = approve(ADMIN_TOKEN, id, "管理员审批");
+        assertThat(byMembership.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(byMembership.getBody()).contains("只能审核自己负责的系统");
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(status(id)).isEqualTo("REVIEWING_L1");
-        assertThat(reviewCount(id)).isZero();
+        jdbc.update("""
+                insert into sys_system_operator (system_id, user_id, operator_type)
+                values (1, 3, 'BACKUP')
+                """);
+        try {
+            ResponseEntity<String> byAdminGate = approve(ADMIN_TOKEN, id, "管理员审批");
+
+            assertThat(byAdminGate.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(byAdminGate.getBody())
+                    .as("成员判定已放行，剩下的必须是 ADMIN 闸")
+                    .contains("管理员")
+                    .doesNotContain("只能审核自己负责的系统");
+            assertThat(status(id)).isEqualTo("REVIEWING_L1");
+            assertThat(reviewCount(id)).isZero();
+            assertThat(ackStages(id)).containsExactly("SUBMIT");
+        } finally {
+            jdbc.update("delete from sys_system_operator where system_id = 1 and user_id = 3");
+        }
+    }
+
+    /**
+     * 备运维与主运维同权（§4.2）：{@code BACKUP_OPS} 既能做 L3 的一级，也能做 L1/L2 的单级审核。
+     *
+     * <p>夹具里没有备运维，这里临时建一个（{@code finally} 清理），避免影响其它用例的用户集合。
+     */
+    @Test
+    void a_backup_operator_can_review_an_l3_first_level_and_an_l1_ticket() {
+        jdbc.update("""
+                insert into sys_user (id, login_name, password_hash, role, display_name)
+                values (6, 'backup01', ?, 'BACKUP_OPS', '备运维')
+                """, PASSWORD_HASH);
+        jdbc.update("""
+                insert into sys_system_operator (system_id, user_id, operator_type)
+                values (1, 6, 'BACKUP')
+                """);
+        try {
+            long l3 = l3Ticket();
+            assertThat(approve(BACKUP_TOKEN, l3, "备运维一级").getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(status(l3)).isEqualTo("REVIEWING_L2");
+            assertThat(reviewerIdAt(l3, 1)).isEqualTo(6L);
+
+            long l1 = l1Ticket();
+            assertThat(approve(BACKUP_TOKEN, l1, "备运维单级").getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(status(l1)).isEqualTo("APPROVED");
+            assertThat(reviewerIdAt(l1, 1)).isEqualTo(6L);
+        } finally {
+            jdbc.update("delete from sys_system_operator where system_id = 1 and user_id = 6");
+            jdbc.update("delete from sys_user where id = 6");
+        }
     }
 
     // ------------------------------------------------------------------ 驳回

@@ -30,6 +30,12 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
  * <p><b>并发</b>：{@code seq} 由应用赋值而不是自增，多线程同时写会分叉出两条链。写入因此串行化
  * （单实例内 {@code synchronized}；跨实例靠 {@code seq} 唯一索引冲突后重试兜底）。
  *
+ * <p><b>链头必须是加锁读</b>（{@link #NEXT_HEAD_SQL} 的 {@code for update}，不要改回普通 {@code select}）：
+ * 审计写入自任务 7 起与业务落库<b>同事务</b>，而普通 {@code select} 在 MySQL 默认的 REPEATABLE READ 下读的
+ * 是事务第一次读时的快照。两个并发事务会各自读到同一个 {@code seq}，一个成功、另一个撞唯一键；它的重试
+ * <b>仍然</b>读同一个旧快照，三次都撞同一个 {@code seq} → 500。加锁读不受快照限制，总是读最新已提交版本，
+ * 并且把并发追加串行化——哈希链本来就不能并行追加。唯一键冲突重试保留为第二道保险（跨实例、异常路径）。
+ *
  * <p><b>大小写</b>：V1 里 {@code hash} 是 {@code utf8mb4_0900_ai_ci}，SQL 比较不区分大小写。
  * 校验一律在应用层用 {@link String#equals} 比较原始字符串，避免 {@code A} 与 {@code a} 被当成同一个哈希。
  */
@@ -38,7 +44,15 @@ public class AuditService {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private static final String NEXT_HEAD_SQL = "select seq, hash from audit_event order by seq desc limit 1";
+    /**
+     * 链头读取：<b>必须是加锁读</b>。
+     *
+     * <p>普通 {@code select} 在 REPEATABLE READ 下会被事务快照钉住，并发事务的重试读不到别人刚提交的
+     * {@code seq}，最终三次唯一键冲突后失败（见类注释）。{@code for update} 总是读最新已提交版本，同时让
+     * 并发追加在链头上排队。空表时它锁住 supremum gap，同样能挡住并发插入。
+     */
+    private static final String NEXT_HEAD_SQL =
+            "select seq, hash from audit_event order by seq desc limit 1 for update";
 
     private static final String INSERT_SQL = """
             insert into audit_event
@@ -93,7 +107,8 @@ public class AuditService {
                             Timestamp.from(clock.instant()));
                     return seq;
                 } catch (org.springframework.dao.DuplicateKeyException e) {
-                    // 另一个实例抢先写了同一个 seq：重新读链头再来一次。
+                    // 第二道保险：跨实例并发时仍可能撞同一个 seq。加锁读保证下一次重试能读到最新链头
+                    // （普通 select 会被事务快照钉住，重试永远读到旧 seq）。
                 }
             }
         }
