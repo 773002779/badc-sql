@@ -6,6 +6,7 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
@@ -36,12 +37,19 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * 谓词），{@code total} 因此永远与分页口径一致。详情先按 id 查工单区分 404，再用<b>同一套</b>谓词判定是否
  * 可见：知道 id 不能绕过列表过滤；无权是 403，绝不伪装成 404。
  *
+ * <h2>为什么整个读路径是一个只读事务</h2>
+ * <p>{@code count} 与 {@code page} 是两条语句：没有事务时它们是两次 autocommit，中间插入一条工单就会出现
+ * "total=3 但第 1 页只有 2 条"的自相矛盾。类上的 {@code @Transactional(readOnly = true)} 让两条查询
+ * （以及详情的工单 + 四张子表）落在同一个连接、同一个快照里；MySQL 默认 REPEATABLE READ，因此
+ * {@code total} 与 {@code items} 来自同一时刻。
+ *
  * <h2>risk_snapshot_json</h2>
  * <p>存的是规范化原文（不用 MySQL JSON 类型以免键序被重排），响应里必须给前端解析后的对象——前端要用它
  * 渲染命中规则与逐条等级。一条坏 JSON 只让这一张工单的 {@code riskSnapshot} 变成 {@code null} 并记
  * {@code log.warn}，<b>不能</b>把详情接口打成 500，也不能把解析异常文本回给前端。
  */
 @Service
+@Transactional(readOnly = true)
 public class TicketQueryService {
 
     private static final Logger log = LoggerFactory.getLogger(TicketQueryService.class);
@@ -117,6 +125,7 @@ public class TicketQueryService {
                 ticket.rollbackPlan(),
                 ticket.rollbackSql(),
                 ticket.statementFingerprint(),
+                ticket.snapshotEnabled(),
                 ticket.riskSnapshotHash(),
                 parseJson(ticket.riskSnapshotJson(), ticketId, "risk_snapshot_json"),
                 ticket.submitterId(),
@@ -141,8 +150,8 @@ public class TicketQueryService {
     /**
      * 解析库里的 JSON 原文；失败返回 {@code null} 并记日志。
      *
-     * <p>只记录字段名、工单 ID 与 Jackson 的原始消息，<b>不记录原文全文</b>（可能是坏在中间的大段文本）；
-     * 响应里更不会出现异常文本。
+     * <p>日志用 Jackson 的 {@code getOriginalMessage()}，它<b>可能带上一小段坏 JSON 原文</b>（例如
+     * {@code (String)"{"}），这是为了排查方便；<b>响应体</b>只给 {@code null}，绝不包含异常文本或原文片段。
      */
     private JsonNode parseJson(String raw, long ticketId, String field) {
         if (raw == null || raw.isBlank()) {
@@ -260,7 +269,8 @@ public class TicketQueryService {
     /**
      * 工单详情。
      *
-     * @param riskSnapshot {@code risk_snapshot_json} 解析后的对象；坏 JSON 时为 {@code null}
+     * @param snapshotEnabled 提交时是否抓取结构快照（本切片恒为 {@code true}；暴露给前端判断快照语义）
+     * @param riskSnapshot    {@code risk_snapshot_json} 解析后的对象；坏 JSON 时为 {@code null}
      */
     public record TicketDetail(
             long id,
@@ -275,6 +285,7 @@ public class TicketQueryService {
             String rollbackPlan,
             String rollbackSql,
             String statementFingerprint,
+            boolean snapshotEnabled,
             String riskSnapshotHash,
             JsonNode riskSnapshot,
             long submitterId,

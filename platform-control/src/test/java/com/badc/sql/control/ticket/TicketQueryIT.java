@@ -9,6 +9,9 @@ import java.util.Set;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
@@ -34,8 +37,11 @@ class TicketQueryIT extends TicketITBase {
     /** JWT 合法但用户在 sys_user 里不存在：角色为空，什么都看不到。 */
     private static final String UNKNOWN_USER_TOKEN = JwtTestSupport.token(999L, "ghost");
 
+    /** 系统 2 的模块。直接插系统 2 的工单时必须用它，不能拿系统 1 的模块 201 去配系统 2。 */
+    private static final long PAY_MODULE_ID = 202L;
+
     @BeforeAll
-    void addBackupOperator() {
+    void addQueryOnlyFixtures() {
         jdbc.update("""
                 insert into sys_user (id, login_name, password_hash, role, display_name)
                 values (6, 'backup01', '$2b$10$TznpaUV2xFOaY3aN9B0lpe0H6sbVMVrDBekF4fxgICSl5BcU9SVGW',
@@ -45,6 +51,9 @@ class TicketQueryIT extends TicketITBase {
                 insert into sys_system_operator (id, system_id, user_id, operator_type)
                 values (12, 1, 6, 'BACKUP')
                 """);
+        // 系统 2 在共享夹具里没有模块；直接插工单需要一条合法的 system_id/module_id 归属。
+        jdbc.update("insert into sys_module (id, system_id, name) values (?, 2, ?)",
+                PAY_MODULE_ID, "支付查询");
     }
 
     @BeforeEach
@@ -203,6 +212,7 @@ class TicketQueryIT extends TicketITBase {
         assertThat(detail.path("changeReason").asText()).isEqualTo("修复线上数据");
         assertThat(detail.path("rollbackSql").asText()).isEqualTo("update t_order set a=0 where id=1");
         assertThat(detail.path("statementFingerprint").asText()).hasSize(64);
+        assertThat(detail.path("snapshotEnabled").asBoolean()).isTrue();
         assertThat(detail.path("riskSnapshotHash").asText()).hasSize(64);
         assertThat(detail.path("submitterId").asLong()).isEqualTo(1L);
         assertThat(detail.path("originTicketId").isNull()).isTrue();
@@ -280,6 +290,53 @@ class TicketQueryIT extends TicketITBase {
                 .doesNotContain("JsonProcessingException");
     }
 
+    @Test
+    void a_corrupt_table_fingerprint_does_not_break_the_detail_endpoint() throws Exception {
+        long id = submitAs(DEV_TOKEN);
+        jdbc.update("""
+                update schema_snapshot set table_fingerprints_json = '{'
+                 where ticket_id = ? and change_seq = 0
+                """, id);
+
+        ResponseEntity<String> response = detail(DEV_TOKEN, id);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode detail = objectMapper.readTree(response.getBody());
+        assertThat(detail.path("snapshots")).hasSize(1);
+        assertThat(detail.path("snapshots").get(0).path("tableFingerprints").isNull()).isTrue();
+        assertThat(response.getBody())
+                .doesNotContain("JsonParseException")
+                .doesNotContain("Unexpected end-of-input");
+    }
+
+    // ------------------------------------------------------------------ 默认值与被夹取的参数
+
+    @Test
+    void the_list_defaults_to_page_one_and_twenty_items() throws Exception {
+        submitAs(DEV_TOKEN);
+        submitAs(DEV_TOKEN);
+
+        JsonNode page = listWithDefaults(DEV_TOKEN);
+
+        assertThat(page.path("page").asInt()).isEqualTo(1);
+        assertThat(page.path("size").asInt()).isEqualTo(20);
+        assertThat(page.path("total").asLong()).isEqualTo(2);
+        assertThat(page.path("items")).hasSize(2);
+    }
+
+    @Test
+    void a_page_or_size_below_one_is_clamped() throws Exception {
+        submitAs(DEV_TOKEN);
+        long newest = submitAs(DEV_TOKEN);
+
+        JsonNode page = listAs(DEV_TOKEN, 0, 0);
+
+        assertThat(page.path("page").asInt()).isEqualTo(1);
+        assertThat(page.path("size").asInt()).isEqualTo(1);
+        assertThat(page.path("total").asLong()).isEqualTo(2);
+        assertThat(idsOf(page)).containsExactly(newest);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /** 用真实提交接口造一张工单，返回 ID。 */
@@ -294,7 +351,8 @@ class TicketQueryIT extends TicketITBase {
      * 直接插一张别的系统的工单。
      *
      * <p>提交接口造不出来：研发只能对自己可见的数据源提单（系统 2 的数据源 999 对 dev01 不可见）。
-     * 表间没有外键，因此只写 {@code ticket} 一行就足够读路径使用。
+     * 表间没有外键，因此只写 {@code ticket} 一行就足够读路径使用；归属仍必须是合法的
+     * {@code system_id=2 / module_id=202}，不能借用系统 1 的模块。
      */
     private long insertTicket(long id, long submitterId, long systemId, long datasourceId, String title) {
         jdbc.update("""
@@ -302,15 +360,26 @@ class TicketQueryIT extends TicketITBase {
                             (id, system_id, module_id, datasource_id, ticket_type, status, risk_level,
                              risk_snapshot_json, risk_snapshot_hash, title, change_reason,
                              statement_fingerprint, submitter_id)
-                        values (?, ?, 201, ?, 'NORMAL', 'REVIEWING_L1', 'L1',
+                        values (?, ?, ?, ?, 'NORMAL', 'REVIEWING_L1', 'L1',
                                 '{"level":"L1","statements":[]}', ?, ?, '系统二变更', ?, ?)
                         """,
-                id, systemId, datasourceId, "a".repeat(64), title, "b".repeat(64), submitterId);
+                id, systemId, PAY_MODULE_ID, datasourceId, "a".repeat(64), title, "b".repeat(64),
+                submitterId);
         return id;
     }
 
     private JsonNode listAs(String token, int page, int size) throws Exception {
         ResponseEntity<String> response = listTickets(token, page, size);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody());
+    }
+
+    /** 不带 {@code page}/{@code size} 参数，验证控制器默认值。 */
+    private JsonNode listWithDefaults(String token) throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        ResponseEntity<String> response = rest.exchange("/api/v1/tickets", HttpMethod.GET,
+                new HttpEntity<>(headers), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         return objectMapper.readTree(response.getBody());
     }
