@@ -11,6 +11,8 @@ import org.springframework.web.bind.annotation.RestController;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExecAccountType;
+import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.SnapshotResult;
@@ -20,6 +22,7 @@ import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.executor.adapter.DataSourceAdapter;
 import com.badc.sql.executor.exec.ExplainRunner;
 import com.badc.sql.executor.exec.QueryRunner;
+import com.badc.sql.executor.exec.WriteRunner;
 import com.badc.sql.executor.schema.SchemaSnapshotter;
 
 /**
@@ -35,16 +38,19 @@ public class ExecutorController {
     private final QueryRunner queryRunner;
     private final SchemaSnapshotter snapshotter;
     private final ExplainRunner explainRunner;
+    private final WriteRunner writeRunner;
 
     public ExecutorController(
             DataSourceAdapter adapter,
             QueryRunner queryRunner,
             SchemaSnapshotter snapshotter,
-            ExplainRunner explainRunner) {
+            ExplainRunner explainRunner,
+            WriteRunner writeRunner) {
         this.adapter = adapter;
         this.queryRunner = queryRunner;
         this.snapshotter = snapshotter;
         this.explainRunner = explainRunner;
+        this.writeRunner = writeRunner;
     }
 
     /**
@@ -104,6 +110,21 @@ public class ExecutorController {
         return explainRunner.estimate(request.conn(), request.sql());
     }
 
+    /**
+     * 执行一条写语句。控制面逐条调用，每条独立提交。
+     *
+     * <p>语句本身失败不回非 2xx，而是 {@link ExecuteResult}({@code success=false})：控制面要按条落库
+     * "哪条失败、为什么"，HTTP 层的失败会把这段信息丢掉。只有入参错误（缺连接配置）才走
+     * {@code BizException}。
+     */
+    @PostMapping("/execute")
+    public ExecuteResult execute(@RequestBody ExecuteCall request) {
+        if (request.conn() == null) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT, "缺少连接配置");
+        }
+        return writeRunner.run(request.conn(), request.sql(), request.accountType());
+    }
+
     /** 探测入参。{@code onlineDdlConn} 为空表示该数据源未配置在线 DDL 专用账号。 */
     public record ProbeRequest(ConnConfig conn, ConnConfig onlineDdlConn) {
     }
@@ -126,5 +147,9 @@ public class ExecutorController {
 
     /** EXPLAIN 入参。 */
     public record ExplainCall(ConnConfig conn, String sql) {
+    }
+
+    /** 写执行入参。{@code accountType} 决定语句超时（DML 300s / DDL 3600s）。 */
+    public record ExecuteCall(ConnConfig conn, String sql, ExecAccountType accountType) {
     }
 }
