@@ -1,6 +1,8 @@
 package com.badc.sql.control;
 
 import java.time.Clock;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
 
 import org.springframework.boot.SpringApplication;
@@ -72,13 +74,18 @@ public class ControlApplication {
     /**
      * 工单执行线程池（任务 11）。
      *
-     * <p>core 2 / max 4 / queue 100，<b>拒绝策略必须是 {@code CallerRunsPolicy}</b>：真正的执行并发上界由
-     * {@code datasource_exec_lock}（单数据源写并发 = 1）决定，池子只是把请求线程从"等执行跑完"里解放出来。
-     * 队列满了就让提交请求的线程自己跑——把任务静默丢掉（{@code AbortPolicy} 的默认行为）会让工单永远停在
-     * {@code EXECUTING}，那是最坏的结果：用户以为在跑，其实没人跑；宁可让这次请求慢一点。
+     * <p>core 2 / max 4 / queue 100。真正的执行并发上界由 {@code datasource_exec_lock}（单数据源写并发 = 1）
+     * 决定，池子只是把请求线程从"等执行跑完"里解放出来。
      *
-     * <p>{@code waitForTasksToCompleteOnShutdown} 打开：优雅停机时正在执行的 DDL 不能被直接掐断——半条
-     * {@code alter} 的后果比停机多等几秒严重得多。
+     * <p><b>拒绝策略是 {@link InlineOrRejectHandler}，不是 JDK 的 {@code CallerRunsPolicy}</b>：后者的实现是
+     * {@code if (!executor.isShutdown()) task.run();}——<b>停机时它什么都不做、静默返回</b>，而
+     * {@code ThreadPoolTaskExecutor.execute} 在拒绝处理器正常返回时也会正常返回。于是调用方以为"任务已交付"：
+     * 任务体的 {@code finally} 根本不会执行 → 锁不释放、工单永远停在 {@code EXECUTING}，而且没有任何日志。
+     * {@link InlineOrRejectHandler} 把这种静默丢弃改成抛
+     * {@link java.util.concurrent.RejectedExecutionException}，入口据此把状态退回去并返回 503。
+     *
+     * <p>{@code waitForTasksToCompleteOnShutdown} 同样是为了停机不丢正在跑的任务：优雅停机时正在执行的
+     * DDL 不能被直接掐断——半条 {@code alter} 的后果比停机多等几秒严重得多。
      */
     @Bean("ticketExecutor")
     public ThreadPoolTaskExecutor ticketExecutor() {
@@ -87,8 +94,33 @@ public class ControlApplication {
         executor.setMaxPoolSize(4);
         executor.setQueueCapacity(100);
         executor.setThreadNamePrefix("ticket-exec-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setRejectedExecutionHandler(new InlineOrRejectHandler());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         return executor;
+    }
+
+    /**
+     * 拒绝策略：<b>未停机时内联执行，停机时抛出而不是静默丢弃</b>。
+     *
+     * <p>两个分支都必须可判定：
+     * <ul>
+     *   <li><b>未停机</b>（4 个线程 + 100 的队列都占着）→ 在提交者线程里跑完。宁可让这次请求慢，也不丢
+     *       任务——丢了任务，工单就永远停在 {@code EXECUTING}。</li>
+     *   <li><b>已停机</b> → 抛 {@link java.util.concurrent.RejectedExecutionException}。此时任务<b>一个字都没
+     *       执行</b>，调用方必须把工单退回 {@code APPROVED}、释放锁并返回 503，而不是谎称"已进入 EXECUTING"。
+     *       JDK 的 {@code CallerRunsPolicy} 恰恰漏掉了这一支。</li>
+     * </ul>
+     *
+     * <p>public：用例要直接钉住这两个分支——"停机时不静默"正是锁不泄漏的前提。
+     */
+    public static final class InlineOrRejectHandler implements RejectedExecutionHandler {
+
+        @Override
+        public void rejectedExecution(Runnable task, ThreadPoolExecutor executor) {
+            if (executor.isShutdown()) {
+                throw new RejectedExecutionException("执行器正在停止，任务未被接受");
+            }
+            task.run();
+        }
     }
 }

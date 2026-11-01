@@ -137,6 +137,26 @@ class TicketExecutionIT extends TicketITBase {
                 .contains("\"succeeded\":1");
     }
 
+    /**
+     * 失败语句的 {@code affected_rows} 必须是 {@code NULL}，不是 {@code 0}。
+     *
+     * <p>执行器回 {@code success=false} 只说明"结果未知"（{@code autoCommit=true} 下 {@code executeUpdate}
+     * 返回即已提交，连接关闭阶段的异常同样落到失败分支）。写 {@code 0} 是在断言"确定改了 0 行"，运维据此
+     * 会认为没生效——这是一个可能已经改了数据的谎言。
+     */
+    @Test
+    void a_failed_statement_leaves_affected_rows_null() {
+        stub.failOnStatementIndex = Set.of(0);
+        long id = approvedTicket(DML_SQL);
+
+        requestExecution(DEV_TOKEN, id);
+
+        assertThat(awaitTerminal(id)).isEqualTo("FAILED");
+        assertThat(statementStatuses(id)).containsExactly("FAILED");
+        assertThat(affectedRows(id, 1)).as("失败语句的影响行数是未知，不是 0").isNull();
+        assertThat(stub.executeCalls).isOne();
+    }
+
     @Test
     void the_remaining_statements_are_skipped_after_a_failure() {
         stub.failOnStatementIndex = Set.of(0);
@@ -227,6 +247,18 @@ class TicketExecutionIT extends TicketITBase {
             assertThat(status(second)).isEqualTo("APPROVED");
             assertThat(statementStatuses(second)).as("失败方不得留下任何执行痕迹").containsOnly("PENDING");
             assertThat(stub.executeCalls).isZero();
+            // 被拒的请求不能留下"看起来执行过"的任何一行：执行前快照、中止事件、执行审计都没有。
+            assertThat(jdbc.queryForList(
+                    "select 1 from schema_snapshot where ticket_id = ? and change_seq = 1", Integer.class, second))
+                    .as("拿不到锁不得抓执行前快照").isEmpty();
+            assertThat(jdbc.queryForList(
+                    "select 1 from ticket_event where ticket_id = ? and event_type = 'EXEC_ABORTED'",
+                    Integer.class, second))
+                    .as("拿不到锁不是中止，它是没被受理").isEmpty();
+            assertThat(jdbc.queryForList(
+                    "select 1 from audit_event where event_type = 'TICKET_EXECUTED' and object_id = ?",
+                    Integer.class, String.valueOf(second)))
+                    .as("拿不到锁不得写执行审计").isEmpty();
             // 持有者的锁不被失败方释放。
             assertThat(jdbc.queryForObject(
                     "select count(*) from datasource_exec_lock where datasource_id = 101", Integer.class))
@@ -264,6 +296,67 @@ class TicketExecutionIT extends TicketITBase {
         assertThat(abortReason(id)).contains("SCHEMA_DRIFT").contains("t_order");
         assertThat(stub.executeCalls).isZero();
         assertThat(stub.executedSql).isEmpty();
+    }
+
+    /**
+     * 执行期取指纹抛异常（库不可达/权限不足）→ <b>判漂移并中止</b>，绝不当成"表都不存在"放行。
+     *
+     * <p>这是最容易写反的一条：把异常吞成空 map，一次网络抖动就会让漂移闸静默通过，或者反过来把整单读成
+     * "所有表都被删了"。所以桩必须在<b>执行期</b>抛——提交期抛会让提交就失败，测不到这道闸。
+     */
+    @Test
+    void an_executor_that_cannot_read_fingerprints_aborts_as_drift() {
+        long id = approvedTicket(DML_SQL);
+        stub.fingerprintThrows = true;
+
+        requestExecution(DEV_TOKEN, id);
+
+        assertThat(awaitTerminal(id)).isEqualTo("FAILED");
+        assertThat(abortReason(id))
+                .contains("SCHEMA_DRIFT")
+                .contains("库不可达");
+        assertThat(stub.executeCalls).as("无法确认结构就一条语句都不许下发").isZero();
+    }
+
+    /**
+     * 提交时表还在（{@code {"t_order":"fp-1"}}），执行时指纹里没有它 → 漂移，且明细必须点名是哪张表。
+     *
+     * <p>与"审批后被加列"的区别只在方向：这里 {@code now} 是空串。两者都不能被"前置状态为空"的规则误跳过。
+     */
+    @Test
+    void a_table_that_disappears_after_submission_is_a_drift() {
+        long id = approvedTicket(DML_SQL);
+        // 提交期的 change_seq=0 已经写成 {"t_order":"fp-1"}；执行前把执行器看到的表改成"没了"。
+        stub.fingerprints = Map.of();
+
+        requestExecution(DEV_TOKEN, id);
+
+        assertThat(awaitTerminal(id)).isEqualTo("FAILED");
+        assertThat(abortReason(id))
+                .contains("SCHEMA_DRIFT")
+                .as("明细要能定位到表")
+                .contains("t_order");
+        assertThat(stub.executeCalls).isZero();
+    }
+
+    /**
+     * 提交期指纹 JSON 坏掉 → 漂移闸<b>失败关闭</b>（abort），而不是解析成空 map 静默放行。
+     *
+     * <p>空 map 会让每张表的 {@code before} 都是 {@code null}，逐表比对全部被跳过——那正是这道闸要防的。
+     */
+    @Test
+    void an_unparseable_submitted_fingerprint_fails_the_drift_gate_closed() {
+        long id = approvedTicket(DML_SQL);
+        jdbc.update("update schema_snapshot set table_fingerprints_json = '{' where ticket_id = ? and change_seq = 0",
+                id);
+
+        requestExecution(DEV_TOKEN, id);
+
+        assertThat(awaitTerminal(id)).isEqualTo("FAILED");
+        assertThat(abortReason(id))
+                .contains("SCHEMA_DRIFT")
+                .contains("无法解析");
+        assertThat(stub.executeCalls).isZero();
     }
 
     /** 快照抓取失败 → 一条语句都不执行（全局约束）。 */

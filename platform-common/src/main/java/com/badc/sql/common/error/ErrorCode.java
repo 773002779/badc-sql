@@ -15,6 +15,8 @@ public enum ErrorCode {
     CONFLICT(409, "资源已存在或状态冲突"),
     DB_VERSION_UNSUPPORTED(422, "数据库版本不支持该语法"),
     QUERY_TIMEOUT(504, "查询执行超时"),
+    /** 服务正在停止/暂时接不了任务：请求**没有被受理**，调用方应稍后重试（不是 500，也不是状态冲突）。 */
+    SERVICE_UNAVAILABLE(503, "服务暂不可用，请稍后重试"),
     INTERNAL_ERROR(500, "服务内部错误");
 
     private final int httpStatus;

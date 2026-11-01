@@ -1,15 +1,22 @@
 package com.badc.sql.control.ticket.exec;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import com.badc.sql.control.ControlApplication;
 import com.badc.sql.control.support.AbstractMySqlIT;
 
 /**
@@ -24,6 +31,9 @@ import com.badc.sql.control.support.AbstractMySqlIT;
  *   <li>释放时不带 ticket_id → 崩掉的工单替接手的工单解锁；</li>
  *   <li>超时锁不能被清理 → 实例崩过一次之后该库永久不可写。</li>
  * </ul>
+ *
+ * <p>另有两支用例钉住执行线程池的拒绝策略 {@link ControlApplication.InlineOrRejectHandler}（同样不起 Spring）：
+ * 停机时必须<b>抛</b>而不是静默丢弃（否则任务体的 {@code finally} 不执行、锁永久泄漏），未停机时必须内联跑完。
  */
 class DatasourceExecLockIT extends AbstractMySqlIT {
 
@@ -94,6 +104,51 @@ class DatasourceExecLockIT extends AbstractMySqlIT {
         assertThat(lock.acquire(101L, 1L)).isTrue();
         assertThat(lock.acquire(102L, 2L)).isTrue();
         assertThat(lockCount()).isEqualTo(2);
+    }
+
+    // ------------------------------------------------------------------ 拒绝策略的两个分支
+
+    /**
+     * <b>停机 → 抛出</b>，而不是像 JDK 的 {@code CallerRunsPolicy} 那样静默返回。
+     *
+     * <p>这是"锁不泄漏"的前提：{@code ThreadPoolTaskExecutor.execute} 在拒绝处理器正常返回时也正常返回，
+     * 调用方会以为任务已交付——任务体的 {@code finally} 永远不会执行，锁被永久占住、工单永远停在
+     * {@code EXECUTING}，而且没有任何日志。所以这里断言两件事：抛
+     * {@link RejectedExecutionException}，且任务<b>一个字都没执行</b>。
+     */
+    @Test
+    void the_reject_handler_throws_while_the_pool_is_shut_down_and_runs_nothing() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
+        executor.shutdown();
+        AtomicBoolean ran = new AtomicBoolean();
+
+        assertThatThrownBy(() -> new ControlApplication.InlineOrRejectHandler()
+                .rejectedExecution(() -> ran.set(true), executor))
+                .isInstanceOf(RejectedExecutionException.class);
+
+        assertThat(ran).as("停机时任务不得被静默执行").isFalse();
+    }
+
+    /**
+     * <b>未停机 → 内联执行</b>：4 个线程 + 队列都占满时宁可让提交请求慢一点，也不能把任务丢掉。
+     *
+     * <p>丢掉任务的后果是工单永远停在 {@code EXECUTING}（用户以为在跑，其实没人跑），所以这里必须看见
+     * 任务真的跑过。
+     */
+    @Test
+    void the_reject_handler_runs_the_task_inline_while_the_pool_is_alive() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
+        try {
+            AtomicBoolean ran = new AtomicBoolean();
+
+            new ControlApplication.InlineOrRejectHandler().rejectedExecution(() -> ran.set(true), executor);
+
+            assertThat(ran).as("未停机时必须在本线程里跑完，而不是丢弃").isTrue();
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     private int lockCount() {

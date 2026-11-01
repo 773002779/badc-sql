@@ -7,7 +7,9 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.RejectedExecutionException;
 
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.EmptyResultDataAccessException;
@@ -117,14 +119,33 @@ public class TicketExecutionService {
              where id = ? and status = 'APPROVED'
             """;
 
+    /**
+     * 交付失败时把状态退回 {@code APPROVED}（连同清掉 {@code executed_at}）。
+     *
+     * <p>只回退仍为 {@code EXECUTING} 的行：若这期间有人把它改成了别的状态（例如任务 13 的恢复），
+     * 不能把它盖回 APPROVED。
+     */
+    private static final String MARK_BACK_TO_APPROVED = """
+            update ticket set status = 'APPROVED', executed_at = null
+             where id = ? and status = 'EXECUTING'
+            """;
+
     private static final String MARK_ABORTED =
             "update ticket set status = 'FAILED', finished_at = ? where id = ?";
 
     private static final String MARK_FINISHED =
             "update ticket set status = ?, finished_at = ? where id = ?";
 
-    private static final String MARK_ORIGIN_ROLLED_BACK =
-            "update ticket set status = 'ROLLED_BACK', finished_at = ? where id = ?";
+    /**
+     * 回滚单成功后回写原单。
+     *
+     * <p><b>带状态条件</b>：只有"已执行成功/部分成功"的原单才谈得上"已回滚"。无条件更新会把一张本该
+     * {@code FAILED}（或从未执行、仍 {@code APPROVED}）的原单标成"已回滚"，运维会据此认为数据已经还原。
+     */
+    private static final String MARK_ORIGIN_ROLLED_BACK = """
+            update ticket set status = 'ROLLED_BACK', finished_at = ?
+             where id = ? and status in ('SUCCEEDED', 'PARTIAL_FAILED')
+            """;
 
     private static final String MARK_STATEMENT_RUNNING = """
             update ticket_statement set status = 'RUNNING', executed_at = ?
@@ -140,12 +161,15 @@ public class TicketExecutionService {
     /**
      * 失败语句落库。
      *
-     * <p>{@code error_message} 只说"这条执行失败、结果可能已生效"，<b>不写"未执行"</b>：执行器的失败返回
-     * 不能证明语句没有生效（见类注释）。
+     * <p><b>{@code affected_rows} 写 {@code NULL} 而不是 {@code 0}</b>：{@code 0} 是"确定改了 0 行"，而
+     * {@code success=false} 的事实是"结果未知"（{@code autoCommit=true} 下 {@code executeUpdate} 返回即已提交，
+     * 连接关闭阶段的异常也落到失败分支）。V3 的列注释也写着"失败或未执行时为空"。
+     *
+     * <p>{@code error_message} 同理只说"这条执行失败、结果可能已生效"，<b>不写"未执行"</b>。
      */
     private static final String MARK_STATEMENT_FAILED = """
             update ticket_statement
-               set status = 'FAILED', affected_rows = ?, elapsed_ms = ?, error_message = ?
+               set status = 'FAILED', affected_rows = null, elapsed_ms = ?, error_message = ?
              where ticket_id = ? and seq_no = ?
             """;
 
@@ -253,7 +277,7 @@ public class TicketExecutionService {
             throw new BizException(ErrorCode.CONFLICT, "该数据源有工单正在执行，请稍后重试");
         }
 
-        boolean handedOff = false;
+        boolean accepted = false;
         try {
             int moved = jdbc.update(MARK_EXECUTING, now(), ticketId);
             if (moved == 0) {
@@ -263,18 +287,42 @@ public class TicketExecutionService {
             ticketExecutor.execute(() -> {
                 try {
                     executeNow(ticketId, userId);
+                } catch (RuntimeException e) {
+                    // 任务体不允许外抛：线程池饱和时它是**在调用方线程里**跑的（InlineOrRejectHandler），
+                    // 抛出去就变成对调用方的 500 —— 而那张工单可能已经执行成功。异步路径外抛则只会杀掉
+                    // 工作线程，工单停在 EXECUTING 却没有任何记录。这里只记录事实，不伪造状态：
+                    // "停在 EXECUTING" 的清理归任务 13 的卡死恢复。
+                    eventMapper.append(ticketId, "EXEC_FAILED", userId,
+                            json(detail("reason", "执行编排抛出未预期异常，工单可能仍停在 EXECUTING",
+                                    "message", messageOf(e))));
                 } finally {
                     // 锁必须在 finally 里释放：任何一条语句抛出都不能把这台库永久锁死。
                     lock.release(datasourceId, ticketId);
                 }
             });
-            handedOff = true;
+            accepted = true;
+        } catch (RejectedExecutionException e) {
+            // 线程池已停机：任务一个字都没跑（InlineOrRejectHandler 在停机时抛出而不是静默丢弃）。
+            // 既然没能交付，就不能声称进入 EXECUTING —— 状态退回去，锁由下面的 finally 释放。
+            jdbc.update(MARK_BACK_TO_APPROVED, ticketId);
+            throw new BizException(ErrorCode.SERVICE_UNAVAILABLE, "执行器正在停止，请稍后重试");
         } finally {
-            if (!handedOff) {
+            // 只有"没交付"才在这里释放。受理之后（哪怕工作线程还没调度到它）锁归任务体所有：
+            // 用"任务是否已开始跑"判会在排队窗口里提前放锁，新工单会在旧任务真正开跑之前就取得锁，
+            // 单数据源并发=1 立刻失效。任务被丢弃时 execute(...) 会抛，走不到 accepted。
+            if (!accepted) {
                 lock.release(datasourceId, ticketId);
             }
         }
-        return new ExecutionAccepted(ticketId, TicketStatus.EXECUTING.name());
+        // 202 正文里的状态取"返回那一刻"的真实值：正常异步路径恒为 EXECUTING；若线程池饱和导致本次请求
+        // 线程内联跑完，这里会如实报出终态，而不是硬编码一个可能已经过期的 EXECUTING。
+        return new ExecutionAccepted(ticketId, currentStatus(ticketId));
+    }
+
+    /** 工单当前状态；读不到（不可能，除非行被删）时按 {@code EXECUTING} 兜底。 */
+    private String currentStatus(long ticketId) {
+        List<String> statuses = jdbc.queryForList("select status from ticket where id = ?", String.class, ticketId);
+        return statuses.isEmpty() ? TicketStatus.EXECUTING.name() : statuses.get(0);
     }
 
     /** 提交人本人，或该系统的运维/组长（{@code sys_system_operator} 有归属）。 */
@@ -432,7 +480,6 @@ public class TicketExecutionService {
                 succeeded++;
             } else {
                 jdbc.update(MARK_STATEMENT_FAILED,
-                        result == null ? 0L : result.affectedRows(),
                         result == null ? 0L : result.elapsedMs(),
                         failedMessage(result), ticketId, seq);
                 failed++;
@@ -468,12 +515,16 @@ public class TicketExecutionService {
                 json(counts)));
 
         // 回滚单成功 → 原单置 ROLLED_BACK。部分失败时原单不动：没还原的数据不能被标成已回滚。
+        // 更新带状态条件（只有 SUCCEEDED/PARTIAL_FAILED 的原单才可回滚），影响行数为 0 时不写事件：
+        // 一张从未成功过的原单被标成"已回滚"，比不标更危险。
         if (ROLLBACK_TICKET_TYPE.equals(ticket.ticketType())
                 && finalStatus == TicketStatus.SUCCEEDED
                 && ticket.originTicketId() != null) {
-            jdbc.update(MARK_ORIGIN_ROLLED_BACK, now(), ticket.originTicketId());
-            eventMapper.append(ticket.originTicketId(), "ROLLED_BACK", operatorId,
-                    json(Map.of("rollbackTicketId", ticketId)));
+            int rolledBack = jdbc.update(MARK_ORIGIN_ROLLED_BACK, now(), ticket.originTicketId());
+            if (rolledBack > 0) {
+                eventMapper.append(ticket.originTicketId(), "ROLLED_BACK", operatorId,
+                        json(Map.of("rollbackTicketId", ticketId)));
+            }
         }
     }
 
@@ -498,13 +549,16 @@ public class TicketExecutionService {
     /**
      * 逐表比对"提交时指纹"与"现在指纹"。
      *
-     * <p>比对规则（三条各自对应一个真实事故）：
+     * <p>比对规则（四条各自对应一个真实事故）：
      * <ul>
      *   <li><b>提交时为空串的表不参与比对</b>：那是"前置状态为空"（表还不存在，本单要新建它），
      *       没有可比对的旧结构，不是漂移；</li>
      *   <li><b>执行时表消失了</b>：提交时有指纹、现在没有 → 漂移（有人删了表，或本单的执行账号看不到它）；</li>
      *   <li><b>取指纹抛异常</b>：库不可达/权限不足，<b>不能</b>当成"没有表"。当成空 map 会让一次网络故障
-     *       被读成"所有表都被删了"或反过来放行一次无法验证的执行——所以直接中止。</li>
+     *       被读成"所有表都被删了"或反过来放行一次无法验证的执行——所以直接中止；</li>
+     *   <li><b>提交时的指纹 JSON 解析不出来</b>：库里的那一行是提交路径自己写的规范化 JSON，读不出来说明
+     *       元数据已损坏。此时"每张表的 before 都是 null"会让所有比对被跳过 → <b>闸门静默放行</b>，
+     *       所以这里同样中止（fail-closed），而不是当成"提交时没有表"。</li>
      * </ul>
      *
      * @return 空 map 表示没有漂移；{@code null} 表示已经 abort（调用方直接返回）
@@ -513,7 +567,14 @@ public class TicketExecutionService {
             ConnConfig execConn, List<String> tables) {
         Map<String, String> before;
         try {
-            before = parseFingerprints(jdbc.queryForObject(SNAPSHOT_ZERO_FINGERPRINTS, String.class, ticketId));
+            Optional<Map<String, String>> parsed =
+                    parseFingerprints(jdbc.queryForObject(SNAPSHOT_ZERO_FINGERPRINTS, String.class, ticketId));
+            if (parsed.isEmpty()) {
+                abort(ticketId, operatorId, datasourceId, SCHEMA_DRIFT,
+                        detail("reason", "存库的提交期结构指纹无法解析，无法确认表结构未变"));
+                return null;
+            }
+            before = parsed.get();
         } catch (EmptyResultDataAccessException e) {
             abort(ticketId, operatorId, datasourceId, SCHEMA_DRIFT,
                     detail("reason", "缺少提交时的结构指纹，无法确认表结构未变"));
@@ -557,20 +618,21 @@ public class TicketExecutionService {
     /**
      * 从提交时的 {@code table_fingerprints_json} 解析表名 → 指纹。
      *
-     * <p>解析失败按空 map 处理：那张快照行是提交路径自己写的规范化 JSON，读不出来说明元数据已经损坏，
-     * 此时所有"提交时非空"的表都会因为 {@code before} 缺失而被跳过比对——这是<b>偏松</b>的方向，
-     * 所以它只可能发生在元数据库本身出问题时；结构真实的漂移仍由下一次执行前快照与指纹兜住。
+     * <p>返回 {@code empty} 表示<b>解析不出来</b>，调用方必须据此中止：那个 JSON 是提交路径自己写的规范化
+     * 文本，读不出来说明元数据已损坏；若把它当成空 map，每张表的 {@code before} 都会是 {@code null}，
+     * 逐表比对全部被跳过——漂移闸静默放行，正是本闸要防的事。
+     *
+     * <p>{@code null}/空白同样视为解析失败：提交路径至少会写 {@code "{}"}。
      */
-    private Map<String, String> parseFingerprints(String json) {
+    private Optional<Map<String, String>> parseFingerprints(String json) {
         if (json == null || json.isBlank()) {
-            return Map.of();
+            return Optional.empty();
         }
         try {
-            Map<String, String> parsed = objectMapper.readValue(json, new TypeReference<Map<String, String>>() {
-            });
-            return parsed == null ? Map.of() : parsed;
+            return Optional.ofNullable(objectMapper.readValue(json, new TypeReference<Map<String, String>>() {
+            }));
         } catch (JsonProcessingException e) {
-            return Map.of();
+            return Optional.empty();
         }
     }
 
