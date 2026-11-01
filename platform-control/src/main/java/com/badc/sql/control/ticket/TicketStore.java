@@ -1,10 +1,12 @@
 package com.badc.sql.control.ticket;
 
+import java.time.Instant;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,6 +38,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 @Service
 public class TicketStore {
 
+    private static final String ROLLBACK_TICKET_TYPE = "ROLLBACK";
+
+    /**
+     * 回滚单的 {@code origin_ticket_id} / {@code rollback_reason} 在插入后补齐。
+     *
+     * <p>{@link TicketMapper#insert} 的列清单是提交路径的（不含这两列），而本任务不改既有 mapper；
+     * 同一个事务里补一次 UPDATE 即可，代价是一条主键更新，换来的是一份写入逻辑。
+     */
+    private static final String SET_ROLLBACK_ORIGIN =
+            "update ticket set origin_ticket_id = ?, rollback_reason = ? where id = ?";
+
+    /** 事务内复查归属：外部调用（指纹/EXPLAIN）期间发起人可能已被移出该系统。 */
+    private static final String OPERATES_SYSTEM =
+            "select count(*) from sys_system_operator where system_id = ? and user_id = ?";
+
     private final TicketAssignmentService assignmentService;
     private final TicketMapper ticketMapper;
     private final TicketStatementMapper statementMapper;
@@ -44,6 +61,7 @@ public class TicketStore {
     private final RiskAcknowledgementMapper acknowledgementMapper;
     private final AuditService auditService;
     private final ObjectMapper objectMapper;
+    private final JdbcTemplate jdbc;
 
     public TicketStore(
             TicketAssignmentService assignmentService,
@@ -53,7 +71,8 @@ public class TicketStore {
             SchemaSnapshotMapper snapshotMapper,
             RiskAcknowledgementMapper acknowledgementMapper,
             AuditService auditService,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            JdbcTemplate jdbc) {
         this.assignmentService = assignmentService;
         this.ticketMapper = ticketMapper;
         this.statementMapper = statementMapper;
@@ -62,6 +81,7 @@ public class TicketStore {
         this.acknowledgementMapper = acknowledgementMapper;
         this.auditService = auditService;
         this.objectMapper = objectMapper;
+        this.jdbc = jdbc;
     }
 
     /**
@@ -159,6 +179,118 @@ public class TicketStore {
         return ticketId;
     }
 
+    /**
+     * 落一张回滚工单（任务 12）。
+     *
+     * <p>与 {@link #create} 的差别只有三处，其余写入步骤（语句、结构指纹、事件、风险确认、审计）完全同构：
+     * <ul>
+     *   <li><b>不做归属推导</b>：{@code system_id}/{@code module_id}/{@code datasource_id} 继承原单——回滚必须打在
+     *       原单那张库上，重新按发起人的授权链推导反而可能算出另一个模块；</li>
+     *   <li><b>写 {@code ticket_type='ROLLBACK'} 与 {@code origin_ticket_id}/{@code rollback_reason}</b>：前者走
+     *       {@link TicketMapper#insert}，后两列由本方法在同一事务里补齐（既有 mapper 的插入列清单属于提交路径，
+     *       不在本任务修改范围内）；</li>
+     *   <li><b>审计事件是 {@code TICKET_ROLLBACK_SUBMITTED}</b>，载荷含原单 ID；事件明细含
+     *       {@code rolledBackFrom}，详情页据此把两张单串起来。</li>
+     * </ul>
+     *
+     * <p>事务内仍然重跑两道廉价判定：发起人是否仍是该系统的运维/组长、L3 单是否还有组长可终审。外部调用
+     * （结构指纹、EXPLAIN）在事务外，期间权限或人员配置都可能在别处被改。
+     *
+     * @param submission 回滚单的业务内容（继承自原单）
+     * @param prepared   事务外算好的等级、逐条等级、风险快照、语句指纹与表指纹
+     * @param client     来源 IP / User-Agent，可空
+     * @return 新工单 ID
+     * @throws BizException 403（发起人已不是该系统运维）或 400（L3 无组长）
+     */
+    @Transactional
+    public long createRollback(RollbackSubmission submission, PreparedTicket prepared,
+            RequestMetadata.Client client) {
+        Integer operating = jdbc.queryForObject(
+                OPERATES_SYSTEM, Integer.class, submission.systemId(), submission.submitterId());
+        if (operating == null || operating == 0) {
+            throw new BizException(ErrorCode.FORBIDDEN,
+                    "只能回滚自己负责的系统的工单（systemId=" + submission.systemId() + "）");
+        }
+        if (prepared.ticketLevel() == RiskLevel.L3) {
+            requireLead(submission.systemId());
+        }
+
+        long ticketId = ticketMapper.insert(new TicketEntity(
+                null,
+                submission.systemId(),
+                submission.moduleId(),
+                submission.datasourceId(),
+                ROLLBACK_TICKET_TYPE,
+                TicketStatus.REVIEWING_L1.name(),
+                prepared.ticketLevel().name(),
+                prepared.riskSnapshotJson(),
+                prepared.riskSnapshotHash(),
+                submission.title(),
+                submission.changeReason(),
+                submission.rollbackPlan(),
+                // 回滚单自己的"反向 SQL"并不存在（再回滚一次原变更不是业务动作），语句原文只落 ticket_statement。
+                null,
+                prepared.statementFingerprint(),
+                true,
+                submission.expectedExecuteAt(),
+                submission.submitterId(),
+                // 剩余列由数据库默认值/本方法的 UPDATE 补齐：insert 的列清单不含 origin/rollback_reason，
+                // 时间戳列走 DEFAULT CURRENT_TIMESTAMP(3)。
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null));
+        jdbc.update(SET_ROLLBACK_ORIGIN, submission.originTicketId(), submission.rollbackReason(), ticketId);
+
+        List<ValidatedStatement> statements = submission.statements();
+        for (int i = 0; i < statements.size(); i++) {
+            ValidatedStatement statement = statements.get(i);
+            statementMapper.insert(ticketId, statement.seq(), statement.sql(), statement.statementType(),
+                    prepared.statementLevels().get(i).name(), "PENDING");
+        }
+
+        // 回滚的基线是"现在"：抓原单这些表的当前指纹，执行前的漂移比对才不会把原单自己造成的结构变化
+        // 当成漂移。
+        snapshotMapper.insert(ticketId, 0, submission.datasourceId(),
+                submission.systemId() + "/" + submission.datasourceId() + "/" + ticketId + "/0",
+                json(prepared.tableFingerprints()));
+
+        Map<String, Object> submittedDetail = new LinkedHashMap<>();
+        submittedDetail.put("riskLevel", prepared.ticketLevel().name());
+        submittedDetail.put("statementCount", statements.size());
+        submittedDetail.put("datasourceId", submission.datasourceId());
+        submittedDetail.put("systemId", submission.systemId());
+        submittedDetail.put("moduleId", submission.moduleId());
+        submittedDetail.put("rolledBackFrom", submission.originTicketId());
+        eventMapper.append(ticketId, "SUBMITTED", submission.submitterId(), json(submittedDetail));
+
+        acknowledgementMapper.insert(ticketId, "SUBMIT", submission.submitterId(),
+                prepared.riskSnapshotHash(), client == null ? null : client.ip(),
+                client == null ? null : client.userAgent());
+
+        Map<String, Object> auditPayload = new LinkedHashMap<>();
+        auditPayload.put("originTicketId", submission.originTicketId());
+        auditPayload.put("riskLevel", prepared.ticketLevel().name());
+        auditPayload.put("statementCount", statements.size());
+        auditPayload.put("datasourceId", submission.datasourceId());
+        auditPayload.put("systemId", submission.systemId());
+        auditPayload.put("moduleId", submission.moduleId());
+        auditService.record(new AuditCommand(
+                "TICKET_ROLLBACK_SUBMITTED",
+                submission.submitterId(),
+                null,
+                submission.datasourceId(),
+                // 动作与提交区分开：审计里"回滚单被发起"与"普通工单被提交"必须是两类事件。
+                "ROLLBACK",
+                String.valueOf(ticketId),
+                json(auditPayload)));
+
+        return ticketId;
+    }
+
     /** §4.7-6：L3 工单若该系统没有组长，提交时就拦下，而不是让它卡在 REVIEWING_L2 无人可审。 */
     public void requireLead(long systemId) {
         if (ticketMapper.countLeads(systemId) == 0) {
@@ -172,6 +304,43 @@ public class TicketStore {
             return objectMapper.writeValueAsString(value);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("事件/快照序列化失败", e);
+        }
+    }
+
+    /**
+     * 一张回滚工单的业务内容（事务外由 {@code TicketRollbackService} 组装）。
+     *
+     * <p>{@code systemId}/{@code moduleId}/{@code datasourceId} 一律继承原单：回滚必须落在原变更的那张库上。
+     * {@code statements} 是按 {@link ValidatedStatement} 校验过的回滚语句（seq 从 1 开始），与
+     * {@link PreparedTicket#statementLevels()} 同序。
+     *
+     * @param originTicketId  被回滚的原工单
+     * @param submitterId     发起回滚的运维/组长
+     * @param systemId        原单归属系统
+     * @param moduleId        原单发起模块
+     * @param datasourceId    原单目标数据源
+     * @param title           新工单标题
+     * @param changeReason    变更原因（回滚原因原文）
+     * @param rollbackPlan    原单的回滚方案文本（留档）
+     * @param rollbackReason  回滚原因（写入 {@code ticket.rollback_reason}）
+     * @param expectedExecuteAt 期望执行时间（回滚应当尽快执行，通常取"现在"）
+     * @param statements      回滚语句（已通过 BLOCK 与表名命中校验）
+     */
+    public record RollbackSubmission(
+            long originTicketId,
+            long submitterId,
+            long systemId,
+            long moduleId,
+            long datasourceId,
+            String title,
+            String changeReason,
+            String rollbackPlan,
+            String rollbackReason,
+            Instant expectedExecuteAt,
+            List<ValidatedStatement> statements) {
+
+        public RollbackSubmission {
+            statements = List.copyOf(statements);
         }
     }
 

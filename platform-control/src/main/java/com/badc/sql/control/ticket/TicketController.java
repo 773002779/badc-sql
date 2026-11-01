@@ -22,9 +22,9 @@ import com.badc.sql.control.web.RequestMetadata;
 /**
  * 变更工单接口。
  *
- * <p>提交（任务 7a）、详情/列表（任务 7b）、审批链（任务 8）、执行前风险确认（任务 9）与执行申请（任务 11）
- * 挂在同一个控制器上：它们共享 {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断全部在服务层——控制器
- * 只负责取当前用户、转发参数。
+ * <p>提交（任务 7a）、详情/列表（任务 7b）、审批链（任务 8）、执行前风险确认（任务 9）、执行申请（任务 11）
+ * 与回滚发起（任务 12）挂在同一个控制器上：它们共享 {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断
+ * 全部在服务层——控制器只负责取当前用户、转发参数。
  *
  * <p><b>请求体不接收 {@code systemId}/{@code moduleId}</b>：归属由服务端从数据源与授权链推导（见
  * {@link TicketAssignmentService}），前端传得越多错得越多。同样不接收 {@code submitterId}——身份只来自
@@ -39,15 +39,17 @@ public class TicketController {
     private final TicketReviewService reviewService;
     private final RiskAckService riskAckService;
     private final TicketExecutionService executionService;
+    private final TicketRollbackService rollbackService;
 
     public TicketController(TicketService ticketService, TicketQueryService queryService,
             TicketReviewService reviewService, RiskAckService riskAckService,
-            TicketExecutionService executionService) {
+            TicketExecutionService executionService, TicketRollbackService rollbackService) {
         this.ticketService = ticketService;
         this.queryService = queryService;
         this.reviewService = reviewService;
         this.riskAckService = riskAckService;
         this.executionService = executionService;
+        this.rollbackService = rollbackService;
     }
 
     /**
@@ -112,6 +114,36 @@ public class TicketController {
 
     /** 审核请求体：只有审核意见，没有身份与级别（级别由服务端按状态与整单等级判定）。 */
     public record ReviewRequest(String comment) {
+    }
+
+    /**
+     * 发起一张回滚工单（任务 12）。{@code {id}} 是<b>原单</b>的 ID。
+     *
+     * <p>回滚不是"撤销按钮"，而是基于原单新建一张 {@code ROLLBACK} 工单：它继承原单的归属与数据源、
+     * 预填原单的回滚 SQL（运维可在请求体里补写/覆盖，DDL 原单只能这样给出语句）、重新走静态校验与风险定级，
+     * 然后同样进审批——原单的成功与否只决定"能不能回滚"，不决定"回滚要不要审批"。
+     *
+     * <p>回滚原因必填（≥10 字）：审计与详情页要能回答"为什么回滚"，一个字的"回滚"回答不了。
+     *
+     * @return 201 + {@code {id, status, riskLevel, ticketType:"ROLLBACK", originTicketId}}
+     */
+    @PostMapping("/{id}/rollback")
+    public ResponseEntity<TicketRollbackService.RollbackResult> rollback(
+            @PathVariable long id,
+            @RequestBody(required = false) RollbackRequest request) {
+        if (request == null) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT, "请求体不能为空");
+        }
+        return ResponseEntity.status(HttpStatus.CREATED).body(
+                rollbackService.rollback(CurrentUser.id(), id, request.reason(), request.rollbackSql()));
+    }
+
+    /**
+     * 回滚请求体：只有原因与运维补写的 SQL，没有身份、归属或等级。
+     *
+     * <p>{@code rollbackSql} 可空：为空时回落到原单提交时填的 {@code rollback_sql}；两者都空由服务层给 400。
+     */
+    public record RollbackRequest(String reason, String rollbackSql) {
     }
 
     /**
