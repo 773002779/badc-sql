@@ -231,6 +231,45 @@ class QueryControllerIT extends AbstractMySqlIT {
         assertThat(stub.lastSql).as("版本不支持时不应调用执行器查询").isNull();
     }
 
+    /**
+     * 同一个入口的两种拒绝，必须都留痕。
+     *
+     * <p>只读白名单拒绝（{@code non_readonly_statement}）在切片 1 就写了 {@code QUERY_REJECTED}，
+     * 而版本拒绝（422）当时一条都没写——"有人拿 CTE 打 5.7 的库"这件事在审计链里完全查不到。
+     * 补齐之后两类拒绝在同一张表里可查，{@code action} 区分原因。
+     *
+     * <p>payload 只记版本与原因，<b>不记 SQL 原文</b>：审计不是查询日志，把用户 SQL 抄进哈希链只会
+     * 稀释真正要看的事件，还会把生产表名/条件写进一个两年不可删的地方。
+     */
+    @Test
+    void a_version_rejection_is_written_to_the_audit_chain() throws Exception {
+        stub.validateResult = ValidationResult.reject(
+                "DB_VERSION_UNSUPPORTED", "该库为 MySQL 5.7，不支持 WITH 子句（CTE）；请改写 SQL 或改用 8.0 实例");
+
+        ResponseEntity<String> response = post(DEV_TOKEN, """
+                {"datasourceId":101,"sql":"with t as (select 1 as x) select * from t"}
+                """);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        Map<String, Object> audit = jdbc.queryForMap("""
+                select operator_id, action, object_id, payload_json from audit_event
+                 where event_type = 'QUERY_REJECTED' and action = 'db_version_unsupported'
+                """);
+        assertThat(((Number) audit.get("operator_id")).longValue())
+                .as("operator_id 是被拒的用户").isEqualTo(1L);
+        assertThat(audit.get("object_id")).as("版本拒绝没有结果对象").isNull();
+
+        String payload = (String) audit.get("payload_json");
+        assertThat(payload)
+                .as("payload 要含版本名与被拒原因")
+                .contains("5.7.44")
+                .contains("WITH");
+        assertThat(payload)
+                .as("审计里不得出现用户 SQL 原文")
+                .doesNotContain("with t as")
+                .doesNotContain("select * from t");
+    }
+
     /** 对照面：校验通过时必须照常执行，别把正常路径一起堵死。 */
     @Test
     void a_query_that_passes_version_validation_still_reaches_the_executor() throws Exception {

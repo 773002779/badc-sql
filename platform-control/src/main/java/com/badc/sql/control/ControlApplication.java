@@ -10,6 +10,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import com.badc.sql.control.risk.PolicyValidator;
@@ -28,8 +29,15 @@ import com.badc.sql.control.risk.RiskProperties;
  * 不见了，而本类的 {@code riskEngine} {@code @Bean} 又要它，结果是每个 {@code @WebMvcTest} 都以
  * {@code No qualifying bean of type 'RiskProperties'} 启动失败。{@code @EnableConfigurationProperties}
  * 直接登记指定类型、不过滤，切片与完整应用行为一致。
+ *
+ * <p><b>{@code @EnableScheduling}</b>（任务 13）：过期作废与卡死恢复都是"没有请求发生"的状态变化，
+ * 只能由定时任务推动（见 {@code TicketRecoveryJob}）。它只在完整应用里生效——{@code @WebMvcTest} 切片
+ * 用 {@code TypeExcludeFilter} 过滤掉了 {@code @Service}，因此切片上下文里没有任何 {@code @Scheduled}
+ * 任务，不会凭空多出一个线程。集成测试加载的是完整应用，任务确实存在，{@code TicketRecoveryJob} 用
+ * 5 分钟的 {@code initialDelayString} 让它在测试进程存活期间不触发。
  */
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
+@EnableScheduling
 @EnableConfigurationProperties(RiskProperties.class)
 public class ControlApplication {
 
