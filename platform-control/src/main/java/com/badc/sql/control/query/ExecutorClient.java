@@ -6,8 +6,11 @@ import java.util.Map;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExecAccountType;
+import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 
 /**
@@ -74,4 +77,39 @@ public interface ExecutorClient {
      * @throws com.badc.sql.common.error.BizException 库不可达、权限不足或执行器不可用
      */
     ExplainEstimate explain(ConnConfig conn, String sql);
+
+    /**
+     * 抓取执行前的结构快照并落盘。
+     *
+     * <p><b>抛异常就是"抓取失败"，而失败必须禁止执行</b>（全局约束：结构快照抓取失败 → 禁止执行）。
+     * 表不存在不是失败：它只是没有前置结构，不进入返回的 {@link SnapshotResult#tableFingerprints()}。
+     * 调用方绝不能把异常吞成"没有表"——那等于在一个无法确认原始结构的库上执行结构变更。
+     *
+     * @param conn        执行账号的连接配置（已解密）
+     * @param tables      本单涉及的表（已归一的裸表名）；为空表示不涉及已有表
+     * @param relativeRef 落盘相对引用 {@code {systemId}/{datasourceId}/{ticketId}/{changeSeq}}，
+     *                    由控制面给、执行器在快照根目录下解析
+     * @return 落盘结果：引用、存在表的指纹、字节数
+     * @throws com.badc.sql.common.error.BizException 库不可达、权限不足、执行器不可用或写盘失败
+     */
+    SnapshotResult snapshot(ConnConfig conn, List<String> tables, String relativeRef);
+
+    /**
+     * 执行一条写语句。
+     *
+     * <p><b>失败是结果，不是异常</b>：语句本身的失败（语法错、约束冲突、超时）由
+     * {@link ExecuteResult#success()} 为 {@code false} 表达，控制面据此逐条记录"哪条失败、为什么"。
+     * 执行器不可用、入参非法才抛 {@link com.badc.sql.common.error.BizException}。
+     *
+     * <p><b>{@code success=false} 不等于"这条语句没有生效"</b>：{@code autoCommit=true} 下
+     * {@code executeUpdate} 返回时已经提交，而连接关闭阶段的异常同样会落到失败分支。调用方不得据此
+     * 断言"未执行"，只能按"执行没有全部成功、结果可能已生效"处理。
+     *
+     * @param conn 连接配置（执行账号，已解密）
+     * @param sql  单条语句原文
+     * @param type 账号类型，决定执行器侧的语句超时（DML 300s / DDL 3600s）
+     * @return 本条语句的执行结果
+     * @throws com.badc.sql.common.error.BizException 执行器不可用或入参非法
+     */
+    ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type);
 }

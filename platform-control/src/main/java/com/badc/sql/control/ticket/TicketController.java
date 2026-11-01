@@ -16,14 +16,15 @@ import org.springframework.web.bind.annotation.RestController;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.security.CurrentUser;
+import com.badc.sql.control.ticket.exec.TicketExecutionService;
 import com.badc.sql.control.web.RequestMetadata;
 
 /**
  * 变更工单接口。
  *
- * <p>提交（任务 7a）、详情/列表（任务 7b）、审批链（任务 8）与执行前风险确认（任务 9）挂在同一个控制器上：
- * 它们共享 {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断全部在服务层——控制器只负责取当前用户、
- * 转发参数。
+ * <p>提交（任务 7a）、详情/列表（任务 7b）、审批链（任务 8）、执行前风险确认（任务 9）与执行申请（任务 11）
+ * 挂在同一个控制器上：它们共享 {@code /api/v1/tickets} 前缀与 JWT 身份来源。业务判断全部在服务层——控制器
+ * 只负责取当前用户、转发参数。
  *
  * <p><b>请求体不接收 {@code systemId}/{@code moduleId}</b>：归属由服务端从数据源与授权链推导（见
  * {@link TicketAssignmentService}），前端传得越多错得越多。同样不接收 {@code submitterId}——身份只来自
@@ -37,13 +38,16 @@ public class TicketController {
     private final TicketQueryService queryService;
     private final TicketReviewService reviewService;
     private final RiskAckService riskAckService;
+    private final TicketExecutionService executionService;
 
     public TicketController(TicketService ticketService, TicketQueryService queryService,
-            TicketReviewService reviewService, RiskAckService riskAckService) {
+            TicketReviewService reviewService, RiskAckService riskAckService,
+            TicketExecutionService executionService) {
         this.ticketService = ticketService;
         this.queryService = queryService;
         this.reviewService = reviewService;
         this.riskAckService = riskAckService;
+        this.executionService = executionService;
     }
 
     /**
@@ -125,6 +129,20 @@ public class TicketController {
     public RiskAckService.AckOutcome acknowledgeRisk(@PathVariable long id) {
         RequestMetadata.Client client = RequestMetadata.current();
         return riskAckService.acknowledgeExecution(CurrentUser.id(), id, client.ip(), client.userAgent());
+    }
+
+    /**
+     * 申请执行一张已审批的工单。
+     *
+     * <p><b>同步部分必须短</b>：这里只做权限、取锁与状态迁移，真正的执行由
+     * {@link com.badc.sql.control.ticket.exec.TicketExecutionService} 在线程池里跑，所以返回 202 而不是
+     * 等执行完再回 200——一次 DDL 可能跑一小时。
+     *
+     * @return 202 + {@code {id, status:"EXECUTING"}}；执行结果异步落到工单状态与语句状态
+     */
+    @PostMapping("/{id}/execute")
+    public ResponseEntity<TicketExecutionService.ExecutionAccepted> execute(@PathVariable long id) {
+        return ResponseEntity.accepted().body(executionService.requestExecution(CurrentUser.id(), id));
     }
 
     /**

@@ -61,6 +61,21 @@ public class ConnAccountService {
         return connConfig(datasourceId, OrgRules.DML_ACCOUNT, "数据源 %d 未配置 dml 账号");
     }
 
+    /**
+     * 读取数据源的 ddl 账号并解密，供控制面内部调用（结构变更语句的执行）。
+     *
+     * <p><b>为什么 DDL 不能借 dml 账号</b>：{@code alter/create/drop} 需要建表、改表权限，dml 账号通常只授
+     * {@code SELECT/INSERT/UPDATE/DELETE}。用错账号的结果是每条 DDL 都在执行时被 MySQL 以 1142 拒绝，
+     * 工单从"结构变更"退化成"每条都失败"。
+     *
+     * <p>与 {@link #dmlConnConfig} 同构：账号缺失是 404（配置问题），不是执行结果。
+     *
+     * <p><b>仅供服务端内部调用</b>，绝不可作为任何 {@code /api/**} 的返回值。
+     */
+    public ConnConfig ddlConnConfig(long datasourceId) {
+        return connConfig(datasourceId, OrgRules.DDL_ACCOUNT, "数据源 %d 未配置 ddl 账号");
+    }
+
     private ConnConfig connConfig(long datasourceId, String accountType, String missingMessageFormat) {
         DataSourceEntity datasource = dataSourceMapper.findById(datasourceId)
                 .orElseThrow(() -> OrgRules.notFound("数据源", datasourceId));

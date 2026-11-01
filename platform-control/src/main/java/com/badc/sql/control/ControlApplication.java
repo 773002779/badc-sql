@@ -1,12 +1,14 @@
 package com.badc.sql.control;
 
 import java.time.Clock;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import com.badc.sql.control.risk.PolicyValidator;
 import com.badc.sql.control.risk.RiskEngine;
@@ -65,5 +67,28 @@ public class ControlApplication {
     @Bean
     public RiskEngine riskEngine(PolicyValidator policyValidator, RiskProperties riskProperties) {
         return new RiskEngine(policyValidator, riskProperties);
+    }
+
+    /**
+     * 工单执行线程池（任务 11）。
+     *
+     * <p>core 2 / max 4 / queue 100，<b>拒绝策略必须是 {@code CallerRunsPolicy}</b>：真正的执行并发上界由
+     * {@code datasource_exec_lock}（单数据源写并发 = 1）决定，池子只是把请求线程从"等执行跑完"里解放出来。
+     * 队列满了就让提交请求的线程自己跑——把任务静默丢掉（{@code AbortPolicy} 的默认行为）会让工单永远停在
+     * {@code EXECUTING}，那是最坏的结果：用户以为在跑，其实没人跑；宁可让这次请求慢一点。
+     *
+     * <p>{@code waitForTasksToCompleteOnShutdown} 打开：优雅停机时正在执行的 DDL 不能被直接掐断——半条
+     * {@code alter} 的后果比停机多等几秒严重得多。
+     */
+    @Bean("ticketExecutor")
+    public ThreadPoolTaskExecutor ticketExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(4);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("ticket-exec-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        return executor;
     }
 }

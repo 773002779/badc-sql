@@ -20,6 +20,8 @@ final class OrgRules {
     static final String READONLY_ACCOUNT = "readonly";
     /** 写语句的 EXPLAIN 与执行都要用 dml 账号：只读账号没有写权限，MySQL 会回 1142。 */
     static final String DML_ACCOUNT = "dml";
+    /** 结构变更语句的执行账号：{@code alter/create/drop} 需要 dml 账号通常没有的权限。 */
+    static final String DDL_ACCOUNT = "ddl";
 
     private static final Set<String> ACCOUNT_TYPES = Set.of("readonly", "dml", "ddl", "onlineddl");
 

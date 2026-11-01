@@ -18,8 +18,11 @@ import org.junit.jupiter.api.Test;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExecAccountType;
+import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
@@ -231,6 +234,16 @@ class DatasourceCapabilityServiceTest {
         @Override
         public ExplainEstimate explain(ConnConfig conn, String sql) {
             throw new UnsupportedOperationException("能力缓存不应做行数估算");
+        }
+
+        @Override
+        public SnapshotResult snapshot(ConnConfig conn, List<String> tables, String relativeRef) {
+            throw new UnsupportedOperationException("能力缓存不应抓取结构快照");
+        }
+
+        @Override
+        public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
+            throw new UnsupportedOperationException("能力缓存不应执行写语句");
         }
     }
 }

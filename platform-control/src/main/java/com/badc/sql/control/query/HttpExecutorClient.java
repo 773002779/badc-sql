@@ -14,8 +14,11 @@ import org.springframework.web.client.ResourceAccessException;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExecAccountType;
+import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
@@ -26,7 +29,8 @@ import com.badc.sql.common.error.ErrorCode;
  * <p>超时设置：连接 2s（执行器在同机房，连不上就是真不可用），读 70s（要大于执行器的 60s 语句超时，
  * 否则控制面先放弃、执行器还在跑）。
  *
- * <p>五个内部调用（query / probe / validate / fingerprint / explain）共用同一套错误还原：非 2xx 一律交给
+ * <p>七个内部调用（query / probe / validate / fingerprint / explain / snapshot / execute）共用同一套错误还原：
+ * 非 2xx 一律交给
  * {@link ExecutorErrors} 把执行器的 {@code {code,message}} 还原成 {@link BizException}，
  * 连不上才是"执行器不可用"。各写一套的结果是同一类故障在不同入口给出不同提示，用户无从判断。
  */
@@ -93,6 +97,31 @@ public class HttpExecutorClient implements ExecutorClient {
     }
 
     /**
+     * 抓取执行前结构快照。
+     *
+     * <p>执行器侧抓取失败会以非 2xx 的 {@code {code,message}} 返回，由 {@link ExecutorErrors} 还原成
+     * {@code BizException} 上抛——控制面据此禁止执行。这里<b>不做任何降级</b>：把失败吞成"没有表"就等于
+     * 允许在无法确认原始结构的库上做结构变更。
+     */
+    @Override
+    public SnapshotResult snapshot(ConnConfig conn, List<String> tables, String relativeRef) {
+        return post("/internal/v1/snapshot", new SnapshotCall(conn, tables, relativeRef), SnapshotResult.class,
+                "执行器返回空的快照结果");
+    }
+
+    /**
+     * 执行一条写语句。
+     *
+     * <p>语句本身失败时执行器仍回 2xx（{@code success=false}），只有入参非法/执行器故障才非 2xx。
+     * 因此这里"空响应体"是故障，而 {@code success=false} 是正常结果——两者不能混为一谈。
+     */
+    @Override
+    public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
+        return post("/internal/v1/execute", new ExecuteCall(conn, sql, type), ExecuteResult.class,
+                "执行器返回空的执行结果");
+    }
+
+    /**
      * 发一个内部调用并把结果映射成 {@code type}。
      *
      * @param emptyResultMessage 执行器 2xx 却没有响应体时的错误消息
@@ -141,5 +170,13 @@ public class HttpExecutorClient implements ExecutorClient {
 
     /** 执行器的 EXPLAIN 入参；执行器只发 {@code explain <sql>}，不会执行原语句。 */
     public record ExplainCall(ConnConfig conn, String sql) {
+    }
+
+    /** 执行器的快照入参；{@code relativeRef} 是落盘相对路径，执行器负责把它解析在快照根目录之内。 */
+    public record SnapshotCall(ConnConfig conn, List<String> tables, String relativeRef) {
+    }
+
+    /** 执行器的写执行入参；{@code accountType} 决定语句超时（DML 300s / DDL 3600s）。 */
+    public record ExecuteCall(ConnConfig conn, String sql, ExecAccountType accountType) {
     }
 }
