@@ -2,7 +2,6 @@ package com.badc.sql.control.ticket;
 
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -18,7 +17,6 @@ import com.badc.sql.common.sql.SqlText;
 import com.badc.sql.control.org.ConnAccountService;
 import com.badc.sql.control.query.ExecutorClient;
 import com.badc.sql.control.risk.Classification;
-import com.badc.sql.control.risk.DdlAction;
 import com.badc.sql.control.risk.Discipline;
 import com.badc.sql.control.risk.PolicyValidator;
 import com.badc.sql.control.risk.RiskAssessment;
@@ -191,18 +189,21 @@ public class TicketRollbackService {
 
         // 风险与指纹都在事务外：与任务 7a 完全同一条路径（DML 用 dml 账号估算、DDL 不估）。
         boolean hasDmlWrite = rollbackStatements.stream()
-                .anyMatch(statement -> isDmlWrite(statement.classification()));
-        ConnConfig dml = hasDmlWrite ? dmlConnOrRefuse(origin.datasourceId()) : null;
+                .anyMatch(statement -> TicketPipelineSupport.isDmlWrite(statement.classification()));
+        ConnConfig dml = hasDmlWrite
+                ? TicketPipelineSupport.dmlConnOrRefuse(connAccountService, origin.datasourceId())
+                : null;
         ConnConfig readonly = connAccountService.readonlyConnConfig(origin.datasourceId());
         // 回滚的基线是"现在"：抓原单这些表的当前指纹。
-        Map<String, String> tableFingerprints = tableFingerprints(readonly, originTables);
+        Map<String, String> tableFingerprints =
+                TicketPipelineSupport.tableFingerprints(executorClient, readonly, originTables);
 
         boolean withinWindow = riskProperties.toWindow().isWithin(clock.instant());
         List<RiskAssessment> assessments = new ArrayList<>(rollbackStatements.size());
         List<RiskLevel> statementLevels = new ArrayList<>(rollbackStatements.size());
         RiskLevel ticketLevel = RiskLevel.L0;
         for (ValidatedStatement statement : rollbackStatements) {
-            ExplainEstimate estimate = estimateFor(statement, readonly, dml);
+            ExplainEstimate estimate = TicketPipelineSupport.estimateFor(executorClient, statement, readonly, dml);
             RiskAssessment assessment = riskEngine.assess(new RiskEngine.RiskRequest(
                     statement.sql(),
                     statement.classification(),
@@ -214,7 +215,8 @@ public class TicketRollbackService {
                     null));
             if (assessment.blocked()) {
                 // 静态校验已拦过 BLOCK；这里兜底，绝不把 BLOCK 语句落成工单。
-                throw new BizException(ErrorCode.INVALID_ARGUMENT, blockMessage(assessment));
+                throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                        TicketPipelineSupport.blockMessage(assessment));
             }
             assessments.add(assessment);
             statementLevels.add(assessment.level());
@@ -301,91 +303,6 @@ public class TicketRollbackService {
                 throw new BizException(ErrorCode.INVALID_ARGUMENT, hit.message());
             }
         }
-    }
-
-    // ------------------------------------------------------------------ 定级与指纹
-
-    /**
-     * 按语句类型选估算账号，DDL 不估——与 {@link TicketService} 提交期的口径完全一致。
-     *
-     * <p>DML 必须用 dml 账号：只读账号对 {@code EXPLAIN UPDATE/INSERT/DELETE} 会被 MySQL 以 1142 拒绝，
-     * 执行器吞成 {@code -1}，回滚单就会被误判成 L3。
-     */
-    private ExplainEstimate estimateFor(ValidatedStatement statement, ConnConfig readonly, ConnConfig dml) {
-        if (statement.classification().ddlAction() != DdlAction.NONE) {
-            return new ExplainEstimate(-1);
-        }
-        ConnConfig conn = statement.classification().writeStatement() ? dml : readonly;
-        ExplainEstimate estimate = executorClient.explain(conn, statement.sql());
-        return estimate == null ? new ExplainEstimate(-1) : estimate;
-    }
-
-    private static boolean isDmlWrite(Classification classification) {
-        return classification.writeStatement() && classification.ddlAction() == DdlAction.NONE;
-    }
-
-    /** 与 {@code TicketService} 相同：dml 账号缺失时给出 400，而不是让每条 DML 静默退化成 L3。 */
-    private ConnConfig dmlConnOrRefuse(long datasourceId) {
-        try {
-            return connAccountService.dmlConnConfig(datasourceId);
-        } catch (BizException e) {
-            if (e.code() == ErrorCode.NOT_FOUND) {
-                throw new BizException(ErrorCode.INVALID_ARGUMENT,
-                        "数据源 " + datasourceId + " 未配置 dml 账号，无法估算影响行数，也就无法定级");
-            }
-            throw e;
-        }
-    }
-
-    /**
-     * 取结构指纹：只为实际存在的表返回值，缺失的表补空串（"前置状态为空"）。
-     *
-     * <p>与 {@code TicketService} 一样严格区分"表不存在"（空串，继续）与"执行器抛异常"（上抛，中止）：
-     * 把故障吞成空 map 会让一次网络故障被记成"所有表都是新建的"，之后执行前的漂移检测就会空转通过。
-     */
-    private Map<String, String> tableFingerprints(ConnConfig conn, List<String> tables) {
-        if (tables.isEmpty()) {
-            return Map.of();
-        }
-        Map<String, String> returned = executorClient.fingerprint(conn, tables);
-        if (returned == null) {
-            throw new BizException(ErrorCode.INTERNAL_ERROR, "执行器未返回结构指纹");
-        }
-        Map<String, String> resolved = new LinkedHashMap<>();
-        for (String table : tables) {
-            String fingerprint = find(returned, table);
-            resolved.put(table, fingerprint == null ? "" : fingerprint);
-        }
-        return resolved;
-    }
-
-    /** 执行器回传的键可能与请求的大小写/限定名不一致，按"精确 → 忽略大小写 → 裸表名"依次找。 */
-    private static String find(Map<String, String> returned, String table) {
-        String value = returned.get(table);
-        if (value != null) {
-            return value;
-        }
-        for (Map.Entry<String, String> entry : returned.entrySet()) {
-            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(table)) {
-                return entry.getValue();
-            }
-        }
-        String bare = TicketSubmitValidator.normalizeTable(table);
-        for (Map.Entry<String, String> entry : returned.entrySet()) {
-            if (bare != null && bare.equalsIgnoreCase(TicketSubmitValidator.normalizeTable(entry.getKey()))) {
-                return entry.getValue();
-            }
-        }
-        return null;
-    }
-
-    private static String blockMessage(RiskAssessment assessment) {
-        for (RiskHit hit : assessment.hits()) {
-            if (hit.discipline() == Discipline.BLOCK) {
-                return hit.message();
-            }
-        }
-        return "回滚语句被禁止提交";
     }
 
     // ------------------------------------------------------------------ 小工具

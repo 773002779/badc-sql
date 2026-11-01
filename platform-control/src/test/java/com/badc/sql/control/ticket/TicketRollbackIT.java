@@ -37,6 +37,10 @@ import com.fasterxml.jackson.databind.JsonNode;
  *
  * <p><b>原单一律用 SQL 直接造 {@code SUCCEEDED}</b>：本任务验证的是"基于原单发起回滚"，不是"把原单跑成功"。
  * 走真实提交+执行会让每个用例多一串无关的审批与异步等待，且失败点会混进任务 11 的编排里。
+ *
+ * <p><b>部署要求（由 {@code an_l3_rollback_initiated_by_the_only_primary_operator_cannot_be_reviewed} 固化）</b>：
+ * 每个系统至少配置 <b>2 名主/备运维</b>。L3 的一级审核只收主/备运维、终审只收组长，且提交人不能审自己的单；
+ * 系统只有 1 名主运维时，他发起的 L3 回滚会永远停在 {@code REVIEWING_L1}，无人可推进一步。
  */
 class TicketRollbackIT extends TicketITBase {
 
@@ -308,6 +312,73 @@ class TicketRollbackIT extends TicketITBase {
         assertThat(status(id)).isEqualTo("APPROVED");
     }
 
+    /**
+     * <b>部署要求</b>：系统只有一名主运维时，他发起的 L3 回滚无人可审——提交人不能审自己的单，而 L3 的一级
+     * 审核只收主/备运维（组长做终审，不做一级）。两条规则各自都对，叠加起来就要求<b>每个系统至少 2 名
+     * 主/备运维</b>，否则该系统的 L3 回滚会永远停在 {@code REVIEWING_L1}。
+     *
+     * <p>本用例把这条产品约束固化成证据：临时移除测试类补的 ops03，只剩 ops02 一名主运维。
+     */
+    @Test
+    void an_l3_rollback_initiated_by_the_only_primary_operator_cannot_be_reviewed() {
+        jdbc.update("delete from sys_system_operator where system_id = 1 and user_id = 6");
+        try {
+            long origin = succeededTicketWithLevel("L3");
+            long id = rollbackOf(origin, "结构性变更回退，需要重建表结构");
+            assertThat(column(id, "risk_level")).isEqualTo("L3");
+
+            // 发起人自审：被"提交人不能审核自己的工单"挡下。
+            ResponseEntity<String> selfReview = approve(OPS02_TOKEN, id);
+            assertThat(selfReview.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(selfReview.getBody()).contains("提交人不能审核自己的工单");
+
+            // 组长也不能顶替 L3 的一级审核：两级按角色分开，否则单组长系统会死锁在二级。
+            ResponseEntity<String> leadAtFirstLevel = approve(LEAD01_TOKEN, id);
+            assertThat(leadAtFirstLevel.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(leadAtFirstLevel.getBody()).contains("L3 工单的一级审核只能由主运维或备运维执行");
+
+            assertThat(status(id)).as("两条 403 叠加的结果：单子一步都走不动").isEqualTo("REVIEWING_L1");
+        } finally {
+            jdbc.update("""
+                    insert into sys_system_operator (system_id, user_id, operator_type)
+                    values (1, 6, 'PRIMARY')
+                    """);
+        }
+    }
+
+    // ------------------------------------------------------------------ 两条路径的口径必须一致
+
+    /**
+     * 提交路径与回滚路径对"同一数据源 + 同一组语句"算出的指纹与整单哈希必须<b>逐字相等</b>。
+     *
+     * <p>这是防分叉的护栏：两条路径各自实现一遍定级/指纹逻辑时，任何一处口径漂移（估算账号、DDL 是否估算、
+     * 快照 JSON 形状、合并顺序）都会让同一组语句得到不同哈希，进而让"执行前风险确认"或"回滚成功"这类跨路径
+     * 比对永远失败。回滚路径的等级还要与"原单等级"取更严——本用例里原单是 L1，两条路径的整单等级相同，
+     * 所以快照 JSON、哈希、指纹都必须完全一致。
+     */
+    @Test
+    void the_submit_path_and_the_rollback_path_compute_the_same_fingerprint_and_hash() {
+        String rollbackSql = "update t_order set a = 0 where id = 1";
+        long origin = succeededTicket("update t_order set a = 1 where id = 1", rollbackSql);
+
+        ResponseEntity<String> submitted = postTicket(DEV_TOKEN,
+                body(rollbackSql, "update t_order set a = 1 where id = 1"));
+        assertThat(submitted.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long normal = idOf(submitted);
+
+        long rollback = rollbackOf(origin, REASON);
+
+        assertThat(column(rollback, "statement_fingerprint"))
+                .as("语句指纹必须与提交路径逐字相等")
+                .isEqualTo(column(normal, "statement_fingerprint"));
+        assertThat(column(rollback, "risk_snapshot_json"))
+                .as("整单风险快照必须逐字相等（否则哈希必然分叉）")
+                .isEqualTo(column(normal, "risk_snapshot_json"));
+        assertThat(column(rollback, "risk_snapshot_hash"))
+                .as("整单哈希必须与提交路径逐字相等")
+                .isEqualTo(column(normal, "risk_snapshot_hash"));
+    }
+
     // ------------------------------------------------------------------ 端到端：执行成功后原单 ROLLED_BACK
 
     @Test
@@ -328,6 +399,36 @@ class TicketRollbackIT extends TicketITBase {
         assertThat(jdbc.queryForList(
                 "select event_type from ticket_event where ticket_id = ? order by id", String.class, origin))
                 .contains("ROLLED_BACK");
+    }
+
+    /**
+     * L3 回滚单也必须能执行成功（C1 的回归用例）。
+     *
+     * <p>提交期整单哈希按 {@code stricter(重算 L1, 原单 L3) = L3} 算；执行期的哈希必须用同一口径，否则
+     * {@code risk_acknowledgement} 里存的 L3 哈希与执行期按 L1 重算的哈希不等，执行会被
+     * {@code RISK_ACK_MISSING} 拦下——工单<b>能审批、却永远执行不了</b>。
+     *
+     * <p>本用例先红后绿：修复 {@code TicketExecutionService} 的哈希等级分量之前，这里必然停在 {@code FAILED}。
+     */
+    @Test
+    void an_l3_rollback_can_be_executed_and_rolls_the_origin_back() {
+        long origin = succeededTicketWithLevel("L3");
+        long id = rollbackOf(origin, "结构性变更回退，需要重建表结构");
+        assertThat(column(id, "risk_level")).as("继承原单等级").isEqualTo("L3");
+
+        assertThat(approve(OPS03_TOKEN, id).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(status(id)).isEqualTo("REVIEWING_L2");
+        assertThat(approve(LEAD01_TOKEN, id).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(status(id)).isEqualTo("APPROVED");
+
+        assertThat(acknowledgeRisk(OPS02_TOKEN, id).getStatusCode()).isEqualTo(HttpStatus.OK);
+        ResponseEntity<String> accepted = requestExecution(OPS02_TOKEN, id);
+        assertThat(accepted.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+
+        assertThat(awaitTerminal(id)).as("L3 回滚单也必须能执行成功").isEqualTo("SUCCEEDED");
+        assertThat(status(origin)).as("执行成功后原单必须变 ROLLED_BACK").isEqualTo("ROLLED_BACK");
+        assertThat(abortReason(id)).as("不允许任何中止事件").isNull();
+        assertThat(stub.executedSql).containsExactly("update t_order set a = 0 where id = 1");
     }
 
     // ------------------------------------------------------------------ 事件与审计
@@ -501,6 +602,14 @@ class TicketRollbackIT extends TicketITBase {
         Integer count = jdbc.queryForObject(
                 "select count(*) from ticket where ticket_type = 'ROLLBACK'", Integer.class);
         return count == null ? 0 : count;
+    }
+
+    /** {@code EXEC_ABORTED} 的明细；没有中止事件时返回 {@code null}。 */
+    private String abortReason(long ticketId) {
+        List<String> details = jdbc.queryForList("""
+                select detail_json from ticket_event where ticket_id = ? and event_type = 'EXEC_ABORTED'
+                """, String.class, ticketId);
+        return details.isEmpty() ? null : details.get(0);
     }
 
     /**

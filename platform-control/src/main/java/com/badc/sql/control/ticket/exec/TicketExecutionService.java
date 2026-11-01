@@ -445,7 +445,16 @@ public class TicketExecutionService {
                 json(resolvedFingerprints(tables, snapshot.tableFingerprints())));
 
         // ---- 闸 5：风险确认，紧贴执行之前。
-        String currentHash = TicketRiskSnapshot.hash(currentLevel, assessments, statements);
+        //
+        // 哈希的等级分量取"重算等级"与"存库等级"中更严者——与提交期（TicketService / TicketRollbackService）
+        // 完全同一口径：提交时整单等级 = max(各条重算等级)，回滚单还会再与原单等级取更严。若这里只用
+        // currentLevel，一张 L3 回滚单（语句重算 L1、存库 L3）会在提交期按 L3 算哈希、执行期按 L1 算哈希，
+        // 两者永不相等 → RISK_ACK_MISSING，工单能审批却永远执行不了。
+        //
+        // 注意：上面的"升档就中止"（currentLevel > committedLevel）仍然只看重算结果，不能用更严者替代——
+        // 那是判"风险是否变高"，不是判"哈希怎么算"。
+        RiskLevel hashLevel = RiskLevel.stricter(currentLevel, committedLevel);
+        String currentHash = TicketRiskSnapshot.hash(hashLevel, assessments, statements);
         try {
             riskAckService.assertExecuteAckCurrent(ticketId, currentHash);
         } catch (BizException e) {
