@@ -1,6 +1,7 @@
 package com.badc.sql.executor.schema;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.SnapshotResult;
+import com.badc.sql.common.error.BizException;
 import com.badc.sql.executor.adapter.mysql.MySqlAdapter;
 import com.badc.sql.executor.exec.ExplainRunner;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -44,6 +46,8 @@ class SchemaSnapshotterIT {
     private static final int PORT = 3306;
     private static final String USER = "root";
     private static final String PASS = "root";
+    /** 受限账号的口令：只在测试库里存在，且用完即删。 */
+    private static final String LIMITED_PASS = "Limited-pass-1";
     /** 每类一个随机 schema（同 {@code AbstractMySqlIT} 的 {@code badc_test_<8位随机>}），并行/残留不会撞。 */
     private static final String SCHEMA =
             "badc_test_snapshot_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
@@ -237,6 +241,109 @@ class SchemaSnapshotterIT {
         assertThat(new ExplainRunner().estimate(conn, "create table t_should_not_exist (id int)")
                 .estimatedRows()).isEqualTo(-1L);
         assertThat(tableExists("t_should_not_exist")).isFalse();
+    }
+
+    /**
+     * 限定到<b>本库</b>的表名等价于裸名：指纹按裸名登记，控制面才能对上它请求的名字。
+     */
+    @Test
+    void a_table_qualified_with_the_current_database_is_accepted_under_its_bare_name() throws Exception {
+        execute("create table t_qual (id bigint primary key)");
+
+        Map<String, String> qualified = snapshotter.fingerprint(conn, List.of(SCHEMA + ".t_qual"));
+
+        assertThat(qualified).containsOnlyKeys("t_qual");
+        assertThat(qualified.get("t_qual"))
+                .isEqualTo(snapshotter.fingerprint(conn, List.of("t_qual")).get("t_qual"));
+    }
+
+    /**
+     * 限定到<b>别的库</b>的表必须以失败告终，不能退化成"这张表不存在"。
+     *
+     * <p>退化的后果有两层：轻则漂移闸把"没有前置结构"当成合法状态静默放行；重则如果本库恰好有同名表，
+     * 指纹会落到那张表上，界面一切正常而核对的是另一张表。两种都不能接受，所以这里连"快照目录没被创建"
+     * 一起断言——失败必须发生在写盘之前，不能留下半个快照。
+     */
+    @Test
+    void a_table_qualified_with_another_database_is_refused_instead_of_looking_absent() throws Exception {
+        String otherSchema = SCHEMA + "_other";
+        try (Connection c = DriverManager.getConnection(MySqlAdapter.url(conn), USER, PASS);
+             Statement s = c.createStatement()) {
+            s.execute("drop database if exists " + otherSchema);
+            s.execute("create database " + otherSchema);
+            s.execute("create table " + otherSchema + ".t_away (id bigint primary key)");
+        }
+        try {
+            String foreign = otherSchema + ".t_away";
+
+            assertThatThrownBy(() -> snapshotter.fingerprint(conn, List.of(foreign)))
+                    .as("跨库表取不到指纹，必须报错而不是返回空 map")
+                    .isInstanceOf(BizException.class)
+                    .hasMessageContaining("另一个库");
+
+            assertThatThrownBy(() -> snapshotter.capture(conn, List.of(foreign), "6/6/6/6"))
+                    .isInstanceOf(BizException.class)
+                    .hasMessageContaining("另一个库");
+            assertThat(tempRoot.resolve("6/6/6/6")).doesNotExist();
+        } finally {
+            try (Connection c = DriverManager.getConnection(MySqlAdapter.url(conn), USER, PASS);
+                 Statement s = c.createStatement()) {
+                s.execute("drop database if exists " + otherSchema);
+            }
+        }
+    }
+
+    /**
+     * 账号没有 {@code TRIGGER} 权限时必须让快照<b>失败</b>。
+     *
+     * <p>MySQL 对缺权限的处理是"静默过滤"：{@code information_schema.triggers} 与 {@code SHOW TRIGGERS}
+     * 都返回空集而不是报错（本机 8.0.16 实测）。所以不主动问授权的话，快照会写下"这张表没有触发器"，
+     * 之后按它重建就会丢触发器——而重建往往发生在事故现场。
+     *
+     * <p>反向那半段（授权后能抓到触发器）不能省：只断言"报错"证明不了报错是因为权限，也可能是因为
+     * 表名写错、连接失败之类的任何原因。
+     */
+    @Test
+    void a_capture_fails_loudly_when_the_account_cannot_see_triggers() throws Exception {
+        execute("create table t_trig (id bigint primary key)");
+        execute("create trigger trg_bi_t_trig before insert on t_trig for each row set @trg_probe = 1");
+
+        String limitedUser = "badc_no_trg_" + SCHEMA.substring("badc_test_snapshot_".length());
+        createLimitedUser(limitedUser, SCHEMA);
+        try {
+            ConnConfig limited = new ConnConfig(HOST, PORT, SCHEMA, limitedUser, LIMITED_PASS, "utf8mb4", "+00:00");
+
+            assertThatThrownBy(() -> snapshotter.capture(limited, List.of("t_trig"), "5/5/5/1"))
+                    .as("看不见触发器时快照必须失败，不能声称这张表没有触发器")
+                    .isInstanceOf(BizException.class)
+                    .hasMessageContaining("TRIGGER");
+
+            grantTrigger(limitedUser, SCHEMA);
+            SnapshotResult afterGrant = snapshotter.capture(limited, List.of("t_trig"), "5/5/5/2");
+
+            assertThat(afterGrant.tableFingerprints()).containsKey("t_trig");
+            assertThat(Files.readString(tempRoot.resolve("5/5/5/2/schema.json")))
+                    .as("有了 TRIGGER 权限才真的读到触发器")
+                    .contains("trg_bi_t_trig");
+        } finally {
+            dropUser(limitedUser);
+        }
+    }
+
+    /** 只给单库读写权限、<b>不给 TRIGGER</b> 的账号——模拟"ddl 账号按最小权限配置"的常见配置。 */
+    private static void createLimitedUser(String user, String schema) throws Exception {
+        execute("drop user if exists '" + user + "'@'%'");
+        execute("create user '" + user + "'@'%' identified by '" + LIMITED_PASS + "'");
+        execute("grant select, insert, update, delete, create, drop, alter, index, references on `"
+                + schema + "`.* to '" + user + "'@'%'");
+    }
+
+    private static void grantTrigger(String user, String schema) throws Exception {
+        execute("grant trigger on `" + schema + "`.* to '" + user + "'@'%'");
+    }
+
+    private static void dropUser(String user) throws Exception {
+        execute("drop user if exists '" + user + "'@'%'");
     }
 
     private static int probeValue(long id) throws Exception {

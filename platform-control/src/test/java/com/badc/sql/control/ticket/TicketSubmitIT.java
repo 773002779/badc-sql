@@ -48,6 +48,26 @@ class TicketSubmitIT extends TicketITBase {
         assertNothingPersisted();
     }
 
+    // ------------------------------------------------------------------ 跨库
+
+    /**
+     * 跨库表引用必须在提交期被拒，而不是等到取指纹时才发现"这张表不存在"。
+     *
+     * <p>这条用例钉的是<b>接线</b>：{@code TicketService.submit} 里那一行
+     * {@code rejectForeignDatabases(...)} 如果漏了，{@code TicketSubmitValidatorCrossDatabaseTest}
+     * 的 8 条单元用例照样全绿（它们直接调方法），只有走完整 submit 路径才会红。
+     */
+    @Test
+    void a_statement_targeting_another_database_is_refused_at_submit() {
+        assertBadRequest(
+                postTicket(DEV_TOKEN, body(
+                        "update other_db.t_order set status = 0 where id = 1",
+                        null,
+                        "update t_order set status = 1 where id = 1")),
+                "另一个库");
+        assertNothingPersisted();
+    }
+
     @Test
     void a_ddl_ticket_without_a_rollback_plan_is_refused() {
         assertBadRequest(

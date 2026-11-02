@@ -37,8 +37,12 @@ import com.badc.sql.control.risk.StatementClassifier;
  * <h2>回滚 SQL 的表名必须命中工单语句</h2>
  * <p>一条 {@code update t_other ...} 的回滚 SQL 挂在一张只改 {@code t_order} 的工单上，执行时会把另一张表
  * 改回去。这里把两边表名按"去反引号 → 取最后一段"归一后比较：{@code `order_db`.`t_order`} 与
- * {@code t_order} 是同一张表；{@code db2.t_order} 也归一成 {@code t_order}（跨库写在风险上是 L3，
- * 这里的归一只是让常见限定名不误报回滚 SQL）。
+ * {@code t_order} 是同一张表。
+ *
+ * <p>但归一<b>不等于</b>允许跨库：{@code other_db.t_order} 归一成 {@code t_order} 之后，取指纹与漂移比对
+ * 用的都是当前库的同名表，等于核对错了对象。所以跨库限定名由
+ * {@link #rejectForeignDatabases(List, String, String) 单独一道闸}拒掉——归一只是为了让同一张表的
+ * 不同写法能对上。
  */
 public final class TicketSubmitValidator {
 
@@ -165,6 +169,64 @@ public final class TicketSubmitValidator {
                                 + "，回滚语句为 " + (table == null ? "（无法识别表名）" : table));
             }
         }
+    }
+
+    /**
+     * 拒绝"指向另一个库"的表引用（工单语句与回滚 SQL 都查）。
+     *
+     * <p><b>为什么这不是可选的额外校验</b>：本类会把限定名归一成裸表名（{@link #normalizeTable}），之后取
+     * 指纹、比对漂移用的都是<b>当前库</b>里的同名表。于是一条 {@code update other_db.t_order ...} 会变成：
+     * <ul>
+     *   <li>当前库没有 {@code t_order} → 被记成"表不存在"，漂移闸把"没有前置结构"当成合法状态
+     *       <b>静默放行</b>；</li>
+     *   <li>当前库恰好有同名表 → 指纹落到<b>那张表</b>上，核对的是另一张表，而界面一切正常。</li>
+     * </ul>
+     * 两种都不能接受，所以跨库写在平台上一律拒绝，要求拆成独立工单在目标库上提交。
+     *
+     * <p>执行器侧还有一道同义的闸（{@code SchemaSnapshotter#resolveTable}），判据是连接<b>实际</b>指向的库，
+     * 更权威；这里提前失败是为了给用户一句能读懂的 400，而不是绕一圈看到"结构快照抓取失败"。
+     *
+     * @param dbName 数据源指向的库名；为空表示配置缺失，此时任何限定名都拒绝（fail-closed）
+     */
+    public static void rejectForeignDatabases(
+            List<ValidatedStatement> statements, String rollbackSql, String dbName) {
+        for (ValidatedStatement statement : statements) {
+            requireSameDatabase(statement.classification().table(), dbName,
+                    "第 " + statement.seq() + " 条语句");
+        }
+        if (isBlank(rollbackSql)) {
+            return;
+        }
+        for (String sql : SqlText.splitStatements(rollbackSql)) {
+            requireSameDatabase(CLASSIFIER.classify(sql).table(), dbName, "回滚 SQL");
+        }
+    }
+
+    private static void requireSameDatabase(String table, String dbName, String what) {
+        String qualifier = qualifierOf(table);
+        if (qualifier == null) {
+            return; // 没写库名前缀：就是当前库
+        }
+        if (dbName == null || dbName.isBlank()) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                    what + "用库名限定了表 " + table + "，但该数据源未配置库名，无法确认它指的就是这个库；"
+                            + "请去掉库名前缀后重试。");
+        }
+        if (!qualifier.equalsIgnoreCase(dbName)) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                    what + "引用了另一个库的表 " + table + "（当前数据源库名 " + dbName + "）。"
+                            + "平台只能对当前库的表做结构快照与漂移比对；跨库写请拆成独立工单在目标库上提交。");
+        }
+    }
+
+    /** 表名里的库限定符；没有限定返回 {@code null}。 */
+    private static String qualifierOf(String table) {
+        if (table == null) {
+            return null;
+        }
+        String cleaned = table.replace("`", "").strip();
+        int dot = cleaned.lastIndexOf('.');
+        return dot <= 0 || dot == cleaned.length() - 1 ? null : cleaned.substring(0, dot);
     }
 
     /**

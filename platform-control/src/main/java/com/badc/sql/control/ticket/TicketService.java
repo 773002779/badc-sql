@@ -96,6 +96,10 @@ public class TicketService {
                 ? TicketPipelineSupport.dmlConnOrRefuse(connAccountService, command.datasourceId())
                 : null;
         ConnConfig readonly = connAccountService.readonlyConnConfig(command.datasourceId());
+        // 跨库表引用必须在<b>取任何指纹之前</b>拒掉：归一成裸名之后，指纹与漂移比对都会落到当前库的同名表上
+        // （或者被当成"表不存在"静默放行），见 TicketSubmitValidator#rejectForeignDatabases。
+        TicketSubmitValidator.rejectForeignDatabases(
+                validated.statements(), command.rollbackSql(), readonly.dbName());
         Map<String, String> tableFingerprints =
                 TicketPipelineSupport.tableFingerprints(executorClient, readonly, validated.targetTables());
 

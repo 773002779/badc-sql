@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
@@ -47,6 +48,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *
  * <p>失败与"表不存在"必须分开：抓取失败（连不上、没权限）抛 {@code BizException}，调用方据此禁止执行；
  * 表不存在只是没抓到前置状态，跳过该表即可，不算失败。
+ *
+ * <p><b>两条"看不见就会静默放行"的红线</b>（都不算"表不存在"）：
+ * <ul>
+ *   <li><b>跨库限定名</b>：{@code other_db.t} 取不到本库的元数据，绝不能当成"表不存在"——否则漂移闸把
+ *       "没有前置结构"当成合法状态，一次跨库写就绕过了整条结构核对。见 {@link #resolveTable}。</li>
+ *   <li><b>没有 TRIGGER 权限</b>：触发器查询会返回空集而不是报错，快照会声称"这张表没有触发器"，
+ *       按它重建就会丢触发器。见 {@link #canSeeAllTriggers}。</li>
+ * </ul>
  */
 @Component
 public class SchemaSnapshotter {
@@ -101,10 +110,19 @@ public class SchemaSnapshotter {
         Map<String, String> fingerprints = new LinkedHashMap<>();
         try (Connection connection = open(conn)) {
             String schemaName = schemaName(connection, conn);
-            for (String table : requestedTables) {
+            // 触发器可见性每单只问一次（一次 SHOW GRANTS），且只在这一单真的要记录触发器时才问。
+            Boolean triggersVisible = null;
+            for (String requested : requestedTables) {
+                String table = resolveTable(schemaName, requested);
                 String createSql = showCreateTable(connection, table);
                 if (createSql == null) {
                     continue;
+                }
+                if (triggersVisible == null) {
+                    triggersVisible = canSeeAllTriggers(connection, schemaName);
+                }
+                if (!triggersVisible) {
+                    throw triggersHidden(schemaName, table);
                 }
                 snapshots.add(readTable(connection, schemaName, table, createSql));
                 fingerprints.put(table, SnapshotPaths.sha256Hex(normalize(createSql)));
@@ -131,7 +149,9 @@ public class SchemaSnapshotter {
         List<String> requestedTables = distinctTables(tables);
         Map<String, String> fingerprints = new LinkedHashMap<>();
         try (Connection connection = open(conn)) {
-            for (String table : requestedTables) {
+            String schemaName = schemaName(connection, conn);
+            for (String requested : requestedTables) {
+                String table = resolveTable(schemaName, requested);
                 String createSql = showCreateTable(connection, table);
                 if (createSql == null) {
                     continue;
@@ -225,6 +245,103 @@ public class SchemaSnapshotter {
         }
         String catalog = connection.getCatalog();
         return catalog == null ? "" : catalog;
+    }
+
+    /**
+     * 把请求里的表名解析成本库里的裸表名。
+     *
+     * <p>限定到<b>本库</b>的名字（{@code order_db.t_order}）等价于裸名，剥掉即可；限定到<b>别的库</b>的
+     * 名字必须拒绝，不能当成"这张表不存在"：
+     * <ul>
+     *   <li>快照与指纹都只按<b>当前连接</b>的 {@code information_schema} 取，跨库表取不到；</li>
+     *   <li>当成"不存在"会让该表拿到空指纹，漂移闸随后把"没有前置结构"当成合法状态<b>静默放行</b>——
+     *       一次跨库写就这样绕过整条结构核对；</li>
+     *   <li>更糟的是如果本库恰好同名表存在，指纹会落到<b>另一张表</b>上，看起来一切正常。</li>
+     * </ul>
+     *
+     * @throws BizException 限定到另一个库
+     */
+    private static String resolveTable(String schemaName, String requested) {
+        String raw = requested == null ? "" : requested.strip();
+        int dot = raw.lastIndexOf('.');
+        if (dot < 0) {
+            // 没有限定符：原样返回（含只去掉"整体被反引号包住"的情况）。
+            // 这里不能无条件剥反引号：表名本身可以含反引号（`t``x`），剥掉就会去找一张不存在的表。
+            return unquote(raw);
+        }
+        String qualifier = unquote(raw.substring(0, dot));
+        String bare = unquote(raw.substring(dot + 1));
+        if (schemaName != null && !schemaName.isBlank() && qualifier.equalsIgnoreCase(schemaName)) {
+            return bare;
+        }
+        throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                "结构快照只能处理当前库（" + schemaName + "）里的表，无法处理另一个库的表："
+                        + requested + "。跨库写请拆成独立工单并在目标库上提交。");
+    }
+
+    /** 去掉"整个标识符被一对反引号包住"的引号；内部的反引号原样保留。 */
+    private static String unquote(String name) {
+        String trimmed = name.strip();
+        if (trimmed.length() >= 2 && trimmed.startsWith("`") && trimmed.endsWith("`")) {
+            return trimmed.substring(1, trimmed.length() - 1).replace("``", "`");
+        }
+        return trimmed;
+    }
+
+    /**
+     * 当前连接对 {@code schemaName} 是否具备 {@code TRIGGER} 权限。
+     *
+     * <p><b>为什么必须问这一句</b>：{@code information_schema.triggers} 与 {@code SHOW TRIGGERS} 都按
+     * TRIGGER 权限<b>静默</b>过滤——没有权限时返回<b>空集</b>而不是报错（8.0.16 实测）。于是
+     * "这张表没有触发器"与"我看不到它的触发器"在结果上完全一样，按快照重建就会<b>悄悄丢触发器</b>。
+     * 这个差别没法从查询结果里看出来，只能从授权里判。
+     *
+     * <p>判据取 {@code SHOW GRANTS FOR CURRENT_USER()}：MySQL 会把 {@code ALL PRIVILEGES} 展开成
+     * 显式列表（8.0 实测），所以"权限列表里出现 {@code TRIGGER}"即可判定，作用域必须是 {@code *.*}
+     * 或当前库。用角色间接授予的权限在这里看不到，会被判成无权限——方向是 fail-closed，可以接受。
+     */
+    private static boolean canSeeAllTriggers(Connection connection, String schemaName) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.setQueryTimeout(SCHEMA_QUERY_TIMEOUT_SECONDS);
+            try (ResultSet rs = statement.executeQuery("show grants for current_user()")) {
+                while (rs.next()) {
+                    if (grantsTriggerOn(rs.getString(1), schemaName)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 一行 {@code SHOW GRANTS} 是否授予了对 {@code schemaName}（或全局）的 {@code TRIGGER}。 */
+    static boolean grantsTriggerOn(String grantLine, String schemaName) {
+        if (grantLine == null) {
+            return false;
+        }
+        String upper = grantLine.toUpperCase(Locale.ROOT);
+        int on = upper.indexOf(" ON ");
+        if (on < 0) {
+            return false; // 例如 GRANT `role`@`%` TO `user`@`%`：授的是角色，不是权限
+        }
+        int to = upper.indexOf(" TO ", on + 4);
+        if (to < 0) {
+            return false;
+        }
+        String privileges = upper.substring(0, on); // "GRANT SELECT, ..., TRIGGER"
+        if (!privileges.contains("TRIGGER") && !privileges.contains("ALL PRIVILEGES")) {
+            return false;
+        }
+        // 作用域从原文取：库名大小写要与连接配置比，不能拿大写副本比。
+        String scope = grantLine.substring(on + 4, to).strip();
+        return "*.*".equals(scope) || ("`" + schemaName + "`.*").equalsIgnoreCase(scope);
+    }
+
+    private static BizException triggersHidden(String schemaName, String table) {
+        return new BizException(ErrorCode.INTERNAL_ERROR,
+                "结构快照抓取失败：执行账号对库 " + schemaName + " 没有 TRIGGER 权限，MySQL 会静默隐藏该库的"
+                        + "触发器（读到空集而不是报错），此时按快照重建表 " + table + " 会丢失触发器。"
+                        + "请为该账号授予 TRIGGER 权限（或改用具备该权限的账号）后重试。");
     }
 
     private static TableSnapshot readTable(
