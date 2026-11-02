@@ -189,6 +189,9 @@ git commit -m "feat(notify): render notifications from a whitelisted fact map, n
 
 **Interfaces:**
 - Consumes: Task 2 的 `Rendered`，Task 3 的 `resolve`，Task 4 的 `ChannelSender`
+**契约（R13，Task 3 落地时确定）**：`NotificationRecipients.resolve` 对 `type == null` 抛
+`IllegalArgumentException`，不会静默落进基线分支。投递器**必须**保证构造 command 时 `type` 非空；
+若从可空列构造事件，会在业务流里抛异常而不是返回空列表——这与"通知绝不拖垮业务"的要求冲突。
 - Produces:
   - `NotificationStore.insert(long recipientId, NotificationEventType type, Long systemId, Long ticketId, Long grantRequestId, NotificationChannel channel, String title, String body)` → `long id`
   - `NotificationStore.markSent(long id, int attempts)`、`markFailed(long id, int attempts, String error)`、`markSkipped(long id, String reason)`
