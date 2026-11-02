@@ -36,7 +36,53 @@ class MigrationIT extends AbstractMySqlIT {
                 "ticket_event",
                 "schema_snapshot",
                 "risk_acknowledgement",
-                "datasource_exec_lock");
+                "datasource_exec_lock",
+                // V4：通知
+                "notification",
+                "notification_switch");
+    }
+
+    @Test
+    void notification_tables_declare_the_column_types_the_mappers_expect() {
+        // 列类型是后续 mapper 与枚举的契约：varchar 太短会静默截断标题/正文，
+        // 时间列若退化成 TIMESTAMP 则在会话时区上二次换算，破坏"时间列一律存 UTC"的约定。
+        assertThat(columnType("notification", "event_type")).isEqualTo("varchar(48)");
+        assertThat(columnType("notification", "channel")).isEqualTo("varchar(16)");
+        assertThat(columnType("notification", "status")).isEqualTo("varchar(16)");
+        assertThat(columnType("notification", "title")).isEqualTo("varchar(200)");
+        assertThat(columnType("notification", "body")).isEqualTo("varchar(2000)");
+        assertThat(columnType("notification", "last_error")).isEqualTo("varchar(500)");
+        assertThat(columnType("notification", "created_at")).isEqualTo("datetime(3)");
+        assertThat(columnType("notification", "sent_at")).isEqualTo("datetime(3)");
+        assertThat(columnType("notification_switch", "event_type")).isEqualTo("varchar(48)");
+        assertThat(columnType("notification_switch", "enabled")).isEqualTo("tinyint(1)");
+        assertThat(columnType("notification_switch", "updated_at")).isEqualTo("datetime(3)");
+
+        // 整数列用 data_type 断言：8.0.16 的 column_type 仍带显示宽度（bigint(20)），
+        // 8.0.17 起去掉了宽度，用 column_type 会让测试卡在特定小版本上。
+        assertThat(dataType("notification", "recipient_id")).isEqualTo("bigint");
+        assertThat(dataType("notification", "attempts")).isEqualTo("int");
+        assertThat(dataType("notification_switch", "system_id")).isEqualTo("bigint");
+    }
+
+    private String columnType(String table, String column) {
+        return jdbc.queryForObject("""
+                select column_type
+                  from information_schema.columns
+                 where table_schema = database()
+                   and table_name = ?
+                   and column_name = ?
+                """, String.class, table, column);
+    }
+
+    private String dataType(String table, String column) {
+        return jdbc.queryForObject("""
+                select data_type
+                  from information_schema.columns
+                 where table_schema = database()
+                   and table_name = ?
+                   and column_name = ?
+                """, String.class, table, column);
     }
 
     @Test
