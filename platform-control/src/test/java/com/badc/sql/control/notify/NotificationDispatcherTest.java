@@ -241,6 +241,53 @@ class NotificationDispatcherTest {
                 .contains("IllegalStateException");
     }
 
+    @Test
+    void a_resolve_failure_never_escapes() {
+        when(recipients.resolve(anyLong(), any(NotificationEventType.class)))
+                .thenThrow(new IllegalStateException("数据库连不上"));
+
+        NotificationDispatcher dispatcher = dispatcher(new InAppSender());
+
+        assertThatCode(() -> dispatcher.dispatch(COMMAND))
+                .as("resolve 是投递的第一步：它炸了也不能回传给已提交的业务事务")
+                .doesNotThrowAnyException();
+        assertThat(store.rows()).as("连收件人都没解析出来，不该有任何通知行").isEmpty();
+    }
+
+    @Test
+    void a_target_load_failure_never_escapes() {
+        givenRecipients(1L);
+        when(targetStore.load(anyList())).thenThrow(new IllegalStateException("sys_user 查询失败"));
+
+        NotificationDispatcher dispatcher = dispatcher(new InAppSender());
+
+        assertThatCode(() -> dispatcher.dispatch(COMMAND))
+                .as("联系方式读取失败同样是「这次没发成」，不是「业务失败」")
+                .doesNotThrowAnyException();
+        assertThat(store.rows()).isEmpty();
+    }
+
+    @Test
+    void a_skipped_reason_is_sanitized_before_it_reaches_last_error() throws Exception {
+        givenRecipients(1L);
+        givenTargets(target(1L, "dev01@badc.test", null));
+
+        ChannelSender sender = mock(ChannelSender.class);
+        when(sender.channel()).thenReturn(NotificationChannel.EMAIL);
+        when(sender.isConfigured()).thenReturn(true);
+        doThrow(new NotificationSkippedException("连接被拒 password='s3cr3t'，跳过邮件渠道"))
+                .when(sender).send(any(NotificationTarget.class), any(), any());
+
+        dispatcher(sender).dispatch(COMMAND);
+
+        Row row = store.rows().get(0);
+        assertThat(row.status).isEqualTo(NotificationStatus.SKIPPED);
+        assertThat(row.lastError)
+                .as("SKIPPED 的原因也进 last_error、也会给研发看，脱敏口径必须和 FAILED 一致")
+                .doesNotContain("s3cr3t")
+                .contains("password=***");
+    }
+
     // ── 夹具 ────────────────────────────────────────────────────────────────
 
     private void givenRecipients(Long... userIds) {

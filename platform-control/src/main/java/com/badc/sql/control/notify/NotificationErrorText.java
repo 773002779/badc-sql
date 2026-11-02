@@ -33,12 +33,17 @@ final class NotificationErrorText {
     /** 整条 JDBC 连接串：协议、主机、端口、库名、查询参数（常含 user/password）一次性抹掉。 */
     private static final Pattern JDBC_URL = Pattern.compile("jdbc:[A-Za-z0-9]+://[^\\s,;\"'）)]*");
 
-    /** 普通 URL 里的 userinfo：{@code //user:pass@host} —— 保留 host（排查要看"连的是谁"），抹掉账号口令。 */
-    private static final Pattern URL_USERINFO = Pattern.compile("//[^\\s/@:'\"]*:[^\\s/@'\"]*@");
+    /** 普通 URL 里的 userinfo：{@code scheme://user:pass@host} 与 {@code scheme://token@host}。
+     * 保留 scheme 与 host（排查要看"连的是谁"），抹掉冒号前的账号与口令 / 只有 token 的形式。
+     * 注意不能要求"必须有冒号"：{@code https://token@host} 没有冒号，但 token 同样是凭证。 */
+    private static final Pattern URL_USERINFO =
+            Pattern.compile("(?i)([a-z][a-z0-9+.\\-]*://)[^\\s/@]+@");
 
-    /** {@code key=value} 形式的凭证：password / pwd / secret / token / 用户名。 */
+    /** {@code key=value} 形式的凭证：password / pwd / secret / token / 用户名 / 主机。
+     * 值两侧可以有单引号、双引号或反引号，引号内允许空格——{@code password='s3 cr3t'} 只抹一半等于没抹。 */
     private static final Pattern NAME_VALUE_SECRET = Pattern.compile(
-            "(?i)\\b(password|passwd|pwd|secret|corpsecret|access_token|token|username|user)\\s*=\\s*[^\\s,;&\"'）)]+");
+            "(?i)\\b(password|passwd|pwd|secret|corpsecret|access_token|token|username|user|host)\\s*=\\s*"
+                    + "(?:\"[^\"]*\"|'[^']*'|`[^`]*`|[^\\s,;&\"'`]+)");
 
     private NotificationErrorText() {
     }
@@ -61,12 +66,23 @@ final class NotificationErrorText {
         if (message == null || message.isBlank()) {
             return simpleName;
         }
-        return simpleName + ": " + redact(message);
+        return simpleName + ": " + sanitizeText(message);
     }
 
-    private static String redact(String message) {
+    /**
+     * 对一段<b>文本</b>做脱敏（不含异常类名前缀），用于异常消息与 {@code SKIPPED} 的跳过原因。
+     *
+     * <p>跳过原因不走异常？它同样会落进 {@code last_error}、同样会展示给研发，所以同样要抹。
+     *
+     * @param message 原文；{@code null} 返回 {@code null}
+     * @return 单行、脱敏后的文本
+     */
+    static String sanitizeText(String message) {
+        if (message == null) {
+            return null;
+        }
         String redacted = JDBC_URL.matcher(message).replaceAll("jdbc:***");
-        redacted = URL_USERINFO.matcher(redacted).replaceAll("//***@");
+        redacted = URL_USERINFO.matcher(redacted).replaceAll("$1***@");
         redacted = NAME_VALUE_SECRET.matcher(redacted).replaceAll("$1=***");
         return redacted.replaceAll("\\s+", " ").strip();
     }

@@ -234,7 +234,8 @@ public class NotificationDispatcher {
 
     private void markSkipped(long id, String reason) {
         try {
-            store.markSkipped(id, reason);
+            // 跳过原因同样落 last_error、同样给研发看：与 FAILED 用同一套脱敏与截断。
+            store.markSkipped(id, truncateText(reason));
         } catch (Exception e) {
             log.warn("通知 {} 回写 SKIPPED 失败：{}", id, NotificationErrorText.sanitize(e));
         }
@@ -244,6 +245,12 @@ public class NotificationDispatcher {
     private static String truncateError(Throwable error) {
         return NotificationErrorText.truncate(
                 NotificationErrorText.sanitize(error), NotificationErrorText.DISPATCHER_MAX_CHARS);
+    }
+
+    /** 纯文本（SKIPPED 的原因）→ 同一套脱敏与上限。 */
+    private static String truncateText(String text) {
+        return NotificationErrorText.truncate(
+                NotificationErrorText.sanitizeText(text), NotificationErrorText.DISPATCHER_MAX_CHARS);
     }
 
     private static String channelOf(ChannelSender sender) {
