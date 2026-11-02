@@ -1,6 +1,7 @@
 package com.badc.sql.executor.exec;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -12,15 +13,23 @@ import org.junit.jupiter.api.Test;
 
 import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.ExplainEstimate;
+import com.badc.sql.common.error.BizException;
 import com.badc.sql.executor.adapter.mysql.MySqlAdapter;
 
 /**
- * 真实 MySQL 上的估算权限测试：<b>只授 SELECT 的账号能 EXPLAIN SELECT，但 EXPLAIN UPDATE 会被
- * MySQL 以 1142（command denied）拒绝</b>，{@link ExplainRunner} 必须把它转成 {@code -1}。
+ * 真实 MySQL 上的估算权限与故障口径。
  *
- * <p>这是任务 7a 评审 C1 的根因用例：控制面若用只读账号估算 DML，1142 会被吞成 {@code -1}，
- * 风险引擎再把负估算判 L3，于是每张 DML 工单都变成 L3——L1/L2 分档在真实环境里从未生效。
- * 本用例把"只读账号估不了写语句"钉在真实库上，防止将来有人把异常改成 0 或抛出去。
+ * <p>两条口径必须分开，否则控制面分不清"估不出来"和"探测不了这个库"：
+ * <ul>
+ *   <li><b>权限不足是故障</b>：只授 SELECT 的账号能 EXPLAIN SELECT，但 EXPLAIN UPDATE 会被 MySQL 以
+ *       1142（command denied）拒绝——{@link ExplainRunner} 必须抛 {@code BizException}
+ *       （与 {@code ExecutorClient#explain}、{@code ExplainEstimate} 的契约一致）。</li>
+ *   <li><b>语句本身不合法不是故障</b>：语法错仍是"估不出来"，返回 {@code -1}，由调用方按最严分档。</li>
+ * </ul>
+ *
+ * <p>历史教训：任务 7a 评审 C1 曾把 1142 吞成 {@code -1}，于是每张走只读账号估算的 DML 工单都被判 L3；
+ * 但"吞掉"只是把故障藏起来，并不是它的正确口径——正确解法是<b>用 dml 账号估 DML</b>（提交期如此），
+ * 权限真的不足时如实抛错。
  *
  * <p>需要 root 建临时用户；用完删掉，不污染本机 MySQL。
  */
@@ -70,13 +79,43 @@ class ExplainRunnerIT {
         assertThat(estimate.estimatedRows()).isGreaterThanOrEqualTo(0);
     }
 
-    /** 只读账号 EXPLAIN 写语句 → 1142 → 必须返回 -1（"估不出来"），而不是 0 或异常。 */
+    /**
+     * 只读账号 EXPLAIN 写语句 → 1142 → 必须抛 {@code BizException}（权限不足是故障），
+     * 而不是静默给出 {@code -1}。
+     */
     @Test
-    void a_read_only_account_cannot_explain_a_write_and_gets_minus_one() {
-        ExplainEstimate estimate = runner.estimate(readOnlyConn(),
-                "update t_order set status = 1 where id = 1");
+    void a_read_only_account_explaining_a_write_fails_loudly() {
+        assertThatThrownBy(() -> runner.estimate(readOnlyConn(),
+                "update t_order set status = 1 where id = 1"))
+                .isInstanceOf(BizException.class)
+                .satisfies(e -> assertThat(e.getMessage())
+                        .contains("1142")
+                        .doesNotContain(READONLY_USER));
+    }
 
-        assertThat(estimate).isEqualTo(new ExplainEstimate(-1));
+    /** 语法错不是故障：仍是"估不出来"（{@code -1}），由调用方按最严分档。 */
+    @Test
+    void a_syntax_error_is_still_an_unknown_estimate() {
+        assertThat(runner.estimate(readOnlyConn(), "select * from"))
+                .isEqualTo(new ExplainEstimate(-1));
+    }
+
+    /** 表单不存在同样是"估不出来"，不能因为 1146 就抛。 */
+    @Test
+    void a_missing_table_is_still_an_unknown_estimate() {
+        assertThat(runner.estimate(readOnlyConn(), "select * from no_such_table"))
+                .isEqualTo(new ExplainEstimate(-1));
+    }
+
+    /** 库不可达（端口 1 上没有 MySQL）→ 08xxx → 抛"数据源不可达"，不能吞成 {@code -1}。 */
+    @Test
+    void an_unreachable_database_fails_loudly_instead_of_estimating_zero() {
+        ConnConfig unreachable = new ConnConfig(
+                HOST, 1, SCHEMA, READONLY_USER, READONLY_PASS, "utf8mb4", "+00:00");
+
+        assertThatThrownBy(() -> runner.estimate(unreachable, "select * from t_order"))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("数据源不可达");
     }
 
     private static ConnConfig readOnlyConn() {

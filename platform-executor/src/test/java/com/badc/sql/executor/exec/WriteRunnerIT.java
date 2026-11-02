@@ -5,10 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -23,12 +20,14 @@ import com.badc.sql.executor.adapter.mysql.MySqlAdapter;
  * 真实 MySQL 上的写执行：沿用执行器既有风格（见 {@code QueryRunnerIT}），纯 JUnit、不起 Spring 上下文、
  * 固定 {@code badc_test_writerunner} schema、裸 JDBC。
  *
+ * <p>只放<b>必须连库</b>的用例：验证"语句真的被执行了、真的按条提交了"。URL 拼装、socket 超时数学、
+ * 错误消息脱敏这些纯函数用例在 {@link WriteRunnerTest} 里——它们不需要 MySQL，无库 CI 也必须跑。
+ *
  * <p>要钉住的是几件容易做错的事：
  * <ul>
  *   <li>语句失败必须<b>回结构化结果</b>而不是抛——抛出去控制面就只剩一个笼统的 FAILED；</li>
- *   <li>每条语句<b>独立提交</b>：前一条成功、后一条失败，前一条不能跟着回滚；</li>
- *   <li>错误消息<b>脱敏</b>：{@code '账号'@'主机'} 不能流到调用方；</li>
- *   <li>socket 读超时<b>不短于</b>语句超时（查询路径的 30 秒用在写路径上会误报"数据源不可达"）。</li>
+ *   <li>前一条成功、后一条失败时，<b>前一条不能跟着消失</b>——这是"部分失败"的来源；</li>
+ *   <li>DDL 真的建出了表（不能只看 {@code success}）。</li>
  * </ul>
  */
 class WriteRunnerIT {
@@ -38,8 +37,6 @@ class WriteRunnerIT {
     private static final String USER = "root";
     private static final String PASS = "root";
     private static final String SCHEMA = "badc_test_writerunner";
-
-    private static final Pattern SOCKET_TIMEOUT = Pattern.compile("[?&]socketTimeout=(\\d+)");
 
     private final WriteRunner runner = new WriteRunner();
 
@@ -104,9 +101,17 @@ class WriteRunnerIT {
         assertThat(queryLong("select count(*) from t_ddl")).isZero();
     }
 
-    /** 每条语句独立提交：前一条成功、后一条失败，前一条不能跟着回滚——这正是"部分失败"的来源。 */
+    /**
+     * 前一条成功、后一条失败时，前一条<b>不能跟着消失</b>——这正是"部分失败"的来源，工单必须如实记录
+     * "哪几条已经生效"。
+     *
+     * <p><b>这个用例证明的是"已生效的不被抹掉"，不是"事务边界"。</b>每次 {@link WriteRunner#run} 都新开
+     * 连接，"前一条跟着回滚"在结构上不可能发生——所以原来的名字 {@code each_statement_is_its_own_transaction}
+     * 是恒真的（把实现改成"包事务"它照样绿）。名字已让给本条用例，这里只保留能真正验证的部分：
+     * 第一条落库、第二条失败、第一条仍在。
+     */
     @Test
-    void each_statement_is_its_own_transaction() throws Exception {
+    void an_earlier_statement_keeps_its_effect_when_a_later_one_fails() throws Exception {
         execute("create table t_independent (id int)");
 
         ExecuteResult inserted = runner.run(conn, "insert into t_independent values (1)", ExecAccountType.DML);
@@ -115,68 +120,6 @@ class WriteRunnerIT {
         assertThat(inserted.success()).isTrue();
         assertThat(failed.success()).isFalse();
         assertThat(queryLong("select count(*) from t_independent")).isEqualTo(1);
-    }
-
-    /**
-     * 28000 的 access denied 原文带着 {@code '账号'@'主机'}，不能进响应体。
-     *
-     * <p>纯函数用例：这里不验"库怎么拒绝"，只验"拒绝消息怎么进 {@link ExecuteResult}"。
-     */
-    @Test
-    void an_access_denied_message_never_carries_the_account_or_host() {
-        ExecuteResult r = WriteRunner.failure(
-                new SQLException("Access denied for user 'root'@'127.0.0.1' (using password: YES)", "28000", 1045),
-                7);
-
-        assertThat(r.success()).isFalse();
-        assertThat(r.affectedRows()).isZero();
-        assertThat(r.elapsedMs()).isEqualTo(7);
-        assertThat(r.errorCode()).isEqualTo("28000");
-        assertThat(r.errorMessage())
-                .contains("'***'@'***'")
-                .doesNotContain("root")
-                .doesNotContain("127.0.0.1");
-    }
-
-    /**
-     * socket 读超时必须 ≥ 语句超时。
-     *
-     * <p>不真跑一条 5 分钟的语句来验证（那要多花 5 分钟且依赖时序），直接断言写路径拼出来的 URL。
-     * 查询路径的 {@code socketTimeout=30000} 照搬到写路径时，本用例会红。
-     */
-    @Test
-    void the_write_url_never_lets_the_socket_time_out_before_the_statement() {
-        String dmlUrl = WriteRunner.url(conn, ExecAccountType.DML);
-        String ddlUrl = WriteRunner.url(conn, ExecAccountType.DDL);
-
-        assertThat(socketTimeoutOf(dmlUrl))
-                .as("DML 语句超时 300s，socket 读超时不能短于它：%s", dmlUrl)
-                .isGreaterThanOrEqualTo(300 * 1000);
-        assertThat(socketTimeoutOf(ddlUrl))
-                .as("DDL 语句超时 3600s，socket 读超时不能短于它：%s", ddlUrl)
-                .isGreaterThanOrEqualTo(3600 * 1000);
-        assertThat(ddlUrl).doesNotContain("socketTimeout=30000");
-    }
-
-    /** 只覆盖 socketTimeout，其余连接参数必须与查询路径一致（尤其是会话时区 UTC）。 */
-    @Test
-    void the_write_url_keeps_the_query_path_connection_parameters() {
-        String url = WriteRunner.url(conn, ExecAccountType.DDL);
-
-        assertThat(url)
-                .startsWith("jdbc:mysql://" + HOST + ":" + PORT + "/" + SCHEMA)
-                .contains("connectionTimeZone=UTC")
-                .contains("forceConnectionTimeZoneToSession=true")
-                .contains("connectTimeout=3000")
-                .contains("useSSL=false")
-                .contains("allowPublicKeyRetrieval=true");
-    }
-
-    /** 语句超时按账号类型选：写 300 秒、DDL 3600 秒（全局约束）。 */
-    @Test
-    void the_statement_timeout_follows_the_account_type() {
-        assertThat(WriteRunner.timeoutSeconds(ExecAccountType.DML)).isEqualTo(300);
-        assertThat(WriteRunner.timeoutSeconds(ExecAccountType.DDL)).isEqualTo(3600);
     }
 
     private static void execute(String sql) throws Exception {
@@ -193,11 +136,5 @@ class WriteRunnerIT {
             assertThat(rs.next()).as("标量查询必须有结果行：%s", sql).isTrue();
             return rs.getLong(1);
         }
-    }
-
-    private static int socketTimeoutOf(String url) {
-        Matcher matcher = SOCKET_TIMEOUT.matcher(url);
-        assertThat(matcher.find()).as("URL 里必须带 socketTimeout：%s", url).isTrue();
-        return Integer.parseInt(matcher.group(1));
     }
 }

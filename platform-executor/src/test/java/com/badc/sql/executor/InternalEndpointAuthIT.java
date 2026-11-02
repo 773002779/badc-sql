@@ -94,13 +94,34 @@ class InternalEndpointAuthIT {
         assertThat(json.readTree(response.getBody()).path("code").asText()).isEqualTo("INVALID_ARGUMENT");
     }
 
+    /**
+     * 矩阵参数不能绕过闸门。
+     *
+     * <p>{@code InternalAuthFilterTest} 用 {@code standaloneSetup} 钉住了过滤器本身；这里在真实容器 + 真实
+     * 分发器上再钉一次：Tomcat 保留 {@code ;x=1}，分发器却按剥掉后的 {@code /internal/v1/fingerprint} 路由，
+     * 只看原始 URI 的闸门会放行这条<b>无令牌</b>的请求。
+     */
+    @Test
+    void a_matrix_parameter_does_not_bypass_the_gate() throws Exception {
+        ResponseEntity<String> response = rest.exchange(
+                "/internal;x=1/v1/fingerprint", HttpMethod.POST,
+                new HttpEntity<>(BODY_WITH_UNREACHABLE_DB, jsonHeaders(null)), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(json.readTree(response.getBody()).path("code").asText()).isEqualTo("UNAUTHORIZED");
+    }
+
     private ResponseEntity<String> post(String body, String token) {
+        return rest.exchange(
+                FINGERPRINT_PATH, HttpMethod.POST, new HttpEntity<>(body, jsonHeaders(token)), String.class);
+    }
+
+    private static HttpHeaders jsonHeaders(String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         if (token != null) {
             headers.set(TOKEN_HEADER, token);
         }
-        return rest.exchange(
-                FINGERPRINT_PATH, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        return headers;
     }
 }

@@ -52,4 +52,45 @@ class SqlErrorMessagesTest {
                 .doesNotContain("bob")
                 .doesNotContain("db.internal");
     }
+
+    /**
+     * 1130 是另一种形态：{@code Host 'x' is not allowed to connect ...}。
+     *
+     * <p>这里没有 {@code '账号'@'主机'} 的形态，只掩前一种正则会漏掉主机名；改动前这条用例是红的。
+     */
+    @Test
+    void a_host_not_allowed_message_loses_the_host() {
+        String sanitized = SqlErrorMessages.sanitize(
+                "Host '10.1.2.3' is not allowed to connect to this MySQL server");
+
+        assertThat(sanitized).isEqualTo("Host '***' is not allowed to connect to this MySQL server");
+    }
+
+    /** 驱动层的"找不到驱动"消息里带着完整连接串（含 host:port，甚至 user 参数）。 */
+    @Test
+    void a_driver_message_loses_the_connection_string() {
+        String sanitized = SqlErrorMessages.sanitize(
+                "No suitable driver found for jdbc:mysql://10.1.2.3:3306/order_db?user=root&password=secret");
+
+        assertThat(sanitized)
+                .isEqualTo("No suitable driver found for jdbc:mysql://***")
+                .doesNotContain("10.1.2.3")
+                .doesNotContain("order_db")
+                .doesNotContain("secret");
+    }
+
+    /** 两种形态同时出现时都要掩掉，且不能互相"吃掉"。 */
+    @Test
+    void a_message_carrying_several_forms_of_connection_info_is_fully_masked() {
+        String sanitized = SqlErrorMessages.sanitize(
+                "Host 'db.internal' is not allowed; Access denied for user 'ro'@'db.internal'; "
+                        + "url=jdbc:mysql://db.internal:3306/order_db");
+
+        assertThat(sanitized)
+                .doesNotContain("db.internal")
+                .doesNotContain("order_db")
+                .contains("Host '***'")
+                .contains("'***'@'***'")
+                .contains("jdbc:mysql://***");
+    }
 }

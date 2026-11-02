@@ -74,6 +74,30 @@ class InternalAuthFilterTest {
                 .andExpect(content().json("{\"code\":\"UNAUTHORIZED\",\"message\":\"内部令牌校验失败\"}"));
     }
 
+    /**
+     * 矩阵参数（{@code ;x=1}）不能把请求从闸门外送进控制器。
+     *
+     * <p>Spring MVC（Boot 3.2，{@code PathPatternParser}）按<b>剥掉 {@code ;} 参数后的 lookup path</b> 路由，
+     * 而 {@code getRequestURI()} 原样带着 {@code ;x=1}。只看原始 URI 的闸门会放行一个分发器仍认作
+     * {@code /internal/v1/validate} 的请求——等于知道端口就能无令牌调用内部端点。
+     */
+    @Test
+    void a_matrix_parameter_cannot_smuggle_a_request_past_the_gate() throws Exception {
+        mockMvc(TOKEN).perform(post("/internal;x=1/v1/validate")
+                        .contentType(APPLICATION_JSON).content(REQUEST_BODY))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+    }
+
+    /** 含 {@code ;} 的请求一律拒：不猜它想打哪个端点，也就不给"路径参数 + 正确令牌"留开口。 */
+    @Test
+    void a_request_with_a_path_parameter_is_rejected_even_with_the_right_token() throws Exception {
+        mockMvc(TOKEN).perform(post("/internal;x=1/v1/validate").header(TOKEN_HEADER, TOKEN)
+                        .contentType(APPLICATION_JSON).content(REQUEST_BODY))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+    }
+
     /** 只拦 {@code /internal/**}：健康检查之类的路径不能被令牌挡住。 */
     @Test
     void only_internal_paths_are_gated() {
@@ -81,6 +105,18 @@ class InternalAuthFilterTest {
 
         assertThat(filter.shouldNotFilter(new MockHttpServletRequest("POST", "/actuator/health"))).isTrue();
         assertThat(filter.shouldNotFilter(new MockHttpServletRequest("POST", VALIDATE_PATH))).isFalse();
+    }
+
+    /**
+     * 设了 {@code server.servlet.context-path} 时 {@code getRequestURI()} 整体带前缀，
+     * 只看原始 URI 的闸门会对<b>所有</b>内部接口 fail-open。
+     */
+    @Test
+    void a_context_path_does_not_open_the_gate() {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/exec/internal/v1/validate");
+        request.setContextPath("/exec");
+
+        assertThat(new InternalAuthFilter(TOKEN).shouldNotFilter(request)).isFalse();
     }
 
     private static MockMvc mockMvc(String configuredToken) {

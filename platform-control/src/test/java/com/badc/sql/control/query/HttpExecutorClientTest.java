@@ -20,7 +20,10 @@ import org.junit.jupiter.api.Test;
 import com.badc.sql.common.DbVersion;
 import com.badc.sql.common.dto.Capability;
 import com.badc.sql.common.dto.ConnConfig;
+import com.badc.sql.common.dto.ExecAccountType;
+import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
+import com.badc.sql.common.dto.RawResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
@@ -51,6 +54,9 @@ class HttpExecutorClientTest {
 
     private static final ConnConfig ONLINE_DDL_CONN = new ConnConfig(
             "10.1.2.3", 3306, "order_db", "onlineddl_user", "onlineddl-pass", "utf8mb4", "+00:00");
+
+    private static final ConnConfig DML_CONN = new ConnConfig(
+            "10.1.2.3", 3306, "order_db", "dml_user", "dml-pass", "utf8mb4", "+00:00");
 
     private HttpServer server;
     private HttpExecutorClient client;
@@ -297,6 +303,99 @@ class HttpExecutorClientTest {
         assertThatThrownBy(() -> client.explain(READONLY_CONN, "update t set a = 1 where id = 1"))
                 .isInstanceOf(BizException.class)
                 .satisfies(e -> assertThat(((BizException) e).getMessage()).contains("42000"));
+    }
+
+    /**
+     * 写执行的接错点：路径、请求体字段、返回值解析。
+     *
+     * <p>这条最贵：路径写错是 404，而控制面在异步线程里同步等这个响应，超时就会把一条<b>仍在执行</b>的
+     * 语句记成失败并提前释放写锁（见 {@link HttpExecutorClient} 类注释）。
+     */
+    @Test
+    void execute_posts_to_the_execute_endpoint_and_parses_the_result() throws Exception {
+        reply.set(new Reply(200, """
+                {"success":true,"affectedRows":2,"elapsedMs":15,"errorCode":null,"errorMessage":null}
+                """));
+
+        ExecuteResult result = client.execute(
+                DML_CONN, "update t_order set status = 1 where id = 1", ExecAccountType.DML);
+
+        assertThat(lastMethod.get()).isEqualTo("POST");
+        assertThat(lastPath.get()).isEqualTo("/internal/v1/execute");
+        JsonNode sent = MAPPER.readTree(lastBody.get());
+        assertThat(sent.path("sql").asText()).isEqualTo("update t_order set status = 1 where id = 1");
+        assertThat(sent.path("accountType").asText()).isEqualTo("DML");
+        assertThat(sent.path("conn").path("username").asText()).isEqualTo("dml_user");
+
+        assertThat(result.success()).isTrue();
+        assertThat(result.affectedRows()).isEqualTo(2);
+        assertThat(result.errorMessage()).isNull();
+    }
+
+    /**
+     * {@code success=false} 是 2xx 的正常结果（语句失败），不是传输故障：必须原样解析，不能吞成异常。
+     * 控制面靠它逐条记录"哪条失败、为什么"。
+     */
+    @Test
+    void execute_parses_a_statement_failure_as_a_result_instead_of_throwing() {
+        reply.set(new Reply(200, """
+                {"success":false,"affectedRows":0,"elapsedMs":3,
+                 "errorCode":"42S02","errorMessage":"Table 'order_db.no_such_table' doesn't exist"}
+                """));
+
+        ExecuteResult result = client.execute(
+                DML_CONN, "update no_such_table set a = 1", ExecAccountType.DML);
+
+        assertThat(result.success()).isFalse();
+        assertThat(result.errorCode()).isEqualTo("42S02");
+        assertThat(result.errorMessage()).contains("no_such_table");
+    }
+
+    /**
+     * 写执行的读超时必须<b>严格大于</b>执行器允许的最长语句超时（DDL 3600s）。
+     *
+     * <p>相等或更短都会让控制面先放弃：它记 FAILED 并释放写锁，执行器那边语句还在跑、最后真的提交，
+     * 于是"单数据源写并发 = 1"被打破，而用户看到的是"失败但可能已生效"。
+     *
+     * <p>用常量本身断言，不真跑一小时：3600 是执行器 {@code WriteRunner.DDL_TIMEOUT_SECONDS} 的约定值
+     * （控制面不依赖执行器模块，只能写下这个数字并与它同步）。
+     */
+    @Test
+    void the_execute_read_timeout_is_longer_than_the_executor_ddl_timeout() {
+        assertThat(HttpExecutorClient.EXECUTE_READ_TIMEOUT_SECONDS)
+                .as("执行器 DDL 最长 3600s，控制面的读超时必须更大")
+                .isGreaterThan(3600);
+    }
+
+    /** 其余六个内部调用仍是 70s：它们背后的语句限时 60s 以内，没有理由挂一小时。 */
+    @Test
+    void only_the_execute_call_gets_the_long_read_timeout() {
+        assertThat(HttpExecutorClient.readTimeoutSecondsFor(HttpExecutorClient.EXECUTE_URI))
+                .isEqualTo(HttpExecutorClient.EXECUTE_READ_TIMEOUT_SECONDS);
+        assertThat(HttpExecutorClient.readTimeoutSecondsFor("/internal/v1/query"))
+                .isEqualTo(HttpExecutorClient.DEFAULT_READ_TIMEOUT_SECONDS)
+                .isEqualTo(70);
+        assertThat(HttpExecutorClient.readTimeoutSecondsFor("/internal/v1/explain"))
+                .isEqualTo(70);
+        assertThat(HttpExecutorClient.readTimeoutSecondsFor("/internal/v1/snapshot"))
+                .isEqualTo(70);
+    }
+
+    /** 查询路径不受 C2 改动影响：路径、请求体、返回值都与原来一致。 */
+    @Test
+    void query_still_posts_to_the_query_endpoint_with_its_original_shape() throws Exception {
+        reply.set(new Reply(200, """
+                {"columns":[{"name":"id","type":"BIGINT"}],"rows":[[1]],"truncated":false,"elapsedMs":2}
+                """));
+
+        RawResult result = client.query(READONLY_CONN, "select id from t_order", 100);
+
+        assertThat(lastPath.get()).isEqualTo("/internal/v1/query");
+        JsonNode sent = MAPPER.readTree(lastBody.get());
+        assertThat(sent.path("sql").asText()).isEqualTo("select id from t_order");
+        assertThat(sent.path("maxRows").asInt()).isEqualTo(100);
+        assertThat(result.rows()).hasSize(1);
+        assertThat(result.columns()).hasSize(1);
     }
 
     private void handle(HttpExchange exchange) throws IOException {

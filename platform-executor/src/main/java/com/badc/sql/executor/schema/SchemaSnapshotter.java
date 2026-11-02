@@ -58,8 +58,15 @@ public class SchemaSnapshotter {
     private static final int TABLE_NOT_FOUND = 1146;
     private static final String MISSING_TABLE_SQL_STATE = "42S02";
 
-    /** {@code SHOW CREATE TABLE} 里的自增计数：随插入增长，不属于结构（见 {@link #normalize}）。 */
-    private static final Pattern AUTO_INCREMENT_COUNTER = Pattern.compile("(ENGINE=\\S+) AUTO_INCREMENT=\\d+");
+    /**
+     * 表选项尾部的自增计数，形如 {@code ) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=...}。
+     *
+     * <p>必须<b>锚到表选项尾部</b>（{@code )} + {@code ENGINE=...}），并且靠贪婪前綴只命中<b>最后一处</b>：
+     * 列上的 {@code COMMENT '... ENGINE=InnoDB AUTO_INCREMENT=9 ...'} 是用户写的字面文本，
+     * 剥它就是"注释里的一段文字改了结构指纹"——既污染哈希，又制造假漂移（真实计数还留在指纹里）。
+     */
+    private static final Pattern AUTO_INCREMENT_COUNTER =
+            Pattern.compile("(?s)(.*\\)\\s*ENGINE=\\S+) AUTO_INCREMENT=\\d+");
 
     private static final int SCHEMA_QUERY_TIMEOUT_SECONDS = 30;
 
@@ -147,7 +154,9 @@ public class SchemaSnapshotter {
      *
      * <p>{@code AUTO_INCREMENT=N} 属于数据侧状态而不是结构：正常写入的业务表在"提交 → 审批 → 执行"之间
      * 几乎必然插入过数据，若把它算进指纹，好工单会被误判成"结构已漂移"。这里按
-     * {@code ENGINE=<engine> AUTO_INCREMENT=<n>} 的固定形态剔除，只去掉数字与它前面的空格。
+     * <b>表选项尾部</b>的 {@code ) ENGINE=<engine> AUTO_INCREMENT=<n>} 形态剔除（只去数字与它前面的空格），
+     * 而不是剥全 DDL 第一处 {@code ENGINE=... AUTO_INCREMENT=...}——后者会先命中列 COMMENT 里的字面文本，
+     * 把注释改掉、真计数留在指纹里。
      */
     static String normalize(String createSql) {
         String unified = AUTO_INCREMENT_COUNTER.matcher(

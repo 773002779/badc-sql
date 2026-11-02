@@ -7,6 +7,11 @@ package com.badc.sql.common.dto;
  * 执行器对 {@code SQLException} 一律转成本记录而不抛，控制面才能逐条记录"哪条失败、为什么"；
  * 一旦抛出去，整单只剩一个笼统的 FAILED，排障与部分失败的判定都无从谈起。
  *
+ * <p><b>但 {@code success=false} 不代表语句没有生效</b>：{@code autoCommit=true} 下 {@code executeUpdate}
+ * 返回即已提交，连接关闭阶段的异常（socket 断开、事务提交失败）也会落到失败分支；控制面还可能因为
+ * 读超时而先放弃一条仍在执行的语句。调用方必须按"结果未知"处理——不能据此断言"未执行"、不能据此
+ * 认为可以安全重放，也不能据此提前释放写锁。
+ *
  * <p>字段语义：
  * <ul>
  *   <li>{@code affectedRows}：{@code executeUpdate} 的返回值。DDL 返回 0 是正常的，不是"没生效"；</li>
@@ -14,7 +19,8 @@ package com.badc.sql.common.dto;
  *   <li>{@code errorCode}：驱动给的 {@code SQLState}，<b>可能为 {@code null}</b>（驱动未提供时）；
  *       成功时为 {@code null}；</li>
  *   <li>{@code errorMessage}：数据库返回的消息，<b>已脱敏</b>（{@code '账号'@'主机'} 掩成
- *       {@code '***'@'***'}），绝不含连接串、账号或密码；成功时为 {@code null}。</li>
+ *       {@code '***'@'***'}，{@code Host '…'} 与 {@code jdbc:mysql://…} 同样掩掉），绝不含连接串、
+ *       账号或密码；连接类失败（{@code 08xxx}）不回显驱动原文；成功时为 {@code null}。</li>
  * </ul>
  */
 public record ExecuteResult(

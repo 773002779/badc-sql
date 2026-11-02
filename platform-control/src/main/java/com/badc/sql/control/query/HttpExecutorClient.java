@@ -26,8 +26,18 @@ import com.badc.sql.common.error.ErrorCode;
 /**
  * 通过 HTTP 调执行器（控制面 / 执行器分离）。
  *
- * <p>超时设置：连接 2s（执行器在同机房，连不上就是真不可用），读 70s（要大于执行器的 60s 语句超时，
- * 否则控制面先放弃、执行器还在跑）。
+ * <p>超时设置：连接 2s（执行器在同机房，连不上就是真不可用）；读超时分两档，见下。
+ *
+ * <p><b>写执行必须用独立的长读超时。</b>执行器对 {@code /internal/v1/execute} 允许 DML 300s / DDL 3600s，
+ * 而 {@code TicketExecutionService} 是在异步线程里<b>同步</b>等这个响应。如果它和其余调用共用 70s：
+ * <ul>
+ *   <li>控制面在 70s 抛 {@code ResourceAccessException}、把工单记成 FAILED（"结果可能已生效"）并置终态；</li>
+ *   <li>执行器线程不会因为客户端断开而中止，语句继续跑到 300s/3600s <b>并真的提交</b>；</li>
+ *   <li>{@code finally} 在 70s 就 {@code lock.release}——"单数据源写并发 = 1"当场被打破，下一条写语句
+ *       与这条仍在跑的语句并发执行。</li>
+ * </ul>
+ * 所以 {@code /internal/v1/execute} 单独用一个读超时为 {@link #EXECUTE_READ_TIMEOUT_SECONDS} 的 client，
+ * 其余六个内部调用继续用 70s（它们背后的查询/元数据语句限时 60s 以内，70s 足够）。
  *
  * <p>七个内部调用（query / probe / validate / fingerprint / explain / snapshot / execute）共用同一套错误还原：
  * 非 2xx 一律交给
@@ -42,19 +52,59 @@ public class HttpExecutorClient implements ExecutorClient {
     /** 与执行器 {@code InternalAuthFilter} 约定的内部令牌头。 */
     private static final String INTERNAL_TOKEN_HEADER = "X-Badc-Internal-Token";
 
+    /** 写执行端点：唯一需要长读超时的内部调用。 */
+    static final String EXECUTE_URI = "/internal/v1/execute";
+
+    /**
+     * 其余内部调用的读超时（秒）：要大于执行器 60s 的只读语句超时，否则控制面先放弃、执行器还在跑。
+     */
+    static final int DEFAULT_READ_TIMEOUT_SECONDS = 70;
+
+    /**
+     * 写执行的读超时（秒）：执行器最长允许 <b>DDL 3600s</b>，读超时必须比它更大，否则控制面先放弃、
+     * 执行器还在跑（并且真的提交），同时写锁被提前释放，单数据源写并发 = 1 失效。
+     *
+     * <p>取 3700 = 3600 + 100s 余量：多出的部分覆盖执行器侧建连、抓快照与本条语句的收尾，确保"控制面先
+     * 超时"永远不会发生在"执行器还在跑"之前。调大执行器的 DDL 超时时，这里必须跟着调大。
+     */
+    static final int EXECUTE_READ_TIMEOUT_SECONDS = 3_700;
+
+    /** 普通内部调用（查询、元数据、EXPLAIN、快照……）的 client。 */
     private final RestClient client;
+
+    /** 写执行专用 client：只有读超时不同。 */
+    private final RestClient executeClient;
 
     public HttpExecutorClient(
             @Value("${badcsql.executor.base-url:http://127.0.0.1:8081}") String baseUrl,
             @Value("${badcsql.executor.internal-token:${BADCSQL_INTERNAL_TOKEN:}}") String internalToken) {
+        this.client = buildClient(baseUrl, internalToken, DEFAULT_READ_TIMEOUT_SECONDS);
+        this.executeClient = buildClient(baseUrl, internalToken, EXECUTE_READ_TIMEOUT_SECONDS);
+    }
+
+    private static RestClient buildClient(String baseUrl, String internalToken, int readTimeoutSeconds) {
         JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
-        factory.setReadTimeout(Duration.ofSeconds(70));
-        this.client = RestClient.builder()
+        factory.setReadTimeout(Duration.ofSeconds(readTimeoutSeconds));
+        return RestClient.builder()
                 .baseUrl(baseUrl)
                 .defaultHeader(INTERNAL_TOKEN_HEADER, internalToken)
                 .requestFactory(factory)
                 .build();
     }
+
+    /**
+     * 该内部调用使用的读超时（秒）。
+     *
+     * <p>包级可见：单测要直接断言"写执行走长超时、其余仍走 70s"，而不是靠真跑一小时去观察。
+     */
+    static int readTimeoutSecondsFor(String uri) {
+        return EXECUTE_URI.equals(uri) ? EXECUTE_READ_TIMEOUT_SECONDS : DEFAULT_READ_TIMEOUT_SECONDS;
+    }
+
+    private RestClient clientFor(String uri) {
+        return EXECUTE_URI.equals(uri) ? executeClient : client;
+    }
+
 
     @Override
     public RawResult query(ConnConfig conn, String sql, int maxRows) {
@@ -114,10 +164,13 @@ public class HttpExecutorClient implements ExecutorClient {
      *
      * <p>语句本身失败时执行器仍回 2xx（{@code success=false}），只有入参非法/执行器故障才非 2xx。
      * 因此这里"空响应体"是故障，而 {@code success=false} 是正常结果——两者不能混为一谈。
+     *
+     * <p>这条调用走 {@link #EXECUTE_READ_TIMEOUT_SECONDS} 的长读超时 client：执行器的语句超时是
+     * DML 300s / DDL 3600s，用其余调用的 70s 会让控制面先于执行器放弃（见类注释）。
      */
     @Override
     public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
-        return post("/internal/v1/execute", new ExecuteCall(conn, sql, type), ExecuteResult.class,
+        return post(EXECUTE_URI, new ExecuteCall(conn, sql, type), ExecuteResult.class,
                 "执行器返回空的执行结果");
     }
 
@@ -129,7 +182,7 @@ public class HttpExecutorClient implements ExecutorClient {
     private <T> T post(String uri, Object body, Class<T> type, String emptyResultMessage) {
         T result;
         try {
-            result = client.post()
+            result = clientFor(uri).post()
                     .uri(uri)
                     .body(body)
                     .<T>exchange((request, response) -> {

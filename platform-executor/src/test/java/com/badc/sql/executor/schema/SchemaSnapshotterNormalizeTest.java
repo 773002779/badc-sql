@@ -90,6 +90,39 @@ class SchemaSnapshotterNormalizeTest {
         assertThat(fingerprint(added)).isNotEqualTo(fingerprint(CANONICAL));
     }
 
+    /**
+     * I2 回归（decoy）：列 COMMENT 里恰好写着 {@code ENGINE=InnoDB AUTO_INCREMENT=9}。
+     *
+     * <p>若按"全 DDL 第一处 {@code ENGINE=... AUTO_INCREMENT=...}"剥离，剥掉的是<b>注释里的那段文字</b>：
+     * 注释被改写、真正的尾部计数残留 → 指纹被污染，且改注释里的数字会改变指纹（假漂移），
+     * 改真实计数反而不影响。剥离必须锚到表选项尾部。
+     */
+    @Test
+    void a_comment_that_looks_like_table_options_is_never_stripped() {
+        String decoy = """
+                CREATE TABLE `t_decoy` (
+                  `id` bigint NOT NULL AUTO_INCREMENT,
+                  `remark` varchar(64) DEFAULT NULL COMMENT 'tuned ENGINE=InnoDB AUTO_INCREMENT=9 for load test',
+                  PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4""";
+
+        String normalized = SchemaSnapshotter.normalize(decoy);
+
+        assertThat(normalized)
+                .as("注释里的字面文本必须原样保留")
+                .contains("COMMENT 'tuned ENGINE=InnoDB AUTO_INCREMENT=9 for load test'");
+        assertThat(normalized)
+                .as("被剥掉的是表选项尾部的真计数")
+                .doesNotContain(") ENGINE=InnoDB AUTO_INCREMENT=3")
+                .contains(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        // 真计数变化不影响指纹；注释里的数字变化当然影响（它是结构的一部分）。
+        assertThat(fingerprint(decoy.replace("AUTO_INCREMENT=3 ", "AUTO_INCREMENT=999 ")))
+                .isEqualTo(fingerprint(decoy));
+        assertThat(fingerprint(decoy.replace("AUTO_INCREMENT=9 ", "AUTO_INCREMENT=42 ")))
+                .isNotEqualTo(fingerprint(decoy));
+    }
+
     private static String fingerprint(String createSql) {
         return SnapshotPaths.sha256Hex(SchemaSnapshotter.normalize(createSql));
     }
