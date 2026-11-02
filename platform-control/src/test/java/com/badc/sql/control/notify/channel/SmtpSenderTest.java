@@ -1,7 +1,6 @@
 package com.badc.sql.control.notify.channel;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -14,6 +13,7 @@ import org.springframework.mail.javamail.JavaMailSender;
 
 import com.badc.sql.control.notify.NotificationChannel;
 import com.badc.sql.control.notify.NotificationProperties;
+import com.badc.sql.control.notify.NotificationSkippedException;
 import com.badc.sql.control.notify.NotificationTarget;
 
 /**
@@ -23,8 +23,9 @@ import com.badc.sql.control.notify.NotificationTarget;
  * <ol>
  *   <li>{@code enabled=false} 时 {@code isConfigured()} 为 false，且一次 SMTP 都不碰；</li>
  *   <li>开启时恰好发一封，收件人是 {@code target.email()}，from 取配置；</li>
- *   <li>{@code target.email()} 为空/null 时<b>跳过而不是抛异常</b>——"某人没填邮箱"是正常状态，
- *       不能让它变成"这个人的整条通知投递失败"，更不能中断其他收件人。</li>
+ *   <li>{@code target.email()} 为空/null 时抛 {@link NotificationSkippedException}（R18）——"某人没填邮箱"
+ *       是正常状态，不能算失败；但<b>必须显式报给投递器</b>，否则 {@code void send} 的静默返回会被记成
+ *       {@code SENT}，通知没发出去却显示成功。</li>
  * </ol>
  */
 class SmtpSenderTest {
@@ -63,11 +64,17 @@ class SmtpSenderTest {
     }
 
     @Test
-    void a_target_without_an_email_is_skipped_instead_of_failing() {
+    void a_target_without_an_email_is_skipped_and_reported_to_the_dispatcher() {
         SmtpSender sender = sender(true);
 
-        assertThatCode(() -> sender.send(target(null), TITLE, BODY)).doesNotThrowAnyException();
-        assertThatCode(() -> sender.send(target("   "), TITLE, BODY)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> sender.send(target(null), TITLE, BODY))
+                .as("R18：静默 return 会被投递器记成 SENT——通知没发出去却记成功")
+                .isInstanceOf(NotificationSkippedException.class)
+                .hasMessageContaining("邮箱");
+        assertThatThrownBy(() -> sender.send(target("   "), TITLE, BODY))
+                .as("空白邮箱与 null 同义：都是「没填」")
+                .isInstanceOf(NotificationSkippedException.class)
+                .hasMessageContaining("邮箱");
 
         verifyNoInteractions(mailSender);
     }

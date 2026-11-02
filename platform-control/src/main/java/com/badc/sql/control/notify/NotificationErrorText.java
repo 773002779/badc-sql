@@ -1,0 +1,97 @@
+package com.badc.sql.control.notify;
+
+import java.util.regex.Pattern;
+
+/**
+ * 异常消息 → {@code notification.last_error} 的安全文本：先去敏，再截断。
+ *
+ * <p><b>为什么不能直接写异常消息</b>：{@code last_error} 是给运维看的，会出现在列表、报表、导出里。
+ * 而投递失败最典型的异常来自 SMTP / 企微 / JDBC 客户端，消息里经常整段带着
+ * {@code jdbc:mysql://user:pass@host:3306/db?user=root&password=...}。一旦落库，等于把数据库口令
+ * 抄进了"人人可查"的通知记录——这是本类存在的唯一理由。
+ *
+ * <p><b>为什么是"最小实现"而不是复用执行器模块的 {@code SqlErrorMessages.sanitize}</b>：
+ * 控制面不能依赖执行器（平台分层），而且那边处理的是 SQL 语法错误（列名、表名），
+ * 口径完全不同。这里只做三件事：抹掉连接串、抹掉 URL 里的账号口令、抹掉 {@code key=value} 形式的凭证。
+ * 宁可多抹（消息少一点信息），也不要漏一段口令。
+ *
+ * <p><b>还有一道截断</b>：{@code last_error} 是 {@code VARCHAR(500)}。投递器先把消息压到
+ * {@link #DISPATCHER_MAX_CHARS}（给类名前缀和后续口径变化留余量），{@link JdbcNotificationStore}
+ * 落库前再按 {@link #COLUMN_MAX_CHARS} 兜一次——两层都在，是因为任何一层被绕过都不该让整行写不进去。
+ */
+final class NotificationErrorText {
+
+    /** 投递器写进 {@code last_error} 的上限；远小于列宽 500，留出余量。 */
+    static final int DISPATCHER_MAX_CHARS = 200;
+
+    /** {@code notification.last_error VARCHAR(500)}，按字符（码点）计。 */
+    static final int COLUMN_MAX_CHARS = 500;
+
+    /** 截断标记；计入长度上限。 */
+    private static final String ELLIPSIS = "…";
+
+    /** 整条 JDBC 连接串：协议、主机、端口、库名、查询参数（常含 user/password）一次性抹掉。 */
+    private static final Pattern JDBC_URL = Pattern.compile("jdbc:[A-Za-z0-9]+://[^\\s,;\"'）)]*");
+
+    /** 普通 URL 里的 userinfo：{@code //user:pass@host} —— 保留 host（排查要看"连的是谁"），抹掉账号口令。 */
+    private static final Pattern URL_USERINFO = Pattern.compile("//[^\\s/@:'\"]*:[^\\s/@'\"]*@");
+
+    /** {@code key=value} 形式的凭证：password / pwd / secret / token / 用户名。 */
+    private static final Pattern NAME_VALUE_SECRET = Pattern.compile(
+            "(?i)\\b(password|passwd|pwd|secret|corpsecret|access_token|token|username|user)\\s*=\\s*[^\\s,;&\"'）)]+");
+
+    private NotificationErrorText() {
+    }
+
+    /**
+     * 把异常转成"一行、脱敏、可入库"的文本。
+     *
+     * <p>只取异常类名 + 顶层消息（不展开 cause 与堆栈）：{@code last_error} 只回答"为什么失败"，
+     * 排查细节在应用日志里。换行被压成空格，避免把多行消息截断后只剩半句噪音。
+     *
+     * @param error 异常；{@code null} 返回 {@code null}
+     * @return 形如 {@code IllegalStateException: 邮件发送失败 jdbc:***}；消息为空时只有类名
+     */
+    static String sanitize(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        String message = error.getMessage();
+        String simpleName = error.getClass().getSimpleName();
+        if (message == null || message.isBlank()) {
+            return simpleName;
+        }
+        return simpleName + ": " + redact(message);
+    }
+
+    private static String redact(String message) {
+        String redacted = JDBC_URL.matcher(message).replaceAll("jdbc:***");
+        redacted = URL_USERINFO.matcher(redacted).replaceAll("//***@");
+        redacted = NAME_VALUE_SECRET.matcher(redacted).replaceAll("$1=***");
+        return redacted.replaceAll("\\s+", " ").strip();
+    }
+
+    /**
+     * 截断到 {@code maxChars} 个码点以内，截断时以 {@code …} 收尾（省略号计入上限）。
+     *
+     * <p>按码点而非常量 {@code String#length()}：补充平面字符（emoji）在 Java 里占两个 {@code char}、
+     * 在 MySQL {@code utf8mb4} 里算一个字符，按 char 切会留下半个代理对。
+     *
+     * @param text     原文；{@code null} 返回 {@code null}
+     * @param maxChars 上限（码点数）；{@code <= 0} 返回空串
+     * @return 不超过 {@code maxChars} 个码点的文本
+     */
+    static String truncate(String text, int maxChars) {
+        if (text == null) {
+            return null;
+        }
+        if (maxChars <= 0) {
+            return "";
+        }
+        if (text.codePointCount(0, text.length()) <= maxChars) {
+            return text;
+        }
+        int end = text.offsetByCodePoints(0, maxChars - 1);
+        return text.substring(0, end) + ELLIPSIS;
+    }
+}

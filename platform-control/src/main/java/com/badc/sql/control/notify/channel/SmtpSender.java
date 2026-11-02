@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 
 import com.badc.sql.control.notify.NotificationChannel;
 import com.badc.sql.control.notify.NotificationProperties;
+import com.badc.sql.control.notify.NotificationSkippedException;
 import com.badc.sql.control.notify.NotificationTarget;
 
 /**
@@ -22,8 +23,11 @@ import com.badc.sql.control.notify.NotificationTarget;
  * "开启了却没有 JavaMailSender"，在 {@code send} 时抛出带配置提示的异常，由投递器记
  * {@code FAILED} + {@code last_error}，而不是启动期炸掉整个控制面。
  *
- * <p><b>没填邮箱的人必须被跳过而不是报错</b>：{@code target.email()} 为 {@code null} 或空白时直接返回。
- * 一个运维没填邮箱是正常状态，不能让他的这一条通知变成 {@code FAILED}——更不能影响其他收件人。
+ * <p><b>没填邮箱的人必须被跳过而不是报错，但必须显式告诉投递器</b>：{@code target.email()} 为 {@code null}
+ * 或空白时抛 {@link NotificationSkippedException}（R18）。一个运维没填邮箱是正常状态，不能让他的这一条
+ * 通知变成 {@code FAILED}，更不能影响其他收件人；但{@code send} 的返回类型是 {@code void}，
+ * 静默 {@code return} 会被投递器记成 {@code SENT}——<b>邮件没发出去，数据库里却记着成功</b>。
+ * 抛这个异常让投递器把该行记成 {@code SKIPPED} 并留下跳过原因。
  */
 @Component
 public class SmtpSender implements ChannelSender {
@@ -53,7 +57,7 @@ public class SmtpSender implements ChannelSender {
         }
         String email = target.email();
         if (email == null || email.isBlank()) {
-            return;
+            throw new NotificationSkippedException("收件人未填写邮箱，跳过邮件渠道");
         }
         if (mailSender == null) {
             throw new IllegalStateException(

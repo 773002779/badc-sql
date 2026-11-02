@@ -1,7 +1,6 @@
 package com.badc.sql.control.notify.channel;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
@@ -21,6 +20,7 @@ import org.junit.jupiter.api.Test;
 
 import com.badc.sql.control.notify.NotificationChannel;
 import com.badc.sql.control.notify.NotificationProperties;
+import com.badc.sql.control.notify.NotificationSkippedException;
 import com.badc.sql.control.notify.NotificationTarget;
 
 /**
@@ -33,8 +33,9 @@ import com.badc.sql.control.notify.NotificationTarget;
  *       再 {@code /cgi-bin/message/send} 发文本消息，请求体带 {@code touser}；</li>
  *   <li>{@code errcode != 0} 必须抛异常，且消息里带企微给的 {@code errmsg}——
  *       否则运维只能看到"发送失败"，看不到"为什么"；</li>
- *   <li>收件人没有企微 userid 时<b>跳过</b>：一个没配企微的运维不能让别人也发不出去，
- *       更不能拿 {@code null} 去请求企微。</li>
+ *   <li>收件人没有企微 userid 时<b>抛 {@link NotificationSkippedException}</b>（R18）：一个没配企微的运维
+ *       不能让别人也发不出去，更不能拿 {@code null} 去请求企微；但"跳过"必须显式报给投递器，
+ *       否则 {@code void send} 的静默返回会被记成 {@code SENT}。</li>
  * </ol>
  *
  * <p>base url 通过 {@code badcsql.notify.wecom.base-url} 指向本机桩，生产默认是企微官方地址。
@@ -124,10 +125,13 @@ class WeComSenderTest {
     }
 
     @Test
-    void a_target_without_a_wecom_userid_is_skipped_without_calling_the_api() {
+    void a_target_without_a_wecom_userid_is_skipped_and_reported_to_the_dispatcher() {
         WeComSender sender = sender(true);
 
-        assertThatCode(() -> sender.send(target(null), TITLE, BODY)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> sender.send(target(null), TITLE, BODY))
+                .as("R18：静默 return 会被投递器记成 SENT；必须抛 NotificationSkippedException")
+                .isInstanceOf(NotificationSkippedException.class)
+                .hasMessageContaining("企微");
 
         assertThat(tokenRequests.get()).as("没有企微 userid 时连 token 都不该取").isZero();
         assertThat(messageRequests.get()).isZero();

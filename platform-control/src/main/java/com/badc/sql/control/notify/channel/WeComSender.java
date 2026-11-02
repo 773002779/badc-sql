@@ -18,6 +18,7 @@ import org.springframework.stereotype.Component;
 
 import com.badc.sql.control.notify.NotificationChannel;
 import com.badc.sql.control.notify.NotificationProperties;
+import com.badc.sql.control.notify.NotificationSkippedException;
 import com.badc.sql.control.notify.NotificationTarget;
 
 /**
@@ -43,7 +44,9 @@ import com.badc.sql.control.notify.NotificationTarget;
  * 时间可被测试控制，且与平台其它时间口径一致。
  *
  * <p>收件人没有企微 userid 时<b>直接跳过，连 token 都不取</b>——没配企微的人不该让整批投递多打一次
- * 外部请求，更不该拿 {@code null} 去请求企微。
+ * 外部请求，更不该拿 {@code null} 去请求企微。跳过以 {@link NotificationSkippedException} 表达（R18）：
+ * {@code send} 返回 {@code void}，静默 {@code return} 会被投递器记成 {@code SENT}，明明没发出去却记成功。
+ * 抛出后由投递器把该行记 {@code SKIPPED}，不算失败、不消耗重试。
  */
 @Component
 public class WeComSender implements ChannelSender {
@@ -86,7 +89,7 @@ public class WeComSender implements ChannelSender {
         }
         String wecomUserId = target.wecomUserId();
         if (wecomUserId == null || wecomUserId.isBlank()) {
-            return;
+            throw new NotificationSkippedException("收件人未填写企微 userid，跳过企微渠道");
         }
 
         String accessToken = accessToken();

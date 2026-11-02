@@ -17,8 +17,10 @@ import com.badc.sql.control.notify.NotificationTarget;
  *
  * <p>{@code send} 的契约：
  * <ul>
- *   <li>实现必须自己判空联系方式（{@code target.email()} / {@code target.wecomUserId()}）并<b>静默跳过</b>，
- *       不能因为"某人没填邮箱"就抛异常；</li>
+ *   <li>实现必须自己判空联系方式（{@code target.email()} / {@code target.wecomUserId()}）：
+ *       缺失时抛 {@code NotificationSkippedException}（R18），<b>不能静默 return</b>——
+ *       {@code void send} 的静默返回在投递器眼里与"发送成功"无法区分，会把该行记成 {@code SENT}，
+ *       通知没发出去却记成功。也不要把"跳过"做成失败异常：那会消耗重试并留下 FAILED 行；</li>
  *   <li>未配置（{@code isConfigured() == false}）却被直接调用属于调用方 bug，实现应响亮地失败
  *       （{@code IllegalStateException}），而不是静默吞掉；</li>
  *   <li>{@code title} / {@code body} 是渲染好的快照，sender 不再改写内容。</li>
@@ -35,9 +37,12 @@ public interface ChannelSender {
     /**
      * 投递一条通知。
      *
-     * @param target 收件人（联系方式可能为 {@code null}，实现自行跳过）
+     * @param target 收件人（联系方式可能为 {@code null}，实现自行判空并抛
+     *               {@link com.badc.sql.control.notify.NotificationSkippedException}）
      * @param title  标题快照
      * @param body   正文快照
+     * @throws com.badc.sql.control.notify.NotificationSkippedException 收件人缺少本渠道的联系方式，
+     *         投递器据此记 {@code SKIPPED}（终态，不重试）
      * @throws Exception 渠道侧失败；由投递器记录 {@code last_error} 并重试
      */
     void send(NotificationTarget target, String title, String body) throws Exception;
