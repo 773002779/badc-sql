@@ -3,6 +3,8 @@ package com.badc.sql.control.notify;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.List;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -80,12 +82,15 @@ class NotificationRecipientsIT extends AbstractMySqlIT {
     void a_lead_is_notified_for_l3_only() {
         insertOperator(LEAD, "lead01", "OPS_LEAD", "组长一号", "LEAD");
 
-        assertThat(recipients.resolve(SYSTEM, NotificationEventType.TICKET_SUBMITTED))
+        List<Long> baseline = recipients.resolve(SYSTEM, NotificationEventType.TICKET_SUBMITTED);
+        assertThat(baseline)
                 .as("普通事件不该打扰组长：基线只取 PRIMARY / BACKUP")
                 .doesNotContain(LEAD);
+
         assertThat(recipients.resolve(SYSTEM, NotificationEventType.TICKET_L3_PENDING_LEAD))
-                .as("L3 待终审必须通知组长")
-                .contains(LEAD);
+                .as("L3 是「追加组长」：主/备运维必须仍在收件人里，只剩组长就是漏通知")
+                .contains(PRIMARY_OPS, LEAD)
+                .containsAll(baseline);
     }
 
     @Test
