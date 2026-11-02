@@ -30,20 +30,36 @@ final class NotificationErrorText {
     /** 截断标记；计入长度上限。 */
     private static final String ELLIPSIS = "…";
 
-    /** 整条 JDBC 连接串：协议、主机、端口、库名、查询参数（常含 user/password）一次性抹掉。 */
-    private static final Pattern JDBC_URL = Pattern.compile("jdbc:[A-Za-z0-9]+://[^\\s,;\"'）)]*");
+    /**
+     * 整条 JDBC 连接串：协议、主机、端口、库名、查询参数（常含 user/password）一次性抹掉。
+     *
+     * <p>子协议长度限死 {@code {0,31}}：没有上界的 {@code [A-Za-z0-9]+} 在"jdbc:" 后面接一段长字母数字、
+     * 却始终不出现 {@code ://} 的输入上，会从每个起点向后回溯，退化成 O(n²)。这里只是一层保险，
+     * {@link #sanitizeText} 另外还有 {@code indexOf("jdbc:")} 的门控。
+     */
+    private static final Pattern JDBC_URL = Pattern.compile("jdbc:[A-Za-z0-9+._\\-]{0,31}://[^\\s,;\"'）)]*");
 
-    /** 普通 URL 里的 userinfo：{@code scheme://user:pass@host} 与 {@code scheme://token@host}。
-     * 保留 scheme 与 host（排查要看"连的是谁"），抹掉冒号前的账号与口令 / 只有 token 的形式。
-     * 注意不能要求"必须有冒号"：{@code https://token@host} 没有冒号，但 token 同样是凭证。 */
-    private static final Pattern URL_USERINFO =
-            Pattern.compile("(?i)([a-z][a-z0-9+.\\-]*://)[^\\s/@]+@");
+    /**
+     * URL 里的 userinfo：{@code scheme://user:pass@host}、{@code scheme://token@host}
+     * （没有冒号也是凭证）、协议相对写法 {@code //user:pass@host}、以及任意自定义 scheme。
+     *
+     * <p><b>为什么必须以字面 {@code //} 开头，而不是 {@code (scheme://)}</b>：后者以字符类开头、
+     * 量词没有上界，对一段长字母数字串（不含 {@code ://}）会在每个起点回溯整段 → O(n²)。实测 40KB 要
+     * 5.5 秒（见 §8）。而 {@code sanitizeText} 吃的是<b>异常原文</b>，MySQL 的错误消息会把 SQL 片段带回来，
+     * SQL 长度由研发提交的语句决定——那就是一个可被低成本触发的 CPU 耗尽面（投递器在异步线程池里）。
+     *
+     * <p>以字面 {@code //} 开头同时解决了覆盖面：scheme 前面是什么根本不重要（保留原样），
+     * 从 {@code //} 到 {@code @} 之间的整段 userinfo 才是要抹掉的部分。邮箱之类的裸 {@code @}
+     * 没有 {@code //} 前缀，不会被误伤。
+     */
+    private static final Pattern URL_USERINFO = Pattern.compile("(?i)//[^\\s/@]+@");
 
     /** {@code key=value} 形式的凭证：password / pwd / secret / token / 用户名 / 主机。
-     * 值两侧可以有单引号、双引号或反引号，引号内允许空格——{@code password='s3 cr3t'} 只抹一半等于没抹。 */
+     * 值两侧可以有单引号、双引号或反引号，引号内允许空格——{@code password='s3 cr3t'} 只抹一半等于没抹。
+     * 收尾引号是可选的：{@code password='s3cr3t}（引号没闭合）照样是口令，不能因为"配对失败"整段放过。 */
     private static final Pattern NAME_VALUE_SECRET = Pattern.compile(
             "(?i)\\b(password|passwd|pwd|secret|corpsecret|access_token|token|username|user|host)\\s*=\\s*"
-                    + "(?:\"[^\"]*\"|'[^']*'|`[^`]*`|[^\\s,;&\"'`]+)");
+                    + "(?:\"[^\"]*\"?|'[^']*'?|`[^`]*`?|[^\\s,;&\"'`]+)");
 
     private NotificationErrorText() {
     }
@@ -81,8 +97,15 @@ final class NotificationErrorText {
         if (message == null) {
             return null;
         }
-        String redacted = JDBC_URL.matcher(message).replaceAll("jdbc:***");
-        redacted = URL_USERINFO.matcher(redacted).replaceAll("$1***@");
+        // 先门控再匹配：两条 URL 正则都以字面量开头，字符串里根本没有那个字面量时就不必进正则引擎。
+        // 这同时把"长 SQL 片段"这类输入的代价压到一次 indexOf（线性）上。
+        String redacted = message;
+        if (redacted.indexOf("jdbc:") >= 0) {
+            redacted = JDBC_URL.matcher(redacted).replaceAll("jdbc:***");
+        }
+        if (redacted.indexOf("//") >= 0) {
+            redacted = URL_USERINFO.matcher(redacted).replaceAll("//***@");
+        }
         redacted = NAME_VALUE_SECRET.matcher(redacted).replaceAll("$1=***");
         return redacted.replaceAll("\\s+", " ").strip();
     }

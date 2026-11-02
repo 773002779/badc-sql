@@ -110,9 +110,86 @@ class NotificationErrorTextTest {
     }
 
     @Test
+    void an_unclosed_quoted_password_is_still_redacted() {
+        assertThat(NotificationErrorText.sanitizeText("登录失败 password='s3cr3t"))
+                .as("少了右引号的口令照样是口令——不能因为「引号没配对」就整段放过")
+                .doesNotContain("s3cr3t")
+                .contains("password=***");
+
+        assertThat(NotificationErrorText.sanitizeText("登录失败 password=\"s3cr3t"))
+                .doesNotContain("s3cr3t")
+                .contains("password=***");
+    }
+
+    @Test
+    void a_protocol_relative_userinfo_is_redacted() {
+        assertThat(NotificationErrorText.sanitizeText("连不上 //admin:pw@db:3306/orders"))
+                .as("协议相对写法没有 scheme，但账号口令一样在里面")
+                .doesNotContain("pw")
+                .doesNotContain("admin")
+                .contains("//***@db:3306");
+    }
+
+    @Test
+    void a_custom_scheme_userinfo_is_redacted() {
+        assertThat(NotificationErrorText.sanitizeText("自定义 my_app://u:p@h:1/x"))
+                .as("自定义 scheme（含下划线）不能漏；scheme 本身要保留")
+                .doesNotContain("u:p")
+                .contains("my_app://***@h:1");
+
+        assertThat(NotificationErrorText.sanitizeText("JDBC 风格 jdbc:mysql://u:p@h/db"))
+                .doesNotContain("u:p")
+                .doesNotContain("h/db");
+    }
+
+    @Test
+    void an_email_address_without_a_url_is_not_mistaken_for_userinfo() {
+        assertThat(NotificationErrorText.sanitizeText("请把结果发到 ops01@badc.test"))
+                .as("脱敏不能反过来把正常邮箱抹掉：userinfo 只存在于 // 之后")
+                .isEqualTo("请把结果发到 ops01@badc.test");
+    }
+
+    /**
+     * 性能断言：这条是本轮的核心，不是锦上添花。
+     *
+     * <p>{@code sanitizeText} 吃的是<b>异常原文</b>，而 MySQL 的错误消息会把 SQL 片段带回来——SQL 由研发提交、
+     * 长度由他们控制。脱敏里任何一条"以字符类开头、量词无上界"的正则，在长串上都会从每个起点回溯整段
+     * （O(n²)）：40KB 就能让异步投递线程烧掉约 10 秒 CPU，是可被低成本触发的资源耗尽面。
+     * 所以这里钉的是"耗时上界"，不是"结果对不对"。
+     */
+    @Test
+    void a_long_message_without_any_url_is_sanitized_quickly() {
+        String payload = "a1b2c3d4".repeat(5_000);
+
+        long elapsed = elapsedMillisOf(() -> NotificationErrorText.sanitizeText(payload));
+
+        assertThat(elapsed)
+                .as("40KB、不含 URL 的消息脱敏耗时 %d ms（修复前实测约 10 秒）：O(n²) 会拖垮异步投递线程", elapsed)
+                .isLessThan(200);
+        assertThat(NotificationErrorText.sanitizeText(payload)).isEqualTo(payload);
+    }
+
+    @Test
+    void a_long_message_full_of_slashes_is_sanitized_quickly() {
+        String payload = "a//".repeat(13_000);
+
+        long elapsed = elapsedMillisOf(() -> NotificationErrorText.sanitizeText(payload));
+
+        assertThat(elapsed)
+                .as("含大量 // 的 39KB 消息也要线性：门控挡不住这种情况，靠的是「字面 // 开头」", elapsed)
+                .isLessThan(200);
+    }
+
+    @Test
     void truncation_is_null_safe_and_handles_a_zero_budget() {
         assertThat(NotificationErrorText.truncate(null, 500)).isNull();
         assertThat(NotificationErrorText.truncate("abc", 0)).isEmpty();
         assertThat(NotificationErrorText.truncate("abc", 500)).isEqualTo("abc");
+    }
+
+    private static long elapsedMillisOf(Runnable action) {
+        long started = System.nanoTime();
+        action.run();
+        return (System.nanoTime() - started) / 1_000_000L;
     }
 }
