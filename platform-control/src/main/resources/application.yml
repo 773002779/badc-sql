@@ -23,3 +23,20 @@ badcsql:
     # 调执行器 /internal/** 的令牌，必须与执行器的 BADCSQL_INTERNAL_TOKEN 一致。
     # 不设字面默认值：留空时执行器会拒绝全部内部请求，而不是放行。
     internal-token: "${BADCSQL_INTERNAL_TOKEN:}"
+
+  notify:
+    # 通知渠道（切片 3-A）：默认全关——没配置就谁也不发，而不是拿半截配置去连企微 / SMTP。
+    # 真实凭证只走环境变量，不写进仓库配置。
+    wecom:
+      enabled: "${BADCSQL_WECOM_ENABLED:false}"
+      corp-id: "${BADCSQL_WECOM_CORP_ID:}"
+      agent-id: "${BADCSQL_WECOM_AGENT_ID:0}"
+      secret: "${BADCSQL_WECOM_SECRET:}"
+      base-url: "${BADCSQL_WECOM_BASE_URL:https://qyapi.weixin.qq.com}"
+    mail:
+      enabled: "${BADCSQL_MAIL_ENABLED:false}"
+      from: "${BADCSQL_MAIL_FROM:}"
+    retry:
+      # 第 n 次退避 = base-backoff-millis * 2^(n-1)
+      max-attempts: 3
+      base-backoff-millis: 500

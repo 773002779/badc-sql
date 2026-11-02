@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
+import com.badc.sql.control.notify.NotificationProperties;
 import com.badc.sql.control.risk.PolicyValidator;
 import com.badc.sql.control.risk.RiskEngine;
 import com.badc.sql.control.risk.RiskProperties;
@@ -35,10 +36,14 @@ import com.badc.sql.control.risk.RiskProperties;
  * 用 {@code TypeExcludeFilter} 过滤掉了 {@code @Service}，因此切片上下文里没有任何 {@code @Scheduled}
  * 任务，不会凭空多出一个线程。集成测试加载的是完整应用，任务确实存在，{@code TicketRecoveryJob} 用
  * 5 分钟的 {@code initialDelayString} 让它在测试进程存活期间不触发。
+ *
+ * <p><b>{@link NotificationProperties} 也在这里登记</b>：通知渠道的开关与凭证由 {@code badcsql.notify.*}
+ * 绑定，走的是与 {@link RiskProperties} 相同的构造器绑定路径（原因见上一条：切片上下文里类路径扫描
+ * 会被过滤掉，而 {@code @EnableConfigurationProperties} 不会）。
  */
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
 @EnableScheduling
-@EnableConfigurationProperties(RiskProperties.class)
+@EnableConfigurationProperties({RiskProperties.class, NotificationProperties.class})
 public class ControlApplication {
 
     public static void main(String[] args) {

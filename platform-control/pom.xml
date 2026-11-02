@@ -28,6 +28,12 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-jdbc</artifactId>
     </dependency>
+    <!-- 邮件渠道（SmtpSender）：版本由 Spring Boot BOM 管理，不写 version。
+         Jakarta Mail 实现（org.eclipse.angus:jakarta.mail）由 starter 带入，不必自己拼坐标。 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-mail</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.flywaydb</groupId>
       <artifactId>flyway-core</artifactId>

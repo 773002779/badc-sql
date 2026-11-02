@@ -64,3 +64,19 @@ CREATE TABLE notification_switch (
   DEFAULT CHARSET = utf8mb4
   COLLATE = utf8mb4_0900_ai_ci
   COMMENT = '通知事件开关（全局默认 + 按系统覆盖）';
+
+-- 通知的收件人联系方式（R1 裁决）：直接挂在 sys_user 上，不另建联系方式表。
+--
+-- 两列都可空：多数用户只收站内通知，没有邮箱 / 企微账号是正常状态。缺联系方式的用户
+-- **必须仍能被 NotificationTargetStore 查出来**（字段为 null），由各渠道 sender 自行判空跳过；
+-- 若在这一层按 email is not null 过滤，"没填邮箱"就会变成"连站内消息也收不到"。
+--
+-- VARCHAR(190)：utf8mb4 下 190 * 4 = 760 字节，仍在 InnoDB 单列索引 767 字节限制内。
+-- uk_sys_user_wecom 是唯一键：企微 userid 一人一号；MySQL 唯一索引允许多个 NULL，
+-- 所以"大量用户没填企微"不会互相冲突。
+ALTER TABLE sys_user
+    ADD COLUMN email        VARCHAR(190) NULL COMMENT '通知收件邮箱',
+    ADD COLUMN wecom_userid VARCHAR(190) NULL COMMENT '企微 userid';
+
+ALTER TABLE sys_user
+    ADD UNIQUE KEY uk_sys_user_wecom (wecom_userid);
