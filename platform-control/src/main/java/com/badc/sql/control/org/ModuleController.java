@@ -17,6 +17,9 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 模块维护与「模块-数据源」挂载。
  *
+ * <p>读接口与 {@code /systems} 同口径：对所有已登录用户开放，不按可见性过滤——研发在申请页要能选到
+ * 尚未授权的模块（§4.4②）。理由与取舍见 {@code SystemService} 的类注释。
+ *
  * <p>写接口仅运维 / 管理员，且运维只能改<b>自己负责的系统</b>下的模块；挂载要求模块与数据源属于同一系统。
  */
 @RestController

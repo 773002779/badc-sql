@@ -533,6 +533,54 @@ class DataSourceApiIT extends AbstractMySqlIT {
                 "select count(*) from datasource where name = 'IT Hijack'", Integer.class)).isZero();
     }
 
+    /**
+     * 系统目录<b>有意</b>对研发开放，不按可见性过滤。
+     *
+     * <p>理由（写在这里是为了让下一个想"顺手补上过滤"的人先看到）：§4.4② 要求研发「选 系统 → 模块 →
+     * 申请权限」，而申请的前提正是<b>看得见自己还没有权限的系统</b>。夹具里 dev01 只有系统 1（订单中心）
+     * 的模块授权，系统 2（支付中心）对它完全不可见——两个都必须出现在目录里，否则申请入口没有可选项。
+     * 真正的执行点在数据源：{@code VisibilityService} 决定哪些库可见，知道系统名拿不到任何数据。
+     *
+     * <p>这条用例是那个决定的看门狗：谁把 {@code /systems} 改成按可见性过滤，这里立刻红，而不是等上线后
+     * 研发报"申请页面选不到系统"。
+     */
+    @Test
+    void the_system_catalog_stays_open_to_a_developer_who_must_apply_for_access() throws Exception {
+        ResponseEntity<String> response = get("/api/v1/systems", devToken());
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        Set<Long> ids = new LinkedHashSet<>();
+        for (JsonNode node : objectMapper.readTree(response.getBody())) {
+            ids.add(node.path("id").asLong());
+            // 目录只给 id + name：系统名不是凭证，但也没有理由附带别的字段。
+            assertThat(node.size()).isEqualTo(2);
+        }
+        assertThat(ids).as("少了系统 2，研发就无从申请它的权限（§4.4②）").contains(1L, 2L);
+    }
+
+    /**
+     * 模块目录同理：研发在申请页要能选到<b>尚未授权</b>的模块。
+     *
+     * <p>夹具里系统 2 没有模块，所以临时建一个再删——否则"过滤"与"不过滤"在这个夹具上返回同样的结果，
+     * 用例就变成了假绿。
+     */
+    @Test
+    void the_module_catalog_also_stays_open_so_a_developer_can_pick_a_module_to_apply_for() throws Exception {
+        long moduleId = createModule(2L, uniqueName("IT 支付模块"));
+        try {
+            ResponseEntity<String> response = get("/api/v1/modules", devToken());
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            Set<Long> ids = new LinkedHashSet<>();
+            for (JsonNode node : objectMapper.readTree(response.getBody())) {
+                ids.add(node.path("id").asLong());
+            }
+            assertThat(ids).as("少了系统 2 的模块，研发就没法申请它").contains(201L, moduleId);
+        } finally {
+            delete("/api/v1/modules/" + moduleId, adminToken());
+        }
+    }
+
     private long createSystem(String name) throws Exception {
         ResponseEntity<String> response = post("/api/v1/systems", adminToken(), json(Map.of("name", name)));
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
