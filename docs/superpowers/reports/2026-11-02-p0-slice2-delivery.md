@@ -1,0 +1,237 @@
+# 切片 2：写路径主干 — 交付报告
+
+**日期**：2026-11-02
+**分支**：`feat/sql-platform`　**HEAD**：`6026cb2`
+**计划**：`docs/superpowers/plans/2026-10-28-p0-slice2-write-path.md`
+**规格**：`docs/superpowers/specs/2026-10-20-sql-execution-platform-design.md`
+
+---
+
+## 1. 交付概要
+
+| 项 | 值 |
+|---|---|
+| 任务 | 13 个（含 3 个临时拆分子任务与 1 个追加任务） |
+| 提交 | 39（33 个代码提交 + 6 个文档提交） |
+| 变更 | 110 文件，+20,152 / −77 |
+| 新增类 | 50 个主代码类，34 个测试类 |
+| 测试 | **426 单元 + 237 集成 = 663 条**，全绿 |
+| 构建 | `.\mvnw.cmd -o verify` → `BUILD SUCCESS` / `LASTEXITCODE=0` |
+
+**能力边界**：本切片交付「研发提单 → 风险分级 → 两级审批 → 风险确认 → 结构快照 → 执行 → 回滚」的完整写路径。**不含**运维临时执行通道、通知、导出、online DDL、前端页面（均在切片 3+）。
+
+---
+
+## 2. 交付内容
+
+### 2.1 数据模型（V3，7 张表）
+
+`ticket`、`ticket_statement`、`ticket_review`、`ticket_event`、`schema_snapshot`、`risk_acknowledgement`、`datasource_exec_lock`。
+
+设计要点：JSON 类内容一律 `MEDIUMTEXT`（不用 MySQL `JSON` 类型，避免键序被重排而破坏哈希）；不建外键（数据源/模块有下线场景）；`datasource_exec_lock` 用**主键本身**做互斥体。
+
+### 2.2 控制面端点（7 个）
+
+| 端点 | 语义 |
+|---|---|
+| `POST /api/v1/tickets` | 提交工单 → 201 |
+| `GET /api/v1/tickets` | 列表（按可见性过滤，`total` 与 `items` 同谓词） |
+| `GET /api/v1/tickets/{id}` | 详情（含解析后的风险快照、事件、快照引用） |
+| `POST /api/v1/tickets/{id}/approve` \| `/reject` | 审批 / 驳回 |
+| `POST /api/v1/tickets/{id}/risk-ack` | 执行前风险确认（**端点无哈希参数**） |
+| `POST /api/v1/tickets/{id}/execute` | 触发执行 → 202 |
+| `POST /api/v1/tickets/{id}/rollback` | 发起回滚工单 → 201 |
+
+### 2.3 执行器内部端点（受令牌闸保护）
+
+`POST /internal/v1/{query,probe,validate,snapshot,fingerprint,explain,execute}`
+
+### 2.4 风险分级
+
+- `StatementClassifier`：语句分类、结构性破坏动作识别、跨库判定、多语句检测
+- `PolicyValidator`：15 条规范规则（`VERSION_MISMATCH_HINT` 未实现，分工给执行器方言校验器）
+- `RiskEngine`：**纯函数**，按「BLOCK 早退 → 基础等级 → PIN_LEVEL 只抬 → 非窗口期 → 快照开关」合并
+- `RiskProperties`：阈值与执行窗口（`application.yml` 的 `badcsql.risk.*`）
+- `ExecWindow`：跨零点窗口判定，秒级精度
+
+结构性破坏 9 条恒为 L3，代码内置、不受阈值配置影响。
+
+### 2.5 结构与漂移
+
+执行器侧 `SchemaSnapshotter` 产出 `schema.sql` + `schema.json`（表/列/索引/触发器/行数估算）+ 每表指纹；`ExplainRunner` 提供受影响行数估算（**绝不执行原语句**）。控制面在提交时记指纹、执行时逐表比对。
+
+### 2.6 执行
+
+`TicketExecutionService`：同步入口只做「权限 → 取锁 → CAS 置 `EXECUTING` → 投池 → 202」，异步执行七道闸：风险重算 → 语句指纹 → 结构漂移 → 抓快照 → 风险确认 → 逐条执行 → 汇总。
+
+`DatasourceExecLock` 保证**单数据源写并发 = 1**；`WriteRunner` 逐条独立提交、DML 300s / DDL 3600s、失败返回结构化结果而不抛。
+
+### 2.7 回滚与恢复
+
+`TicketRollbackService` 基于原单建新工单，继承系统/模块/数据源与（更严的）风险等级，回滚语句来源为「请求体 → 原单回滚 SQL」。`TicketRecoveryJob` 处理 24h 过期、2h 卡死恢复（**绝不自动续跑**）、陈旧锁清理。
+
+### 2.8 审计
+
+哈希链（`prev_hash` + `hash`），链头读取为**加锁读**（`for update`）——哈希链不可并行追加，且加锁读才能突破事务快照看到最新已提交版本。
+
+---
+
+## 3. 端到端行为（真实轨迹）
+
+```
+dev01 提交 drop table t_order（回滚方案含确认语）
+  → 201 / risk_level=L3 / status=REVIEWING_L1
+  → 命中 DROP_TABLE（PIN_LEVEL L3）+ KEYWORD_NOT_UPPERCASE（INFO）
+  → statement_fingerprint、risk_snapshot_hash、table_fingerprints 落库
+
+ops02（系统 1 主运维）审一级 → REVIEWING_L2
+  → ticket_review(level=1)、事件 APPROVED_L1、审计 TICKET_APPROVED/action=l1
+
+lead01（系统 1 组长）终审 → APPROVED
+  → ticket_review(level=2)、事件 APPROVED_L2、审计 action=l2
+
+研发点执行 → 202 / EXECUTING
+  → 风险重算（不升档）→ 语句指纹一致 → 漂移比对通过
+  → 抓执行前快照（change_seq=1）→ 风险确认哈希一致
+  → 逐条执行（DDL 用 ddl 账号）→ SUCCEEDED
+  → 审计 TICKET_EXECUTED：operator_id=1（研发）vs exec_identity=ddl_user
+```
+
+DML 工单同样一条：`update t_order set status = 0 where id = 1` + 估算 500 行 → **L2**（不是 L3），一级审批即可。
+
+---
+
+## 4. 关键设计决定
+
+### 4.1 结构性防护优先于运行时校验
+
+| 问题 | 结构性做法 |
+|---|---|
+| BLOCK 命中 `level=null`，先合并等级会算出 L0 | **早退**：有 BLOCK 直接返回 L3，根本不进入等级合并 |
+| 客户端伪造"我确认过最新风险" | 端点**没有任何哈希参数**，服务端自取，伪造被结构排除 |
+| 停机时任务被静默丢弃 → 锁泄漏 | 拒绝策略改为"未停机内联执行、已停机抛异常"，入口据此退回状态并返 503 |
+| 同一数据源并发写 | 锁表**主键**即互斥体，`insert` 冲突即失败 |
+
+### 4.2 失败方向必须显式决定
+
+- 快照抓取失败 → **一条语句都不执行**
+- 漂移比对时执行器抛异常 → **中止**（不是当成"无表"）
+- 提交期指纹 JSON 解析失败 → **中止**（不是当成"无表"）
+- 风险确认缺失/过期 → **中止**
+- 逐语句失败 → 停止，剩余置 `SKIPPED`
+
+### 4.3 提交期与执行期必须同口径
+
+整单风险哈希、语句指纹、表名归一在三处共用同一实现（`TicketRiskSnapshot`、`StatementFingerprint`、`TicketPipelineSupport`）。**本切片因此出过一个 Critical**：执行期只按"重算等级"算哈希，而回滚单的存库等级是继承来的更高等级 → L3 回滚单永远执行不了。
+
+### 4.4 诚实的不可判定
+
+| 场景 | 处理 |
+|---|---|
+| 收窄判定无旧列类型 | 一律按最严 L3，消息说明"无法判定是否收窄" |
+| 受影响行数估不出 | `-1` → L3 |
+| `IMPLICIT_CAST` 无列类型 | **不报**（宁可少报，也不制造噪音） |
+| 语句失败 | `success=false` **不证明未生效**，文案为"结果未知，请人工核对" |
+
+---
+
+## 5. 交付过程中发现并修复的缺陷
+
+**8 个 Critical，没有一个是被测试发现的。**
+
+| # | 缺陷 | 若未发现 |
+|---|---|---|
+| 1 | `with ... delete` 被判非写语句 | 删数据的变更被判 **L0（免审批）** |
+| 2 | 错误消息泄漏 `'账号'@'主机'` | 研发可见数据库账号与主机，违反 §4.3-6 |
+| 3 | 提交期用只读账号 `EXPLAIN` 写语句（MySQL 1142） | 每张 DML 工单都是 L3，**L1/L2 分档从未生效** |
+| 4 | 审计链头在 REPEATABLE READ 快照内重试无效 | 并发提交/审批偶发 500，且随写入点增加而变频繁 |
+| 5 | `CallerRunsPolicy` 停机时静默丢弃任务 | 锁行永久残留 + 工单永久 `EXECUTING` |
+| 6 | 漂移闸对不可解析的存库 JSON 放行 | **安全闸在异常路径上失效** |
+| 7 | 执行期哈希未并入存库等级 | L3 回滚单能审批、**永远执行不了** |
+| 8 | 内部令牌闸可被 `;` 矩阵参数绕过 | **等于生产库无认证**（红证据：修复前无令牌返回 200） |
+
+其中 1、3、6、8 都是"正常路径正确、异常或变体路径放行"这一类。
+
+---
+
+## 6. 合并前必须处理
+
+| # | 项 | 影响 |
+|---|---|---|
+| 1 | `StatementClassifier` 类注释仍写"跨库引用是**首关键字**的 `update`" | 注释与实现矛盾，下一个人会按注释改代码 |
+| 2 | 角色 → 可见范围/审核资格有**四处实现**（`VisibilityService`/`QueryHistoryService`/`TicketQueryService`/`TicketReviewMapper.isOperatorOf`） | 本切片 5 次事故的共同根因；任一处漂移即权限洞 |
+| 3 | `GET /systems`、`GET /modules` 未按可见性过滤（切片 1 遗留） | 研发可见全部系统名与模块名 |
+| 4 | spec FR-02 要求的 **after 份快照**与"前后结构差异"未实现 | 「查看前后结构差异」无处取数 |
+| 5 | 触发器查询对 ddl 账号**静默返回空集**（该账号最小权限不含 TRIGGER） | `drop table` 后按快照重建会**静默丢触发器** |
+| 6 | 跨库限定名被剥成裸表名 | `update db1.t …` 被判"表不存在" → 漂移闸**静默跳过**（跨库恰是最危险的一类） |
+
+前 3 项建议在合并前修；4–6 可开 issue 但与「结构快照可作重建依据」这一承诺直接相关，建议一并排期。
+
+---
+
+## 7. 部署前提
+
+1. **执行器内部通道仍是明文 HTTP**，`ConnConfig` 携带解密后的密码。必须靠 NetworkPolicy 隔离，或上线前补 mTLS。
+2. `platform-control/src/main/resources/application.yml` 仍提交 `root/root` 默认值 + `useSSL=false`，只覆盖 host/db 的部署会带着明文 root 凭证走非 TLS 链路。
+3. **每个系统至少 2 名主/备运维**，否则该系统发起的 L3 回滚无法完成审批（提交人不能自审 + L3 一级只收主/备运维）。
+4. 平台元数据库需 **MySQL 8.0.16+**（更低版本 `CHECK` 约束被静默忽略）。
+5. **dml / ddl 账号**需具备对应写权限与元数据读权限。权限不足时提交期会**直接失败**（这是刻意的：宁可报错也不静默降级成 L3）。
+6. 执行器 `DDL_TIMEOUT_SECONDS`（3600）与控制面 `EXECUTE_READ_TIMEOUT_SECONDS`（3700）是**单方约定**，改一侧必须同步另一侧。
+7. 快照根目录（`BADCSQL_SNAPSHOT_ROOT`）必须是**独立卷且不可被租户写**——路径守卫是词法判定，不防符号链接逃逸。
+
+---
+
+## 8. 已知限制与推迟项
+
+### 8.1 功能缺口（切片 3+）
+
+- **运维临时执行通道**（`DirectExecRecord`、L3 自动生成工单）
+- **通知**（企微/邮件）
+- **导出**（>1000 行审批、100 万行/500MB）
+- **online DDL / gh-ost**（P1）
+- **前端页面**
+- 风险阈值的 **DSL 化与三级作用域**（当前仅 `application.yml` 全局值）
+- **精确计数**（`§7.2-6`；当前用 `EXPLAIN` 估算，估不出即 L3）
+- **执行队列**（后来者得 409，不排队）
+- **执行器 mTLS**
+
+### 8.2 语义待明确
+
+- `NEEDS_MANUAL_CONFIRM` 无 `finished_at`，且在状态机里**没有出边**（汇点）——需定义人工解除路径。
+- `snapshotEnabled=false` 会把**只读语句**也抬 L3（本切片快照不可关故不触发）；切片 3 启用开关时必须收窄到只写语句。
+- `RISK_ACK_MISSING` 的补救文案不可满足：`abort` 置 `FAILED`，而确认行永远存提交期哈希，故执行期任何合法偏移（估算漂移、跨执行窗口）都以"风险已变更"中止且重新确认救不回来，只能重新提单。
+
+### 8.3 工程性
+
+- `WriteRunner` 的 `success=false` **不证明未生效**（`autoCommit=true` 下 `executeUpdate` 返回即已提交；连接关闭异常也落同一分支）——控制面文案已按"结果未知"实现。
+- `HttpExecutorClient` 注释称"连接 2s"，实际只设了读超时。
+- `application.yml` 无 `badcsql.snapshot.root` 之外的新增键缺默认凭证问题已修，但历史默认值仍在。
+- 调度线程为 Spring 默认单线程；再加定时任务需显式配 `TaskScheduler` 池。
+- 清理是 5 分钟一轮的存量扫描（最多晚 5 分钟）。
+
+---
+
+## 9. 方法与覆盖说明（重要）
+
+本切片执行方式：每个任务「派实现者 → 任务级评审 → 修复轮 → 限定范围复审」，共 **20 次任务级评审、16 轮修复**。
+
+终审阶段把全支（约 1MB）拆成 6 个分域评审包，**只有 1 份拿到完整结论**（执行器 + `platform-common`）——该份产出 2 个 Critical（令牌绕过、读超时），已修。其余 5 份的评审进程在读取过程中死亡（累计 9 次进程死亡）。
+
+因此：
+
+- **有独立终审的域**：`platform-common`、`platform-executor`（全部）
+- **只有任务级评审 + 控制器核验的域**：`risk` 包、工单提交/审批、查询/回滚/确认、执行编排、控制面核心（审计/认证/可见性）
+
+这意味着第 6 节列出的 6 项"合并前必须处理"，是**被识别出来但未被独立终审完整覆盖**的残余风险。建议合并前补一次针对这四个域的人工评审，重点看：跨模块口径一致性、权限判定顺序、异常路径的失败方向。
+
+另一条值得记录的实践：**证明用例承重**。多次要求"修复前该用例必须红"，并保留红→绿输出（例如令牌绕过用例修复前无令牌返回 200、L3 回滚用例修复前 `expected SUCCEEDED but was FAILED`）。本切片共有 5 次"断言描述了未被触发的场景"（假绿），全部靠这一要求发现并修正。
+
+---
+
+## 10. 下一步建议
+
+按依赖顺序：
+
+1. **补第 6 节的 1–3 项**（注释、角色判定收口、`/systems` 与 `/modules` 过滤）——成本低、直接消除权限与误导风险。
+2. **补一次四域人工评审**（见 §9）。
+3. **切片 3**：运维临时执行通道 + 通知 + 导出 + 授权申请/审批，以及 §8.2 的三处语义补齐。
