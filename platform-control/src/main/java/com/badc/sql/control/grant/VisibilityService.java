@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.user.RoleScope;
 import com.badc.sql.control.user.UserRoleService;
 
 /**
@@ -21,6 +22,10 @@ import com.badc.sql.control.user.UserRoleService;
  *   <li>{@code ADMIN}：全部可见；</li>
  *   <li>其余（含用户不存在）一律不可见。</li>
  * </ul>
+ *
+ * <p><b>"谁属于哪个范围"不在这里判</b>：角色到范围的映射只有 {@link RoleScope#of(String)} 一份，
+ * 本类只负责把那个范围翻译成这张表上的 SQL。三条读路径（本类、{@code QueryHistoryService}、
+ * {@code TicketQueryMapper}）因此不会对同一个角色给出不同口径。
  *
  * <p>过滤在 SQL 里完成，不把全量拉进内存再筛——授权链会随系统数量增长。
  *
@@ -71,29 +76,21 @@ public class VisibilityService {
 
     /** 该用户可见的数据源 ID 集合（可能为空，不为 null）。 */
     public Set<Long> visibleDatasourceIds(Long userId) {
-        String role = roleOf(userId);
-        if (role == null) {
-            return Set.of();
-        }
-        return switch (role) {
-            case "DEVELOPER" -> ids(DEV_DATASOURCES_SQL, userId);
-            case "PRIMARY_OPS", "BACKUP_OPS", "OPS_LEAD" -> ids(OPS_DATASOURCES_SQL, userId);
-            case "ADMIN" -> ids(ALL_DATASOURCES_SQL);
-            default -> Set.of();
+        return switch (RoleScope.of(roleOf(userId))) {
+            case SELF -> ids(DEV_DATASOURCES_SQL, userId);
+            case OPERATED_SYSTEMS -> ids(OPS_DATASOURCES_SQL, userId);
+            case ALL -> ids(ALL_DATASOURCES_SQL);
+            case NONE -> Set.of();
         };
     }
 
     /** 该用户可见的功能模块 ID 集合（可能为空，不为 null）。 */
     public Set<Long> visibleModuleIds(Long userId) {
-        String role = roleOf(userId);
-        if (role == null) {
-            return Set.of();
-        }
-        return switch (role) {
-            case "DEVELOPER" -> ids(DEV_MODULES_SQL, userId);
-            case "PRIMARY_OPS", "BACKUP_OPS", "OPS_LEAD" -> ids(OPS_MODULES_SQL, userId);
-            case "ADMIN" -> ids(ALL_MODULES_SQL);
-            default -> Set.of();
+        return switch (RoleScope.of(roleOf(userId))) {
+            case SELF -> ids(DEV_MODULES_SQL, userId);
+            case OPERATED_SYSTEMS -> ids(OPS_MODULES_SQL, userId);
+            case ALL -> ids(ALL_MODULES_SQL);
+            case NONE -> Set.of();
         };
     }
 

@@ -12,10 +12,10 @@ import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.ticket.TicketQueryMapper.EventRow;
 import com.badc.sql.control.ticket.TicketQueryMapper.ReviewRow;
-import com.badc.sql.control.ticket.TicketQueryMapper.Scope;
 import com.badc.sql.control.ticket.TicketQueryMapper.SnapshotRow;
 import com.badc.sql.control.ticket.TicketQueryMapper.StatementRow;
 import com.badc.sql.control.ticket.TicketQueryMapper.SummaryRow;
+import com.badc.sql.control.user.RoleScope;
 import com.badc.sql.control.user.UserRoleService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -32,6 +32,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *   <li>{@code ADMIN}：全部（管理员负责全局治理，工单里不含凭证）；</li>
  *   <li>其它角色（含用户不存在）：什么都看不到。</li>
  * </ul>
+ *
+ * <p>上面这份"谁属于哪个范围"<b>不在这里判</b>：角色 → 范围的映射只有 {@link RoleScope#of(String)} 一份，
+ * 与查询历史、授权自查共用；本服务只把拿到的范围交给 {@link TicketQueryMapper} 翻译成谓词。
  *
  * <p>列表过滤在 SQL 里完成（{@link TicketQueryMapper#count} 与 {@link TicketQueryMapper#page} 共用同一个
  * 谓词），{@code total} 因此永远与分页口径一致。详情先按 id 查工单区分 404，再用<b>同一套</b>谓词判定是否
@@ -83,7 +86,7 @@ public class TicketQueryService {
     public TicketPage list(long userId, int page, int size) {
         int safePage = Math.max(page, 1);
         int safeSize = Math.min(Math.max(size, 1), MAX_PAGE_SIZE);
-        Scope scope = scopeOf(userRoleService.roleOf(userId));
+        RoleScope scope = RoleScope.of(userRoleService.roleOf(userId));
 
         long total = queryMapper.count(userId, scope);
         long offset = (long) (safePage - 1) * safeSize;
@@ -102,7 +105,7 @@ public class TicketQueryService {
         TicketEntity ticket = ticketMapper.findById(ticketId)
                 .orElseThrow(() -> new BizException(ErrorCode.NOT_FOUND, "工单不存在：" + ticketId));
 
-        Scope scope = scopeOf(userRoleService.roleOf(userId));
+        RoleScope scope = RoleScope.of(userRoleService.roleOf(userId));
         // 详情必须重新判定：列表过滤只是让工单不出现，不能阻止知道 id 的人直接访问。
         if (!queryMapper.isVisible(ticketId, userId, scope)) {
             throw new BizException(ErrorCode.FORBIDDEN, "无权查看该工单：" + ticketId);
@@ -217,23 +220,6 @@ public class TicketQueryService {
                 row.actorId(),
                 row.detailJson(),
                 row.createdAt());
-    }
-
-    /**
-     * 角色 → 可见性范围。
-     *
-     * <p>只在这里做一次映射，列表与详情共用；漏掉任何角色都落到 {@link Scope#NONE}（fail-closed）。
-     */
-    private static Scope scopeOf(String role) {
-        if (role == null) {
-            return Scope.NONE;
-        }
-        return switch (role) {
-            case "DEVELOPER" -> Scope.SELF;
-            case "PRIMARY_OPS", "BACKUP_OPS", "OPS_LEAD" -> Scope.OPERATED_SYSTEMS;
-            case "ADMIN" -> Scope.ALL;
-            default -> Scope.NONE;
-        };
     }
 
     /**

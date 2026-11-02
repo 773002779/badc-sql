@@ -11,6 +11,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
+import com.badc.sql.control.user.RoleScope;
+
 /**
  * 工单读路径的 SQL。
  *
@@ -18,22 +20,14 @@ import org.springframework.stereotype.Repository;
  * 把它们塞进任一个写 Mapper 都会让那个类承担两种职责。这里只放查询，不写任何一行。
  *
  * <p><b>可见性过滤必须留在 SQL 里</b>：如果把全表查出来再在内存里筛，{@code total} 与分页就会与
- * {@code items} 不一致（"第 3 页共 1 页"）。{@link Scope} 由服务层按角色判定，本类只把它翻译成
+ * {@code items} 不一致（"第 3 页共 1 页"）。{@link RoleScope} 由服务层按角色判定，本类只把它翻译成
  * {@code where} 谓词，计数与分页共用同一个谓词——两处各写一份迟早分叉。
+ *
+ * <p>"哪个角色对应哪个范围"<b>不在这里定</b>（见 {@link RoleScope#of(String)}）：本类只负责把四种范围
+ * 翻译成 {@code ticket} 表上的谓词。
  */
 @Repository
 public class TicketQueryMapper {
-
-    /**
-     * 读路径的可见性范围。
-     *
-     * <p>{@link #SELF}：只看自己提交的（研发）；{@link #OPERATED_SYSTEMS}：只看自己运维的系统
-     * （主运维/备运维/组长）；{@link #ALL}：全部（管理员）；{@link #NONE}：什么都看不到（其它角色、
-     * 用户不存在）。
-     */
-    public enum Scope {
-        SELF, OPERATED_SYSTEMS, ALL, NONE
-    }
 
     private static final String COUNT = "select count(*) from ticket t ";
 
@@ -94,7 +88,7 @@ public class TicketQueryMapper {
     }
 
     /** 可见范围内的工单总数；与 {@link #page} 用同一个过滤谓词。 */
-    public long count(long userId, Scope scope) {
+    public long count(long userId, RoleScope scope) {
         Long count = jdbc.queryForObject(COUNT + filter(scope), Long.class, filterArgs(scope, userId));
         return count == null ? 0 : count;
     }
@@ -105,7 +99,7 @@ public class TicketQueryMapper {
      * @param size   页大小
      * @param offset 偏移量（已由服务层按 {@code (page-1)*size} 算好）
      */
-    public List<SummaryRow> page(long userId, Scope scope, int size, long offset) {
+    public List<SummaryRow> page(long userId, RoleScope scope, int size, long offset) {
         Object[] filterArgs = filterArgs(scope, userId);
         Object[] args = Arrays.copyOf(filterArgs, filterArgs.length + 2);
         args[filterArgs.length] = size;
@@ -118,7 +112,7 @@ public class TicketQueryMapper {
      *
      * <p>详情不能只靠列表过滤：知道 id 就能绕过列表，所以详情必须按 id 再做一次同样的判定。
      */
-    public boolean isVisible(long ticketId, long userId, Scope scope) {
+    public boolean isVisible(long ticketId, long userId, RoleScope scope) {
         Object[] filterArgs = filterArgs(scope, userId);
         Object[] args = Arrays.copyOf(filterArgs, filterArgs.length + 1);
         args[filterArgs.length] = ticketId;
@@ -169,7 +163,8 @@ public class TicketQueryMapper {
                 instant(rs, "created_at")), ticketId);
     }
 
-    private static String filter(Scope scope) {
+    /** 范围 → 谓词。包级可见是为了让单元测试核对"谓词里的 {@code ?} 个数 == 绑定的参数个数"。 */
+    static String filter(RoleScope scope) {
         return switch (scope) {
             case SELF -> " where t.submitter_id = ? ";
             case OPERATED_SYSTEMS -> """
@@ -182,17 +177,14 @@ public class TicketQueryMapper {
         };
     }
 
-    /** 只有 SELF / OPERATED_SYSTEMS 的谓词需要 userId。 */
-    private static Object[] filterArgs(Scope scope, long userId) {
-        return switch (scope) {
-            case SELF, OPERATED_SYSTEMS -> new Object[] {userId};
-            case ALL, NONE -> new Object[0];
-        };
+    /** 只有 SELF / OPERATED_SYSTEMS 的谓词需要 userId；个数由 {@link RoleScope#needsUserId()} 决定。 */
+    static Object[] filterArgs(RoleScope scope, long userId) {
+        return scope.needsUserId() ? new Object[] {userId} : new Object[0];
     }
 
     /** 在过滤谓词之后追加主键条件；ALL 还没有 where，需要自己起一个。 */
-    private static String idPredicate(Scope scope) {
-        return scope == Scope.ALL ? " where t.id = ?" : " and t.id = ?";
+    static String idPredicate(RoleScope scope) {
+        return scope == RoleScope.ALL ? " where t.id = ?" : " and t.id = ?";
     }
 
     private static Instant instant(ResultSet rs, String column) throws SQLException {

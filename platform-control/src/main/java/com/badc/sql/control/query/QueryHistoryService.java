@@ -11,6 +11,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import com.badc.sql.control.user.RoleScope;
+
 /**
  * 查询历史。
  *
@@ -18,6 +20,7 @@ import org.springframework.stereotype.Service;
  * 而看到 500。
  *
  * <p>读历史按角色收敛：研发只看自己的；运维/组长看所辖系统的；管理员看全部。过滤在 SQL 里做。
+ * 角色到范围的映射统一走 {@link RoleScope}，与工单读路径、授权自查共用同一份判定。
  */
 @Service
 public class QueryHistoryService {
@@ -74,22 +77,20 @@ public class QueryHistoryService {
     /**
      * 分页查询历史。
      *
-     * @param role 调用者角色，决定可见范围
+     * @param role 调用者角色，决定可见范围；映射统一走 {@link RoleScope}，本类只把范围翻译成这条表上的谓词
      */
     public Map<String, Object> page(Long userId, String role, int page, int size) {
         int safeSize = Math.min(Math.max(size, 1), 100);
         int safePage = Math.max(page, 1);
-        String filter = switch (role == null ? "" : role) {
-            case "DEVELOPER" -> DEV_FILTER;
-            case "PRIMARY_OPS", "BACKUP_OPS", "OPS_LEAD" -> OPS_FILTER;
-            case "ADMIN" -> "";
-            default -> " where 1 = 0 ";
-        };
+        RoleScope scope = RoleScope.of(role);
+        String filter = filterFor(scope);
+        // 参数个数由 scope 决定，不看谓词字符串：从 SQL 文本反推"要不要绑 userId"迟早错位。
+        Object[] scopeArgs = scope.needsUserId() ? new Object[] {userId} : new Object[0];
 
-        Long total = jdbc.queryForObject(COUNT_SELECT + filter, Long.class, args(filter, userId));
+        Long total = jdbc.queryForObject(COUNT_SELECT + filter, Long.class, scopeArgs);
         List<Map<String, Object>> items = jdbc.queryForList(
                 PAGE_SELECT + filter + ORDER_AND_PAGE,
-                concat(args(filter, userId), safeSize, (long) (safePage - 1) * safeSize));
+                concat(scopeArgs, safeSize, (long) (safePage - 1) * safeSize));
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("items", items);
@@ -99,9 +100,21 @@ public class QueryHistoryService {
         return body;
     }
 
-    /** 过滤器需要 userId 时传一个参数，否则不传。 */
-    private static Object[] args(String filter, Long userId) {
-        return filter.isEmpty() || filter.contains("1 = 0") ? new Object[0] : new Object[] {userId};
+    /**
+     * 范围 → 谓词。包级可见是为了让单元测试能核对"谓词里的 {@code ?} 个数 == 绑定的参数个数"。
+     *
+     * <p>这条约束值得单独测：本类没有端到端覆盖（历史接口只有研发与运维两条用例），
+     * 谓词与参数个数一旦错位，编译通过、单测通过，只在运行时抛
+     * {@code SQLException: 参数个数不对}——而它出现在"用户已经拿到查询结果、只是历史查不出来"的场景里，
+     * 很容易被当成可忽略的下游噪音。
+     */
+    static String filterFor(RoleScope scope) {
+        return switch (scope) {
+            case SELF -> DEV_FILTER;
+            case OPERATED_SYSTEMS -> OPS_FILTER;
+            case ALL -> "";
+            case NONE -> " where 1 = 0 ";
+        };
     }
 
     private static Object[] concat(Object[] head, Object... tail) {

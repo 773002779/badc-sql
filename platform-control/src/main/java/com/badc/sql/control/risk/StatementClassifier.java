@@ -21,9 +21,11 @@ import com.badc.sql.common.sql.SqlText;
  * 的七个动作恒为 L3，而 {@code alter modify} 是否收窄、跨库要不要抬级、多语句要不要拦，都由任务 4/6 决定。
  *
  * <p><b>跨库判定只看表位置</b>：只有 {@code from}/{@code join}/{@code into}/{@code straight_join}/{@code using}/
- * {@code table}（以及首关键字的 {@code update}）之后出现的两段式名称（{@code db2.t_order}）才算跨库；
- * {@code where t_order.id = 1}、{@code select o.id} 里的 {@code x.y} 是列限定，不算。别名不是表列表的结束，
- * 逗号分隔的多表列表会继续检查——{@code update t1 as a, db2.t2 as b set ...} 必须命中。
+ * {@code table}，以及<b>任何不在 {@code on duplicate key update} 里的 {@code update}</b>之后出现的两段式名称
+ * （{@code db2.t_order}）才算跨库。{@code update} <b>不受"首关键字"限制</b>；把它排除在
+ * {@code on duplicate key update} 之外，是为了不让 upsert 里 {@code update b = c.d} 的 {@code c.d}
+ * 被当成跨库表名。{@code where t_order.id = 1}、{@code select o.id} 里的 {@code x.y} 是列限定，不算。
+ * 别名不是表列表的结束，逗号分隔的多表列表会继续检查——{@code update t1 as a, db2.t2 as b set ...} 必须命中。
  *
  * <p><b>{@code with} 开头的 CTE 按顶层动词判性质</b>：{@code with ... select} 是只读，
  * {@code with ... insert/update/delete/replace} 是写语句（{@code ddlAction} 为 {@code NONE}）——
