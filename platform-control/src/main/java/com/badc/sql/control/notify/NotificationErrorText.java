@@ -44,9 +44,14 @@ final class NotificationErrorText {
      * （没有冒号也是凭证）、协议相对写法 {@code //user:pass@host}、以及任意自定义 scheme。
      *
      * <p><b>为什么必须以字面 {@code //} 开头，而不是 {@code (scheme://)}</b>：后者以字符类开头、
-     * 量词没有上界，对一段长字母数字串（不含 {@code ://}）会在每个起点回溯整段 → O(n²)。实测 40KB 要
-     * 5.5 秒（见 §8）。而 {@code sanitizeText} 吃的是<b>异常原文</b>，MySQL 的错误消息会把 SQL 片段带回来，
+     * 量词没有上界，对一段长字母数字串（不含 {@code ://}）会在每个起点回溯整段 → O(n²)。实测 40KB 为
+     * 5517 ms（见 §8）。而 {@code sanitizeText} 吃的是<b>异常原文</b>，MySQL 的错误消息会把 SQL 片段带回来，
      * SQL 长度由研发提交的语句决定——那就是一个可被低成本触发的 CPU 耗尽面（投递器在异步线程池里）。
+     *
+     * <p><b>改这条正则之前先看两个性能用例</b>：{@code a_long_message_without_any_url_is_sanitized_quickly}
+     * 与 {@code a_long_message_with_slashes_but_no_at_sign_is_sanitized_quickly}。本类的线性性质<b>完全依赖</b>
+     * "正则以字面 {@code //} 开头"这个前提：一旦变成以字符类（或可选的字符类组）开头，长输入就会退回 O(n²)，
+     * 而所有行为用例仍然是绿的——只有那两个性能用例会红。
      *
      * <p>以字面 {@code //} 开头同时解决了覆盖面：scheme 前面是什么根本不重要（保留原样），
      * 从 {@code //} 到 {@code @} 之间的整段 userinfo 才是要抹掉的部分。邮箱之类的裸 {@code @}

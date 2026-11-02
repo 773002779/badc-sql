@@ -154,7 +154,7 @@ class NotificationErrorTextTest {
      *
      * <p>{@code sanitizeText} 吃的是<b>异常原文</b>，而 MySQL 的错误消息会把 SQL 片段带回来——SQL 由研发提交、
      * 长度由他们控制。脱敏里任何一条"以字符类开头、量词无上界"的正则，在长串上都会从每个起点回溯整段
-     * （O(n²)）：40KB 就能让异步投递线程烧掉约 10 秒 CPU，是可被低成本触发的资源耗尽面。
+     * （O(n²)）：40KB 就能让异步投递线程烧掉 5517 ms CPU，是可被低成本触发的资源耗尽面。
      * 所以这里钉的是"耗时上界"，不是"结果对不对"。
      */
     @Test
@@ -164,19 +164,32 @@ class NotificationErrorTextTest {
         long elapsed = elapsedMillisOf(() -> NotificationErrorText.sanitizeText(payload));
 
         assertThat(elapsed)
-                .as("40KB、不含 URL 的消息脱敏耗时 %d ms（修复前实测约 10 秒）：O(n²) 会拖垮异步投递线程", elapsed)
+                .as("40KB、不含 URL 的消息脱敏耗时 %d ms（修复前实测 5517 ms）：O(n²) 会拖垮异步投递线程", elapsed)
                 .isLessThan(200);
         assertThat(NotificationErrorText.sanitizeText(payload)).isEqualTo(payload);
     }
 
+    /**
+     * 这条才是"线性"本身的守护者——第 2 轮用的 payload 抓不到退化，别把它改回去。
+     *
+     * <p>payload 含 {@code //}（门控放行、正则必须真的进引擎扫描），但 {@code //} 后面没有 {@code @}，
+     * 所以整串扫完也没有匹配。当前实现每个起点只做两次字符比较就失败 → 线性。
+     *
+     * <p>一旦有人把这条正则改成"可选 scheme 组开头"（例如为了同时支持带/不带 scheme 而写成
+     * {@code (?:[a-z][a-z0-9+.\-]*:)?//[^\s/@]+@}），每个起点都会先吃掉整段 {@code a} 再回溯找 {@code :}
+     * → O(n²)，39KB 要数秒；而除此之外的 15 条行为用例<b>全是绿的</b>，只有这条会红。
+     *
+     * <p>为什么不用 {@code "a//"} 重复：那种 payload 在 {@code //} 之后立刻碰到 {@code /}，
+     * 每个起点都是常数失败，正则退化后它依然很快——第 2 轮用的正是它，所以"线性"当时没有任何守护。
+     */
     @Test
-    void a_long_message_full_of_slashes_is_sanitized_quickly() {
-        String payload = "a//".repeat(13_000);
+    void a_long_message_with_slashes_but_no_at_sign_is_sanitized_quickly() {
+        String payload = "a".repeat(39_000) + "//x";
 
         long elapsed = elapsedMillisOf(() -> NotificationErrorText.sanitizeText(payload));
 
         assertThat(elapsed)
-                .as("含大量 // 的 39KB 消息也要线性：门控挡不住这种情况，靠的是「字面 // 开头」", elapsed)
+                .as("39KB、含 // 但无 @：门控放行且正则必须真扫描，线性靠「以字面 // 开头」（实测 %d ms）", elapsed)
                 .isLessThan(200);
     }
 
