@@ -85,16 +85,8 @@ git commit -m "feat(notify): add notification and notification_switch tables"
 - [ ] **Step 1: 写失败测试**
 
 ```java
-@Test
-void a_statement_with_literals_never_reaches_the_message() {
-    NotificationCommand command = new NotificationCommand(
-            NotificationEventType.TICKET_SUBMITTED, 1L, 42L, null,
-            Map.of("system", "订单中心", "statementType", "UPDATE", "riskLevel", "L2",
-                   "submitter", "dev01", "ticketNo", "42"));
-    Rendered rendered = NotificationRenderer.render(command);
-    assertThat(rendered.title()).contains("订单中心");
-    assertThat(rendered.body()).doesNotContain("身份证").doesNotContain("id_card");
-}
+// 实施时已按 R11 删除一条测试：原写的 a_statement_with_literals_never_reaches_the_message
+// 从未喂入任何 SQL，doesNotContain("身份证") 对任何实现恒真。端到端断言移交 Task 7。
 
 @Test
 void a_fact_outside_the_whitelist_is_refused() {
@@ -257,6 +249,11 @@ void a_channel_failure_does_not_stop_other_recipients_and_never_throws() {
 
 映射：`TICKET_SUBMITTED`（提交，收件人=系统运维）；`REVIEWING_L2` 时追加 `TICKET_L3_PENDING_LEAD`；`TICKET_APPROVED` / `TICKET_REJECTED`（给提交人 + 一级审核人）；`TICKET_EXECUTED` / `TICKET_EXEC_FAILED`（给提交人 + 系统运维）。
 
+**本任务必须补的端到端断言（R11 移交）**：构造一张语句里带字面量的工单（例如
+`update t_order set note = '身份证110101199001011234' where id = 1`），断言落库的 `notification.title`
+与 `body` **都不含**该字面量。这是 FR-13「不含 SQL 正文」在测试层唯一的承重断言——Task 2 原写的同名
+测试因为「从未喂入 SQL」而恒真，已按 R11 删除，真正的证明点在这里。只断言「白名单外的键被拒」不够：
+那只证明键名受限，不证明平台不会把工单内容塞进白名单字段。
 - [ ] **Step 1: 写失败测试（关键：通知失败不影响业务）**
 
 ```java
