@@ -1,6 +1,7 @@
 package com.badc.sql.control.notify;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -26,6 +27,8 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import com.badc.sql.common.dto.ExecuteResult;
@@ -299,7 +302,7 @@ class TicketNotificationIT extends TicketITBase {
         ResponseEntity<String> approved = approve(OPS02_TOKEN, id, "一级通过");
         assertThat(approved.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(status(id)).isEqualTo("REVIEWING_L2");
-        awaitNotificationTasks(approveMark, 1);
+        awaitNotificationTasks(approveMark, 1, id);
 
         List<Row> pendingLead = rowsOfType(id, "TICKET_L3_PENDING_LEAD");
         assertThat(pendingLead)
@@ -390,7 +393,7 @@ class TicketNotificationIT extends TicketITBase {
 
         long approveMark = notificationTaskMark();
         assertThat(approve(OPS02_TOKEN, id, "同意执行").getStatusCode()).isEqualTo(HttpStatus.OK);
-        awaitNotificationTasks(approveMark, 1);
+        awaitNotificationTasks(approveMark, 1, id);
 
         List<Row> approved = rowsOfType(id, "TICKET_APPROVED");
         assertThat(approved).as("审批通过必须通知").isNotEmpty();
@@ -422,7 +425,7 @@ class TicketNotificationIT extends TicketITBase {
 
         long approveMark = notificationTaskMark();
         assertThat(approve(OPS02_TOKEN, id, "同意执行").getStatusCode()).isEqualTo(HttpStatus.OK);
-        awaitNotificationTasks(approveMark, 1);
+        awaitNotificationTasks(approveMark, 1, id);
 
         List<Row> approved = rowsOfType(id, "TICKET_APPROVED");
         assertThat(approved).as("审批通过必须通知").isNotEmpty();
@@ -446,7 +449,7 @@ class TicketNotificationIT extends TicketITBase {
 
         long rejectMark = notificationTaskMark();
         assertThat(reject(OPS02_TOKEN, id, "变更说明不清").getStatusCode()).isEqualTo(HttpStatus.OK);
-        awaitNotificationTasks(rejectMark, 1);
+        awaitNotificationTasks(rejectMark, 1, id);
 
         List<Row> rejected = rowsOfType(id, "TICKET_REJECTED");
         assertThat(rejected).as("驳回必须通知").isNotEmpty();
@@ -467,18 +470,27 @@ class TicketNotificationIT extends TicketITBase {
     // ------------------------------------------------------------------ AFTER_COMMIT（Important 4）
 
     /**
-     * <b>AFTER_COMMIT 的承重断言</b>：事务回滚时，期间发布的事件一条通知都不该产生。
+     * <b>AFTER_COMMIT 的承重断言</b>：事务在"提交前"失败时，期间发布的事件一条通知都不该产生。
      *
-     * <p>为什么不能只测"提交后有通知"：把注解改成 {@code BEFORE_COMMIT} 或删掉，正常路径照样有通知，
-     * 9 条用例全绿——真正区分 AFTER_COMMIT 的是<b>回滚</b>。这里在一个显式回滚的事务里发布一条审批事件：
+     * <p>为什么不能只测"提交后有通知"：把注解改成 {@code BEFORE_COMMIT}、{@code AFTER_COMPLETION}
+     * 或干脆删掉，正常路径照样有通知——真正区分这几个相位的是<b>事务没有正常提交</b>。
+     *
+     * <p><b>为什么不是简单地 {@code setRollbackOnly()}</b>：Spring 在"已标记回滚"的事务上会直接走
+     * {@code processRollback}，<b>根本不调用 beforeCommit</b>。那样 {@code BEFORE_COMMIT} 的监听器也不会被
+     * 触发，用例就成了恒真——本用例第一版正是这样漏掉的。这里改为让事务<b>走到 beforeCommit 之后、真正提交
+     * 之前</b>失败：注册一个排在监听器之后的同步器，在它的 {@code beforeCommit} 里抛异常。
      * <ul>
-     *   <li>{@code getTaskCount()} 在事务返回时必须没变：回滚回调是同步的，若监听器在提交前就被调用，
-     *       任务此刻已经提交给线程池了（确定性信号，不靠 sleep）；</li>
-     *   <li>该工单也没有多出任何 {@code TICKET_APPROVED} 行。</li>
+     *   <li>{@code AFTER_COMMIT}：回调不发生 → 任务数不变、零行 → 绿；</li>
+     *   <li>{@code BEFORE_COMMIT}：同步器按注册顺序执行，监听器先跑（任务已提交给线程池），随后异常回滚
+     *       → 任务数 +1 → 红；</li>
+     *   <li>{@code AFTER_COMPLETION} 或无注解：同样会把任务提交掉 → 红。</li>
      * </ul>
+     *
+     * <p>判据用 {@code getTaskCount()} 而不是通知行：任务提交是<b>同步</b>发生在这个事务调用里，
+     * 而行是异步写的，用行判断会引入等待/竞态。
      */
     @Test
-    void an_event_published_in_a_rolled_back_transaction_is_never_delivered() {
+    void an_event_whose_transaction_fails_before_commit_is_never_delivered() {
         long submitMark = notificationTaskMark();
         long id = submitTicket(L1_SQL, null, L1_ROLLBACK_SQL);
         awaitNotificationTasks(submitMark, 1);
@@ -487,19 +499,26 @@ class TicketNotificationIT extends TicketITBase {
         long tasksBefore = pool.getTaskCount();
         int rowsBefore = notificationsOf(id).size();
 
-        new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+        assertThatThrownBy(() -> new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
             events.publishEvent(new TicketNotificationEvent(new NotificationCommand(
                     NotificationEventType.TICKET_APPROVED, 1L, id, null,
                     Map.of("system", "订单中心", "ticketNo", String.valueOf(id)),
                     List.of(LEAD_ID))));
-            status.setRollbackOnly();
-        });
+            // 注册在监听器之后：AFTER_COMMIT 的监听器在 afterCommit 才跑，本同步器先把事务打回滚。
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void beforeCommit(boolean readOnly) {
+                    throw new IllegalStateException("测试用例：故意让事务在提交前失败");
+                }
+            });
+        })).as("事务确实失败了，否则这条用例证明不了任何事")
+                .isInstanceOf(RuntimeException.class);
 
         assertThat(pool.getTaskCount())
-                .as("回滚的事务不得把事件交给通知线程池（AFTER_COMMIT 的语义）")
+                .as("事务失败时事件不得交给通知线程池（AFTER_COMMIT 的语义）")
                 .isEqualTo(tasksBefore);
         assertThat(notificationsOf(id))
-                .as("回滚后该工单不该多出任何通知行")
+                .as("事务失败后该工单不该多出任何通知行")
                 .hasSize(rowsBefore);
         assertThat(rowsOfType(id, "TICKET_APPROVED")).isEmpty();
     }
@@ -580,7 +599,7 @@ class TicketNotificationIT extends TicketITBase {
         long mark = notificationTaskMark();
         assertThat(recoveryJob.recoverStuckExecuting())
                 .as("这张单应该被恢复任务选中").isEqualTo(1);
-        awaitNotificationTasks(mark, 1);
+        awaitNotificationTasks(mark, 1, id);
 
         assertThat(status(id)).isEqualTo("NEEDS_MANUAL_CONFIRM");
         List<Row> rows = rowsOfType(id, "TICKET_EXEC_FAILED");
@@ -675,6 +694,17 @@ class TicketNotificationIT extends TicketITBase {
 
     /** 等通知线程池完成至少 {@code expected} 个新任务。超时是失败，不是跳过。 */
     private void awaitNotificationTasks(long mark, int expected) {
+        awaitNotificationTasks(mark, expected, null);
+    }
+
+    /**
+     * 同上，但超时信息里带上该工单<b>实际产生了哪些事件</b>。
+     *
+     * <p>为什么值得多传一个工单 ID：当实现漏发某类通知时（例如驳回不发布），失败信息如果只有
+     * "已完成 0/1"，看不出是"没发布"还是"发布了但没跑"；列出该工单已有的事件类型，一眼就能定位
+     * "缺的是 TICKET_REJECTED"。
+     */
+    private void awaitNotificationTasks(long mark, int expected, Long ticketId) {
         long deadline = System.nanoTime() + AWAIT_NANOS;
         long done = 0;
         while (System.nanoTime() < deadline) {
@@ -685,10 +715,16 @@ class TicketNotificationIT extends TicketITBase {
             }
             sleepPoll();
         }
+        String events = ticketId == null ? "" : "；该工单已产生的通知事件=" + eventTypesOf(ticketId);
         throw new AssertionError("通知任务未在 " + (AWAIT_NANOS / 1_000_000_000L) + "s 内完成：已完成 "
                 + done + "/" + expected + "，活动线程 " + pool().getActiveCount()
                 + "，队列 " + pool().getQueue().size()
-                + "，notification 行数 " + countNotifications());
+                + "，notification 行数 " + countNotifications() + events);
+    }
+
+    /** 某个工单已落库的通知事件类型（按行顺序，可能重复）。 */
+    private List<String> eventTypesOf(long ticketId) {
+        return notificationsOf(ticketId).stream().map(Row::eventType).toList();
     }
 
     /** 等渠道桩第一次被调用（轮询，最多 10s）。超时是失败：投递压根没发生。 */
