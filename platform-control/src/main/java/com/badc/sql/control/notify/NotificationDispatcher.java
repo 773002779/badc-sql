@@ -32,6 +32,12 @@ import com.badc.sql.control.notify.channel.ChannelSender;
  * 这是 FR-13 的核心要求——一个人的通知失败不能顺带把别人也拖下水。落库在发送<b>之前</b>（{@code PENDING}），
  * 这样进程崩溃时留下的 PENDING 行是唯一的痕迹。
  *
+ * <h2>收件人来源</h2>
+ * <p>两条通道，顺序固定：{@link NotificationCommand#hasExplicitRecipients()} 为真时<b>直接用它</b>
+ * （审批/执行结果要发给提交人，而提交人不在系统归属里），否则按
+ * {@link NotificationRecipients#resolve} 解析归属。显式列表只在"归属表达不了"的地方使用——
+ * 能由归属回答的（提交、L3 待终审、主备缺位兜底）一律走 resolve，避免两套收件人口径并存。
+ *
  * <h2>四种结果</h2>
  * <ul>
  *   <li>渠道 {@link ChannelSender#isConfigured()} 为 false → {@code SKIPPED}（"渠道未启用"），一次都不发；</li>
@@ -149,7 +155,11 @@ public class NotificationDispatcher {
 
     private void deliverAll(NotificationCommand command) {
         Rendered rendered = NotificationRenderer.render(command);
-        List<Long> recipientIds = recipients.resolve(command.systemId(), command.type());
+        // 收件人来源只有两处，顺序固定：显式列表（"某个人无论如何都该收到"）优先，否则按系统归属解析。
+        // 放在这里而不是更早，是为了让事件开关先短路——关掉的事件连收件人都不必查。
+        List<Long> recipientIds = command.hasExplicitRecipients()
+                ? command.explicitRecipients()
+                : recipients.resolve(command.systemId(), command.type());
         if (recipientIds == null || recipientIds.isEmpty()) {
             // 没人可发是正常状态（系统还没配运维），不是失败：不写行、不抛异常。
             return;

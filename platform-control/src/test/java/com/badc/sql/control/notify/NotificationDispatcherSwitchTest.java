@@ -106,7 +106,8 @@ class NotificationDispatcherSwitchTest {
         return new NotificationProperties(
                 NotificationProperties.Wecom.defaults(),
                 NotificationProperties.Mail.defaults(),
-                new NotificationProperties.Retry(1, 0));
+                new NotificationProperties.Retry(1, 0),
+                NotificationProperties.DEFAULT_LINK_BASE);
     }
 
     /** 内存版 {@code notification} 表：只记"写了什么行、最后是什么状态"。 */

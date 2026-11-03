@@ -145,7 +145,8 @@ class WeComSenderTest {
         return new NotificationProperties(
                 new NotificationProperties.Wecom(enabled, "corp-1", 1001L, "secret-1", baseUrl),
                 new NotificationProperties.Mail(false, ""),
-                new NotificationProperties.Retry(3, 500));
+                new NotificationProperties.Retry(3, 500),
+                NotificationProperties.DEFAULT_LINK_BASE);
     }
 
     private static NotificationTarget target(String wecomUserId) {

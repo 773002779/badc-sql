@@ -2,7 +2,11 @@ package com.badc.sql.control.notify;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -10,6 +14,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -18,13 +23,16 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.control.support.RecordingChannelSender;
 import com.badc.sql.control.support.TicketITBase;
 import com.badc.sql.control.support.TicketNotificationTestConfig;
+import com.badc.sql.control.ticket.exec.TicketRecoveryJob;
 
 /**
  * 通知接线的端到端用例：真实 HTTP + 真实元数据库 + 真实异步线程池。
@@ -66,6 +74,9 @@ class TicketNotificationIT extends TicketITBase {
     /** 系统 1 的组长（ticket-fixtures.sql 的用户 5）。 */
     private static final long LEAD_ID = 5L;
 
+    /** 提交人 dev01（ticket-fixtures.sql 的用户 1）：审批/执行结果必须送到他手上。 */
+    private static final long SUBMITTER_ID = 1L;
+
     /** 管理员：只用来写通知开关（开关接口本身的权限不属本任务）。 */
     private static final long ADMIN_ID = 3L;
 
@@ -89,6 +100,18 @@ class TicketNotificationIT extends TicketITBase {
 
     @Autowired
     private NotificationSwitchService switches;
+
+    /** 回滚用例要自己开一个事务并显式回滚（见 {@code an_event_published_in_a_rolled_back_transaction_is_never_delivered}）。 */
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    /** 回滚用例直接用真实的发布器发布事件——与生产走同一条 {@code publishEvent} 通道。 */
+    @Autowired
+    private ApplicationEventPublisher events;
+
+    /** 卡死恢复（NEEDS_MANUAL_CONFIRM）的最小用例直接驱动它，不依赖调度器。 */
+    @Autowired
+    private TicketRecoveryJob recoveryJob;
 
     @BeforeEach
     void resetNotificationState() {
@@ -148,6 +171,18 @@ class TicketNotificationIT extends TicketITBase {
         // 反证：确实通知的是"这张单已提交"，而不是一屏空白。
         assertThat(rows).extracting(Row::eventType).containsOnly("TICKET_SUBMITTED");
         assertThat(rows).extracting(Row::recipientId).containsOnly(PRIMARY_OPS_ID);
+
+        // 渠道侧入参也必须干净：落库的行干净不代表交给 sender 的内容干净，而"发出去"的正是后者。
+        assertThat(recorder.titles()).isNotEmpty().allSatisfy(title ->
+                assertThat(title).doesNotContain(literal).doesNotContain("身份证"));
+        assertThat(recorder.bodies()).isNotEmpty().allSatisfy(body ->
+                assertThat(body).doesNotContain(literal).doesNotContain("update t_order"));
+
+        // R36：link-base 默认是空的，此时消息里不该出现"短链"这一行，更不该出现打不开的相对路径。
+        assertThat(rows.get(0).body())
+                .as("link-base 未配置时不得生成短链（默认空 = 不填 link 键）")
+                .doesNotContain("短链")
+                .doesNotContain("/tickets/");
     }
 
     // ------------------------------------------------------------------ R22：不阻塞业务线程
@@ -170,10 +205,12 @@ class TicketNotificationIT extends TicketITBase {
         List<String> names = recorder.threadNames();
         assertThat(names).as("渠道必须真的被调用过，否则线程名断言是空转").isNotEmpty();
         assertThat(names).allSatisfy(name -> assertThat(name)
-                .as("投递线程不能是 HTTP 请求线程（%s）", Thread.currentThread().getName())
+                // 消息里打观测到的线程名集合：断言失败时看到的是"投递跑在哪"，而不是 JUnit 线程的名字。
+                .as("投递必须发生在通知线程池；观测到的线程名=%s", names)
                 .startsWith(AsyncConfig.THREAD_NAME_PREFIX)
                 .doesNotContain("http-nio")
                 .doesNotContain("Test worker"));
+        assertThat(recorder.sentCount()).as("至少有一条真的发成功").isPositive();
         assertThat(notificationsOf(id)).isNotEmpty();
         // 收尾：等这一批投递跑完，别把活动任务留给下一个用例。
         awaitNotificationTasks(mark, 1);
@@ -300,6 +337,9 @@ class TicketNotificationIT extends TicketITBase {
         assertThat(jdbc.queryForList("select status from notification where ticket_id = ?", String.class, id))
                 .as("失败必须落成 FAILED 行，而不是被静默吞掉")
                 .contains("FAILED");
+        // 渠道确实被反复尝试过（max-attempts=3）：证明上面的 FAILED 行不是"没发就标失败"。
+        assertThat(recorder.attempts()).isGreaterThanOrEqualTo(3);
+        assertThat(recorder.sentCount()).as("失败的渠道一次都不该算成功").isZero();
     }
 
     // ------------------------------------------------------------------ 事件开关
@@ -365,6 +405,105 @@ class TicketNotificationIT extends TicketITBase {
         });
     }
 
+    // ------------------------------------------------------------------ 审批结果的收件人（Critical 1）
+
+    /**
+     * 审批通过：<b>提交人必须收到</b>（brief 的「提交人 + 一级审核人」）。
+     *
+     * <p>这是"通知到底有没有用"的分水岭：提完单在等结果的研发，如果只按系统归属发，他永远收不到自己的
+     * 审批结果——通知发给了刚点完按钮的运维。归属解析（PRIMARY/BACKUP）表达不了"某个人必然要收到"，
+     * 所以这条断言必须钉在收件人集合上，而不是"有没有行"。
+     */
+    @Test
+    void an_approval_reaches_the_submitter_and_the_first_level_reviewer() {
+        long submitMark = notificationTaskMark();
+        long id = submitTicket(L1_SQL, null, L1_ROLLBACK_SQL);
+        awaitNotificationTasks(submitMark, 1);
+
+        long approveMark = notificationTaskMark();
+        assertThat(approve(OPS02_TOKEN, id, "同意执行").getStatusCode()).isEqualTo(HttpStatus.OK);
+        awaitNotificationTasks(approveMark, 1);
+
+        List<Row> approved = rowsOfType(id, "TICKET_APPROVED");
+        assertThat(approved).as("审批通过必须通知").isNotEmpty();
+        assertThat(approved)
+                .as("提交人在等结果，必须收到；一级审核人（本次审批人）也在收件人里")
+                .extracting(Row::recipientId)
+                .contains(SUBMITTER_ID, PRIMARY_OPS_ID);
+    }
+
+    /**
+     * 驳回：<b>提交人必须收到，且理由进 facts</b>（`reason` 只放审核意见/驳回理由，R31）。
+     *
+     * <p>驳回是提交人最需要看到的一条通知——它决定他下一步改什么。只测"通过"不测"驳回"，
+     * 等于把这条最关键的路径交给"实现时别忘了"。
+     */
+    @Test
+    void a_rejection_reaches_the_submitter_with_the_reason() {
+        long submitMark = notificationTaskMark();
+        long id = submitTicket(L1_SQL, null, L1_ROLLBACK_SQL);
+        awaitNotificationTasks(submitMark, 1);
+
+        long rejectMark = notificationTaskMark();
+        assertThat(reject(OPS02_TOKEN, id, "变更说明不清").getStatusCode()).isEqualTo(HttpStatus.OK);
+        awaitNotificationTasks(rejectMark, 1);
+
+        List<Row> rejected = rowsOfType(id, "TICKET_REJECTED");
+        assertThat(rejected).as("驳回必须通知").isNotEmpty();
+        assertThat(rejected)
+                .as("驳回通知必须落到提交人（和一级审核人）身上")
+                .extracting(Row::recipientId)
+                .contains(SUBMITTER_ID, PRIMARY_OPS_ID);
+        assertThat(rejected).allSatisfy(row ->
+                assertThat(row.body()).as("驳回理由要进消息（reason 只放审核意见）").contains("原因：变更说明不清"));
+        // 驳回理由之外的键集仍受 R31 约束：不带模块/数据源/语句类型/风险等级。
+        assertThat(rejected.get(0).body())
+                .doesNotContain("模块")
+                .doesNotContain("数据源")
+                .doesNotContain("语句类型")
+                .doesNotContain("风险等级");
+    }
+
+    // ------------------------------------------------------------------ AFTER_COMMIT（Important 4）
+
+    /**
+     * <b>AFTER_COMMIT 的承重断言</b>：事务回滚时，期间发布的事件一条通知都不该产生。
+     *
+     * <p>为什么不能只测"提交后有通知"：把注解改成 {@code BEFORE_COMMIT} 或删掉，正常路径照样有通知，
+     * 9 条用例全绿——真正区分 AFTER_COMMIT 的是<b>回滚</b>。这里在一个显式回滚的事务里发布一条审批事件：
+     * <ul>
+     *   <li>{@code getTaskCount()} 在事务返回时必须没变：回滚回调是同步的，若监听器在提交前就被调用，
+     *       任务此刻已经提交给线程池了（确定性信号，不靠 sleep）；</li>
+     *   <li>该工单也没有多出任何 {@code TICKET_APPROVED} 行。</li>
+     * </ul>
+     */
+    @Test
+    void an_event_published_in_a_rolled_back_transaction_is_never_delivered() {
+        long submitMark = notificationTaskMark();
+        long id = submitTicket(L1_SQL, null, L1_ROLLBACK_SQL);
+        awaitNotificationTasks(submitMark, 1);
+
+        ThreadPoolExecutor pool = pool();
+        long tasksBefore = pool.getTaskCount();
+        int rowsBefore = notificationsOf(id).size();
+
+        new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+            events.publishEvent(new TicketNotificationEvent(new NotificationCommand(
+                    NotificationEventType.TICKET_APPROVED, 1L, id, null,
+                    Map.of("system", "订单中心", "ticketNo", String.valueOf(id)),
+                    List.of(LEAD_ID))));
+            status.setRollbackOnly();
+        });
+
+        assertThat(pool.getTaskCount())
+                .as("回滚的事务不得把事件交给通知线程池（AFTER_COMMIT 的语义）")
+                .isEqualTo(tasksBefore);
+        assertThat(notificationsOf(id))
+                .as("回滚后该工单不该多出任何通知行")
+                .hasSize(rowsBefore);
+        assertThat(rowsOfType(id, "TICKET_APPROVED")).isEmpty();
+    }
+
     // ------------------------------------------------------------------ 执行终态
 
     /** 执行成功 → {@link NotificationEventType#TICKET_EXECUTED}，且消息里没有任何错误文本/SQL。 */
@@ -380,6 +519,10 @@ class TicketNotificationIT extends TicketITBase {
 
         List<Row> rows = rowsOfType(id, "TICKET_EXECUTED");
         assertThat(rows).as("执行成功必须通知").isNotEmpty();
+        assertThat(rows)
+                .as("执行结果发给提交人 + 系统运维（brief 口径）")
+                .extracting(Row::recipientId)
+                .contains(SUBMITTER_ID, PRIMARY_OPS_ID);
         assertThat(rows).allSatisfy(row -> {
             assertThat(row.body()).doesNotContain("update t_order").doesNotContain("t_order");
             assertThat(row.body()).doesNotContain("dml_user").doesNotContain("dml-pass");
@@ -415,6 +558,41 @@ class TicketNotificationIT extends TicketITBase {
         assertThat(jdbc.queryForObject("""
                 select error_message from ticket_statement where ticket_id = ? and seq_no = 1
                 """, String.class, id)).contains("模拟的语句执行失败");
+        assertThat(rows)
+                .as("执行失败同样发给提交人 + 系统运维")
+                .extracting(Row::recipientId)
+                .contains(SUBMITTER_ID, PRIMARY_OPS_ID);
+    }
+
+    /**
+     * {@code NEEDS_MANUAL_CONFIRM}：卡死恢复把工单交给人工时，也要发 {@link NotificationEventType#TICKET_EXEC_FAILED}。
+     *
+     * <p>这个终态只由 {@link TicketRecoveryJob#recoverStuckExecuting()} 产生（不在 {@code TicketExecutionService}
+     * 里），所以它的通知接线只能在这里验：提交 → 审批 → 把工单伪造成"执行中且已卡死 3 小时" → 驱动恢复任务。
+     */
+    @Test
+    void a_stuck_execution_notifies_the_submitter_and_the_system_operators() {
+        long id = approvedTicket();
+        // 伪造"执行中且超时"：executed_at 回拨 3 小时（阈值是 2 小时），不依赖真实等待。
+        jdbc.update("update ticket set status = 'EXECUTING', executed_at = ? where id = ?",
+                Timestamp.from(Instant.now().minus(3, ChronoUnit.HOURS)), id);
+
+        long mark = notificationTaskMark();
+        assertThat(recoveryJob.recoverStuckExecuting())
+                .as("这张单应该被恢复任务选中").isEqualTo(1);
+        awaitNotificationTasks(mark, 1);
+
+        assertThat(status(id)).isEqualTo("NEEDS_MANUAL_CONFIRM");
+        List<Row> rows = rowsOfType(id, "TICKET_EXEC_FAILED");
+        assertThat(rows).as("转人工必须通知").isNotEmpty();
+        assertThat(rows)
+                .as("转人工的通知同样发给提交人 + 系统运维")
+                .extracting(Row::recipientId)
+                .contains(SUBMITTER_ID, PRIMARY_OPS_ID);
+        assertThat(rows).allSatisfy(row -> assertThat(row.body())
+                .as("恢复原因（含工单/库状态描述）不进消息")
+                .doesNotContain("执行超过")
+                .doesNotContain("人工核对"));
     }
 
     // ------------------------------------------------------------------ 提交 / 审批 / 执行辅助
@@ -427,6 +605,10 @@ class TicketNotificationIT extends TicketITBase {
 
     private ResponseEntity<String> approve(String token, long ticketId, String comment) {
         return postJson(token, "/api/v1/tickets/" + ticketId + "/approve", "{\"comment\":\"" + comment + "\"}");
+    }
+
+    private ResponseEntity<String> reject(String token, long ticketId, String comment) {
+        return postJson(token, "/api/v1/tickets/" + ticketId + "/reject", "{\"comment\":\"" + comment + "\"}");
     }
 
     /** 提交 → 一级审批 → 执行前风险确认，返回可执行的工单 ID（与 TicketExecutionIT 同一套真实链路）。 */

@@ -40,3 +40,6 @@ badcsql:
       # 第 n 次退避 = base-backoff-millis * 2^(n-1)
       max-attempts: 3
       base-backoff-millis: 500
+    # 通知"短链"的基地址（控制台前端，例如 https://console.example.com）。
+    # 默认空 = 消息里不出现短链；配错会给出一打点不开的死链，所以只接受显式配置，不在代码里猜。
+    link-base: "${BADCSQL_NOTIFY_LINK_BASE:}"

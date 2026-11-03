@@ -11,7 +11,10 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *   <li>{@code badcsql.notify.wecom.enabled}、{@code corp-id}、{@code agent-id}、{@code secret}、
  *       {@code base-url}——企微应用消息；{@code base-url} 默认企微官方地址，测试指向本机桩；</li>
  *   <li>{@code badcsql.notify.mail.enabled}、{@code from}——邮件渠道；</li>
- *   <li>{@code badcsql.notify.retry.max-attempts=3}、{@code base-backoff-millis=500}——投递重试口径。</li>
+ *   <li>{@code badcsql.notify.retry.max-attempts=3}、{@code base-backoff-millis=500}——投递重试口径；</li>
+ *   <li>{@code badcsql.notify.link-base}——消息里"短链"的基地址（控制台前端，R36）。<b>默认空</b>：
+ *       空表示不填 {@code link} 这个键，而不是发一个点不开的相对路径；配错会给出死链，
+ *       所以只接受显式配置，绝不猜一个域名。</li>
  * </ul>
  *
  * <p><b>真实密钥一律不写进 {@code application.yml}</b>：{@code secret} / 邮件口令走环境变量或部署期注入，
@@ -28,7 +31,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * 组内字段用 {@code @DefaultValue} 兜住"只配了组内一项"的情况。
  */
 @ConfigurationProperties(prefix = "badcsql.notify")
-public record NotificationProperties(Wecom wecom, Mail mail, Retry retry) {
+public record NotificationProperties(Wecom wecom, Mail mail, Retry retry,
+        @DefaultValue("") String linkBase) {
 
     /** 企微 API 默认地址；测试通过 {@code base-url} 指向本机桩。 */
     public static final String DEFAULT_WECOM_BASE_URL = "https://qyapi.weixin.qq.com";
@@ -39,16 +43,20 @@ public record NotificationProperties(Wecom wecom, Mail mail, Retry retry) {
     /** 默认首次退避 500ms，之后按 {@code base * 2^(n-1)} 递增。 */
     public static final int DEFAULT_BASE_BACKOFF_MILLIS = 500;
 
-    /** 嵌套组缺省时换成默认实例，绝不让 sender 拿到 {@code null} 组。 */
+    /** 短链基地址的默认值：<b>空</b>。空表示"不填 link 键"，而不是填一个打不开的路径。 */
+    public static final String DEFAULT_LINK_BASE = "";
+
+    /** 嵌套组缺省时换成默认实例，绝不让 sender 拿到 {@code null} 组；短链基地址空串归一。 */
     public NotificationProperties {
         wecom = wecom != null ? wecom : Wecom.defaults();
         mail = mail != null ? mail : Mail.defaults();
         retry = retry != null ? retry : Retry.defaults();
+        linkBase = linkBase == null ? DEFAULT_LINK_BASE : linkBase.strip();
     }
 
-    /** 全默认口径：三个渠道全关，重试 3 次 / 500ms。 */
+    /** 全默认口径：三个渠道全关，重试 3 次 / 500ms，短链基地址为空（不生成 link）。 */
     public static NotificationProperties defaults() {
-        return new NotificationProperties(Wecom.defaults(), Mail.defaults(), Retry.defaults());
+        return new NotificationProperties(Wecom.defaults(), Mail.defaults(), Retry.defaults(), DEFAULT_LINK_BASE);
     }
 
     /**

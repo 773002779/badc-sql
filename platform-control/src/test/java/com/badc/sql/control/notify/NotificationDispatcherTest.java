@@ -318,7 +318,8 @@ class NotificationDispatcherTest {
         return new NotificationProperties(
                 NotificationProperties.Wecom.defaults(),
                 new NotificationProperties.Mail(true, "noreply@badc.test"),
-                new NotificationProperties.Retry(maxAttempts, baseBackoffMillis));
+                new NotificationProperties.Retry(maxAttempts, baseBackoffMillis),
+                NotificationProperties.DEFAULT_LINK_BASE);
     }
 
     private static NotificationTarget target(long userId, String email, String wecomUserId) {

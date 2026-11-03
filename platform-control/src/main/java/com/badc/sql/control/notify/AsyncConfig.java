@@ -2,6 +2,7 @@ package com.badc.sql.control.notify;
 
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,7 +22,7 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
  * <ul>
  *   <li>线程数有界（core 2 / max 4）；</li>
  *   <li>队列有界（200）：积压不可能是无限的，满了就按拒绝策略处理，而不是把内存吃光；</li>
- *   <li>拒绝策略<b>记录日志</b>并与业务隔离（见 {@link LoggingCallerRunsHandler}）。</li>
+ *   <li>拒绝策略<b>记录 error 后丢弃</b>：不静默、也绝不在业务线程上跑（见 {@link LoggingDiscardHandler}）。</li>
  * </ul>
  *
  * <p>为什么 bean 名要显式写在 {@code @Async} 上（{@link #NOTIFICATION_EXECUTOR}）：上下文里还有
@@ -71,37 +72,48 @@ public class AsyncConfig {
         executor.setMaxPoolSize(MAX_POOL_SIZE);
         executor.setQueueCapacity(QUEUE_CAPACITY);
         executor.setThreadNamePrefix(THREAD_NAME_PREFIX);
-        executor.setRejectedExecutionHandler(new LoggingCallerRunsHandler());
+        executor.setRejectedExecutionHandler(new LoggingDiscardHandler());
         return executor;
     }
 
     /**
-     * 拒绝策略：<b>先记录，再在提交线程里跑完</b>，绝不静默丢弃。
+     * 拒绝策略：<b>记录 error，然后丢弃</b>——既不在业务线程上跑，也不静默。
      *
-     * <p>为什么不用 JDK 的 {@code CallerRunsPolicy}：它在执行器已停机时是
-     * {@code if (!executor.isShutdown()) task.run();} ——<b>什么都不做、也不打日志</b>，通知就此消失且无人知晓。
-     * 通知不像工单执行那样有"状态没落地"的外部证据，静默丢一条就是永久丢一条，所以这里两个分支都必须留下痕迹：
+     * <p>为什么<b>不</b>用 CallerRuns（JDK 的或自己写的）：池满时在提交线程里跑投递，意味着
+     * <b>HTTP 请求线程要跑完整个渠道重试</b>（最坏 3 次尝试 + 500/1000ms 退避），直接违反 R22
+     * "通知不阻塞业务线程"。更隐蔽的后果：发布点将来若带事务，这个 inline run 会发生在
+     * {@code afterCommit} 里、连接仍绑定，投递器写下的 {@code notification} 行会随连接释放而丢失——
+     * 通知没发出去，连失败记录都没有。
+     *
+     * <p>两个分支都是"丢弃 + 留痕"：
      * <ul>
-     *   <li>未停机（4 个线程 + 200 队列都占着）→ 记 warn 后在提交线程里跑。宁可让这次请求多花一次投递的时间，
-     *       也不丢通知；</li>
-     *   <li>已停机 → 记 error 后放弃。此时业务事务早已提交（AFTER_COMMIT），没有任何东西可以回滚，
-     *       唯一能做的是让日志说得清楚：这条通知没发出去。</li>
+     *   <li>池满（4 线程 + 200 队列都占着）→ {@code log.error}，带池状态与任务标识，便于事后按工单补发；</li>
+     *   <li>已停机 → {@code log.error}，说明进程正在退出。</li>
      * </ul>
      *
-     * <p>public：用例要能直接钉住这两个分支——"停机时不静默"正是本策略存在的理由。
+     * <p><b>能记到哪一层</b>：拒绝发生在 {@code @Async} 代理把任务交给线程池的那一刻，监听器方法体还没进入，
+     * 所以这里拿不到 eventType/systemId——能拿到的是任务对象的类名（通常就是监听器 lambda）与池状态。
+     * 要带完整事件上下文，只能放弃 {@code @Async} 改由监听器自己 {@code execute}（那会偏离任务简报的
+     * 异步设计），故保留现状并在日志里给出足够的定位线索。
+     *
+     * <p>public：用例要直接钉住"被拒绝的任务一次都没跑"——这正是本策略存在的理由。
      */
-    public static final class LoggingCallerRunsHandler implements RejectedExecutionHandler {
+    public static final class LoggingDiscardHandler implements RejectedExecutionHandler {
+
+        /** 丢弃计数：进程内累计，便于用日志/指标观察"通知池是否长期打满"。 */
+        private static final AtomicLong DROPPED = new AtomicLong();
 
         @Override
         public void rejectedExecution(Runnable task, ThreadPoolExecutor executor) {
+            long dropped = DROPPED.incrementAndGet();
             if (executor.isShutdown()) {
-                log.error("通知线程池已停止，任务被丢弃（业务已提交，通知为尽力而为）；队列积压 {} 条",
-                        executor.getQueue().size());
+                log.error("通知线程池已停止，任务被丢弃（业务已提交，通知为尽力而为）；累计丢弃 {} 条，队列 {} 条，任务 {}",
+                        dropped, executor.getQueue().size(), task.getClass().getName());
                 return;
             }
-            log.warn("通知线程池已满（active={}，queue={}），改为在提交线程内同步投递：{}",
-                    executor.getActiveCount(), executor.getQueue().size(), task.getClass().getSimpleName());
-            task.run();
+            log.error("通知线程池已满（active={}，queue={}），任务被丢弃；累计丢弃 {} 条，任务 {}。"
+                            + "业务不受影响，但这条通知不会重发——需要时按工单手工补发",
+                    executor.getActiveCount(), executor.getQueue().size(), dropped, task.getClass().getName());
         }
     }
 }

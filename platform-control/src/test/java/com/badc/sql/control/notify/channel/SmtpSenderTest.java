@@ -87,7 +87,8 @@ class SmtpSenderTest {
         return new NotificationProperties(
                 new NotificationProperties.Wecom(false, "", 0L, "", NotificationProperties.DEFAULT_WECOM_BASE_URL),
                 new NotificationProperties.Mail(enabled, FROM),
-                new NotificationProperties.Retry(3, 500));
+                new NotificationProperties.Retry(3, 500),
+                NotificationProperties.DEFAULT_LINK_BASE);
     }
 
     private static NotificationTarget target(String email) {

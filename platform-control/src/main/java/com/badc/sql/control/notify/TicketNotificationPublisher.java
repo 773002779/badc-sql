@@ -42,6 +42,13 @@ import com.badc.sql.control.ticket.TicketStatus;
  *   <li>{@code module} / {@code datasource} 的名字查不到（被删）时整项跳过，不写占位符。</li>
  * </ul>
  *
+ * <h2>收件人：归属 + 显式两条通道</h2>
+ * <p>"系统主/备运维"回答不了"提交人在等结果"这件事：审批通过/驳回若只按归属发，通知会发给刚点完按钮的
+ * 运维，而提完单的研发一条都收不到。所以审批结果显式发给<b>提交人 + 一级审核人</b>，执行结果显式发给
+ * <b>提交人 + 系统运维</b>（都走 {@link NotificationCommand#explicitRecipients()}）；其余事件不带显式收件人，
+ * 仍由 {@link NotificationRecipients#resolve} 按归属解析——两条通道的边界写在
+ * {@link #explicitRecipients(TicketEntity, NotificationEventType)} 里。
+ *
  * <h2>R16 兜底</h2>
  * <p>提交事件发布前先解析一次基线收件人（{@link NotificationRecipients#resolve(long,
  * NotificationEventType)}，事件用 {@link NotificationEventType#TICKET_SUBMITTED}）。为空说明该系统
@@ -62,19 +69,25 @@ public class TicketNotificationPublisher {
     private static final String STATEMENT_TYPES_SQL =
             "select statement_type from ticket_statement where ticket_id = ? order by seq_no";
 
-    /** 短链前缀：控制面自己的工单详情接口（本切片没有独立的前端域名配置，发相对路径）。 */
-    private static final String TICKET_LINK_PREFIX = "/api/v1/tickets/";
+    /** 工单详情路径；基地址来自 {@code badcsql.notify.link-base}（R36），基地址为空时不生成短链。 */
+    private static final String TICKET_DETAIL_PATH = "/tickets/";
+
+    /** 一级审核人：审批结果的另一个收件人（提交人之外）。 */
+    private static final String FIRST_LEVEL_REVIEWER_SQL =
+            "select reviewer_id from ticket_review where ticket_id = ? and review_level = 1";
 
     private final ApplicationEventPublisher events;
     private final NotificationRecipients recipients;
     private final TicketMapper ticketMapper;
+    private final NotificationProperties properties;
     private final JdbcTemplate jdbc;
 
     public TicketNotificationPublisher(ApplicationEventPublisher events, NotificationRecipients recipients,
-            TicketMapper ticketMapper, JdbcTemplate jdbc) {
+            TicketMapper ticketMapper, NotificationProperties properties, JdbcTemplate jdbc) {
         this.events = events;
         this.recipients = recipients;
         this.ticketMapper = ticketMapper;
+        this.properties = properties;
         this.jdbc = jdbc;
     }
 
@@ -214,8 +227,92 @@ public class TicketNotificationPublisher {
 
     private void publish(TicketEntity ticket, NotificationEventType type, String reason) {
         Map<String, String> facts = facts(ticket, type, reason);
+        List<Long> explicitRecipients = explicitRecipients(ticket, type);
         events.publishEvent(new TicketNotificationEvent(new NotificationCommand(
-                type, ticket.systemId(), ticket.id(), null, facts)));
+                type, ticket.systemId(), ticket.id(), null, facts, explicitRecipients)));
+    }
+
+    /**
+     * 哪些事件需要显式收件人。
+     *
+     * <p>只有两类：<b>审批结果</b>（提交人在等，而他不在系统归属里）与<b>执行结果</b>（提交人 + 系统运维）。
+     * 其余事件一律返回 {@code null}，交给 {@link NotificationRecipients#resolve} 按归属解析——
+     * 能由归属回答的事不要另开一套口径。
+     *
+     * @return 非空列表表示"就用这些人"；{@code null} 表示走归属解析
+     */
+    private List<Long> explicitRecipients(TicketEntity ticket, NotificationEventType type) {
+        return switch (type) {
+            case TICKET_APPROVED, TICKET_REJECTED -> reviewOutcomeRecipients(ticket);
+            case TICKET_EXECUTED, TICKET_EXEC_FAILED -> executionRecipients(ticket);
+            default -> null;
+        };
+    }
+
+    /**
+     * 审批结果：<b>提交人 + 一级审核人</b>（brief 的口径）。
+     *
+     * <p>只给运维是错的——提完单在等结果的是研发，他收不到就等于没通知。一级审核人也要在列表里：
+     * 一张 L3 单的终审结果（组长批/驳）对一级运维同样重要。两者用 {@link LinkedHashSet} 去重保序
+     * （提交人恰好是审核人时只有一行）。一级审核人可能不存在（例如数据被清理），那就只发提交人。
+     */
+    private List<Long> reviewOutcomeRecipients(TicketEntity ticket) {
+        LinkedHashSet<Long> ids = new LinkedHashSet<>();
+        if (ticket.submitterId() != null) {
+            ids.add(ticket.submitterId());
+        }
+        Long firstLevelReviewer = firstLevelReviewer(ticket.id());
+        if (firstLevelReviewer != null) {
+            ids.add(firstLevelReviewer);
+        }
+        return List.copyOf(ids);
+    }
+
+    /**
+     * 执行结果：<b>提交人 + 该系统的运维</b>（brief 的口径）。
+     *
+     * <p>归属解析失败时不能让整条通知消失：至少把提交人发出去（他点了"执行"，最需要知道结果）。
+     * 两者都为空时返回 {@code null}，退回投递器按事件类型解析——那是最后的兜底，不是正常路径。
+     */
+    private List<Long> executionRecipients(TicketEntity ticket) {
+        LinkedHashSet<Long> ids = new LinkedHashSet<>();
+        try {
+            List<Long> operators = recipients.resolve(ticket.systemId(), NotificationEventType.TICKET_SUBMITTED);
+            if (operators != null) {
+                ids.addAll(operators);
+            }
+        } catch (RuntimeException e) {
+            log.warn("执行通知的运维收件人解析失败（系统 {}），只发给提交人：{}",
+                    ticket.systemId(), NotificationErrorText.sanitize(e));
+        }
+        if (ticket.submitterId() != null) {
+            ids.add(ticket.submitterId());
+        }
+        return ids.isEmpty() ? null : List.copyOf(ids);
+    }
+
+    /** 一级审核人；没有该级审核记录时返回 {@code null}。 */
+    private Long firstLevelReviewer(long ticketId) {
+        List<Long> ids = jdbc.queryForList(FIRST_LEVEL_REVIEWER_SQL, Long.class, ticketId);
+        return ids.isEmpty() ? null : ids.get(0);
+    }
+
+    /**
+     * 短链（R36）：{@code {link-base}/tickets/{id}}，例如 {@code https://console.example.com/tickets/42}。
+     *
+     * <p><b>基地址为空时返回 {@code null}（不填 link 键）</b>：相对路径在企微里既点不开也不是给人读的地址，
+     * 与其发一个打不开的链接，不如不发这一行。基地址只接受显式配置——猜一个域名等于批量制造死链。
+     */
+    private String link(long ticketId) {
+        String base = properties.linkBase();
+        if (base == null || base.isBlank()) {
+            return null;
+        }
+        String normalized = base.strip();
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized.isEmpty() ? null : normalized + TICKET_DETAIL_PATH + ticketId;
     }
 
     /**
@@ -240,7 +337,7 @@ public class TicketNotificationPublisher {
         Map<String, String> facts = new LinkedHashMap<>();
         put(facts, "system", name(SYSTEM_NAME_SQL, ticket.systemId()));
         put(facts, "ticketNo", String.valueOf(ticket.id()));
-        put(facts, "link", TICKET_LINK_PREFIX + ticket.id());
+        put(facts, "link", link(ticket.id()));
 
         if (type == NotificationEventType.TICKET_EXECUTED
                 || type == NotificationEventType.TICKET_EXEC_FAILED) {

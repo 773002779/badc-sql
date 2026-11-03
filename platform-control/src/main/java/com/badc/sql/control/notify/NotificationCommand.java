@@ -1,10 +1,12 @@
 package com.badc.sql.control.notify;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
- * 一条待渲染的通知：事件类型 + 关联的业务主键 + <b>白名单事实</b>。
+ * 一条待渲染的通知：事件类型 + 关联的业务主键 + <b>白名单事实</b> + 可选的显式收件人。
  *
  * <h2>为什么不带 SQL</h2>
  * <p>FR-13 要求通知里<b>不得出现 SQL 正文</b>。如果只靠"调用方自觉"，总有人会把整条语句塞进
@@ -21,18 +23,32 @@ import java.util.Set;
  * <p>{@code facts} 在构造时复制成不可变 Map，{@code null} 值与白名单之外的键一样被拒绝（"缺失"
  * 用不传这个键表达，而不是传 {@code null}）。空 Map 合法：不是每个事件都有全部事实，渲染时缺失项跳过。
  *
- * @param type           事件类型，非 {@code null}
- * @param systemId       相关业务系统 ID；{@code long} 而非 {@code Long}，所以"系统为空"在类型上就不可表达
- * @param ticketId       相关工单 ID；非工单事件为 {@code null}
- * @param grantRequestId 相关授权申请 ID；非授权事件为 {@code null}
- * @param facts          白名单事实，非 {@code null}，值非 {@code null}
+ * <h2>为什么需要显式收件人</h2>
+ * <p>{@link NotificationRecipients#resolve} 表达的是<b>归属</b>（该系统的主/备运维、必要时加组长），
+ * 它回答不了"某个人无论如何都该收到"这件事：
+ * <ul>
+ *   <li>审批结果要发给<b>提交人</b>——他知道自己在等这个结果，而系统归属里根本没有他；</li>
+ *   <li>驳回同理：提完单在等的人收不到，通知等于没发；</li>
+ *   <li>执行结果要发给<b>提交人 + 系统运维</b>：发起执行的人需要知道跑完了没有。</li>
+ * </ul>
+ * 所以这里留了一条显式通道：{@code explicitRecipients} 非空时投递器<b>直接用它</b>、跳过归属解析；
+ * 为 {@code null} 或空（"没人"）时保持原有 resolve 逻辑。显式列表只装用户 ID——没有邮箱、没有 SQL，
+ * 不构成新的泄露面。
+ *
+ * @param type              事件类型，非 {@code null}
+ * @param systemId          相关业务系统 ID；{@code long} 而非 {@code Long}，所以"系统为空"在类型上就不可表达
+ * @param ticketId          相关工单 ID；非工单事件为 {@code null}
+ * @param grantRequestId    相关授权申请 ID；非授权事件为 {@code null}
+ * @param facts             白名单事实，非 {@code null}，值非 {@code null}
+ * @param explicitRecipients 显式收件人用户 ID；{@code null}/空表示"按归属解析"。构造时去 null、去重、保序
  */
 public record NotificationCommand(
         NotificationEventType type,
         long systemId,
         Long ticketId,
         Long grantRequestId,
-        Map<String, String> facts) {
+        Map<String, String> facts,
+        List<Long> explicitRecipients) {
 
     /**
      * 允许出现在 {@code facts} 里的键。
@@ -54,6 +70,18 @@ public record NotificationCommand(
             "link",
             "reason");
 
+    /**
+     * 不指定显式收件人的构造（走归属解析）。
+     *
+     * <p>保留这个重载是为了让"只有归属规则"的事件（提交、L3 待终审、授权类）读起来更短，
+     * 也避免调用方为了少写一个参数而传 {@code List.of()}——那与 {@code null} 同义，但更容易被误读成
+     * "明确没人可发"。
+     */
+    public NotificationCommand(NotificationEventType type, long systemId, Long ticketId, Long grantRequestId,
+            Map<String, String> facts) {
+        this(type, systemId, ticketId, grantRequestId, facts, null);
+    }
+
     public NotificationCommand {
         if (type == null) {
             throw new IllegalArgumentException("type 不能为空：通知必须知道自己在通知什么事件");
@@ -74,5 +102,15 @@ public record NotificationCommand(
             }
         }
         facts = Map.copyOf(facts);
+        // 收件人在这里归一：null 原样保留（"没指定"，交给投递器 resolve），非 null 去 null、去重、保序。
+        // 去重是必须的：提交人恰好也是本系统运维时，同一个人不该收到两条一样的通知。
+        explicitRecipients = explicitRecipients == null
+                ? null
+                : explicitRecipients.stream().filter(Objects::nonNull).distinct().toList();
+    }
+
+    /** 是否指定了显式收件人（非 {@code null} 且非空）。空列表按"没指定"处理。 */
+    public boolean hasExplicitRecipients() {
+        return explicitRecipients != null && !explicitRecipients.isEmpty();
     }
 }
