@@ -39,7 +39,39 @@ class MigrationIT extends AbstractMySqlIT {
                 "datasource_exec_lock",
                 // V4：通知
                 "notification",
-                "notification_switch");
+                "notification_switch",
+                // V5：授权申请
+                "grant_request");
+    }
+
+    @Test
+    void grant_request_declares_the_columns_and_status_check_the_mappers_expect() {
+        // 列宽是"理由/意见写入被拒"的边界：varchar 太短会让一次正常申请在严格模式下 500。
+        assertThat(columnType("grant_request", "can_export")).isEqualTo("tinyint(1)");
+        assertThat(columnType("grant_request", "reason")).isEqualTo("varchar(500)");
+        assertThat(columnType("grant_request", "status")).isEqualTo("varchar(16)");
+        assertThat(columnType("grant_request", "review_comment")).isEqualTo("varchar(500)");
+        assertThat(columnType("grant_request", "created_at")).isEqualTo("datetime(3)");
+        assertThat(columnType("grant_request", "reviewed_at")).isEqualTo("datetime(3)");
+        assertThat(dataType("grant_request", "user_id")).isEqualTo("bigint");
+        assertThat(dataType("grant_request", "reviewer_id")).isEqualTo("bigint");
+
+        // CHECK 必须真的存在：MySQL 8.0.16 起才生效，低于它会被静默忽略——那时非法状态能写进去，
+        // 状态机就成了唯一防线。
+        assertThat(jdbc.queryForObject("""
+                select count(*)
+                  from information_schema.table_constraints
+                 where table_schema = database()
+                   and table_name = 'grant_request'
+                   and constraint_type = 'CHECK'
+                """, Integer.class)).isPositive();
+        assertThat(jdbc.queryForObject("""
+                select check_clause
+                  from information_schema.check_constraints
+                 where constraint_schema = database()
+                   and constraint_name = 'ck_grant_request_status'
+                """, String.class)).contains("PENDING").contains("APPROVED")
+                .contains("REJECTED").contains("CANCELLED");
     }
 
     @Test
