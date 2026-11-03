@@ -11,6 +11,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -95,6 +98,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  */
 @Service
 public class TicketExecutionService {
+
+    private static final Logger log = LoggerFactory.getLogger(TicketExecutionService.class);
 
     /** 与 §4.2 一致：管理员只配置与授权，不参与执行链。 */
     private static final String ADMIN = "ADMIN";
@@ -504,6 +509,12 @@ public class TicketExecutionService {
         // 其余未执行的语句置 SKIPPED（返回值就是被跳过的条数）。
         int skipped = jdbc.update(MARK_REMAINING_SKIPPED, ticketId);
 
+        // ---- 执行后快照（FR-02 验收 1）：DDL 真的改了结构，才能算出"哪里变了"。
+        //
+        // 与执行前快照的失败语义**故意相反**：执行前抓不到 → 禁止执行；执行后抓不到 → 只记 warn。
+        // 语句已经落地，此时把工单标成失败会让人以为"没改成功"，比"看不到差异"危险得多。
+        capturePostExecutionSnapshot(ticket, datasourceId, tables, accounts.execution());
+
         // ---- 闸 7：汇总。
         TicketStatus finalStatus = succeeded == statements.size()
                 ? TicketStatus.SUCCEEDED
@@ -545,6 +556,29 @@ public class TicketExecutionService {
         notifications.executionFinished(ticketId, finalStatus);
     }
 
+    /**
+     * 抓执行后的结构快照（{@code change_seq = 2}），供"变更前后对比"使用。
+     *
+     * <p><b>失败不影响工单状态</b>：变更已经执行，抓不到快照只是"看不到差异"，不是"变更失败"。
+     * 这种情况下不写 {@code schema_snapshot} 行，差异接口随后会明确告诉调用方"没有执行后快照"，
+     * 而不是返回一份"什么都没有变"的空差异——那会被误读成"这次变更没改任何结构"。
+     */
+    private void capturePostExecutionSnapshot(TicketEntity ticket, long datasourceId, List<String> tables,
+            ConnConfig executionConn) {
+        String reference = ticket.systemId() + "/" + datasourceId + "/" + ticket.id() + "/2";
+        try {
+            SnapshotResult post = executorClient.snapshot(executionConn, tables, reference);
+            if (post == null) {
+                log.warn("执行后结构快照为空（工单 {}），结构差异不可用", ticket.id());
+                return;
+            }
+            snapshotMapper.insert(ticket.id(), 2, datasourceId,
+                    truncate(post.ref() == null ? reference : post.ref(), SNAPSHOT_REF_MAX_LENGTH),
+                    json(resolvedFingerprints(tables, post.tableFingerprints())));
+        } catch (RuntimeException e) {
+            log.warn("执行后结构快照抓取失败（工单 {}），结构差异不可用：{}", ticket.id(), messageOf(e));
+        }
+    }
     /**
      * 中止：工单置 {@code FAILED} + {@code finished_at}，写事件与审计。
      *

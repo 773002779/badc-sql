@@ -102,14 +102,16 @@ class TicketExecutionIT extends TicketITBase {
         assertThat(stub.executedSql).containsExactly(DML_SQL);
         assertThat(stub.executedAccountTypes).containsExactly(ExecAccountType.DML);
 
-        // change_seq=0 是提交时写的结构指纹，change_seq=1 是执行前抓的快照。
+        // change_seq=0 是提交时写的结构指纹，1 是执行前快照，2 是执行后快照（FR-02 验收 1 的差异来源）。
         assertThat(jdbc.queryForList(
                 "select change_seq from schema_snapshot where ticket_id = ? order by change_seq", Integer.class, id))
-                .containsExactly(0, 1);
+                .containsExactly(0, 1, 2);
         assertThat(jdbc.queryForObject(
                 "select snapshot_ref from schema_snapshot where ticket_id = ? and change_seq = 1", String.class, id))
                 .isEqualTo("1/101/" + id + "/1");
-        assertThat(stub.snapshotRefs).containsExactly("1/101/" + id + "/1");
+        // 执行前后各抓一次快照：第一份是 {system}/{ds}/{ticket}/1（执行前），第二份是 .../2（执行后）。
+        assertThat(stub.snapshotRefs).first().isEqualTo("1/101/" + id + "/1");
+        assertThat(stub.snapshotRefs).allSatisfy(ref -> assertThat(ref).startsWith("1/101/" + id + "/"));
 
         // 事件流：提交 → 审批 → 执行风险确认 → 执行结束。
         assertThat(eventTypes(id)).contains("SUBMITTED", "APPROVED_L1", "FINISHED");

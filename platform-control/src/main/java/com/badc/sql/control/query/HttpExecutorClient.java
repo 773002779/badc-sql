@@ -18,6 +18,7 @@ import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -160,6 +161,15 @@ public class HttpExecutorClient implements ExecutorClient {
     }
 
     /**
+     * 比对两次结构快照。只读执行器上的快照文件，不连目标库，因此不需要连接配置。
+     */
+    @Override
+    public SchemaDiff schemaDiff(String beforeRef, String afterRef) {
+        return post("/internal/v1/schema-diff", new SchemaDiffCall(beforeRef, afterRef), SchemaDiff.class,
+                "执行器返回空的结构差异");
+    }
+
+    /**
      * 执行一条写语句。
      *
      * <p>语句本身失败时执行器仍回 2xx（{@code success=false}），只有入参非法/执行器故障才非 2xx。
@@ -226,6 +236,9 @@ public class HttpExecutorClient implements ExecutorClient {
     }
 
     /** 执行器的快照入参；{@code relativeRef} 是落盘相对路径，执行器负责把它解析在快照根目录之内。 */
+    public record SchemaDiffCall(String beforeRef, String afterRef) {
+    }
+
     public record SnapshotCall(ConnConfig conn, List<String> tables, String relativeRef) {
     }
 

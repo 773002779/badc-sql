@@ -36,6 +36,7 @@ import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -593,7 +594,12 @@ class QueryControllerIT extends AbstractMySqlIT {
         }
 
         @Override
-        public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
+        public SchemaDiff schemaDiff(String beforeRef, String afterRef) {
+        throw new UnsupportedOperationException("查询测试不走这个入口");
+    }
+
+    @Override
+    public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
             throw new UnsupportedOperationException("查询测试不走这个入口");
         }
     }

@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.security.CurrentUser;
@@ -40,16 +41,19 @@ public class TicketController {
     private final RiskAckService riskAckService;
     private final TicketExecutionService executionService;
     private final TicketRollbackService rollbackService;
+    private final SchemaDiffService schemaDiffService;
 
     public TicketController(TicketService ticketService, TicketQueryService queryService,
             TicketReviewService reviewService, RiskAckService riskAckService,
-            TicketExecutionService executionService, TicketRollbackService rollbackService) {
+            TicketExecutionService executionService, TicketRollbackService rollbackService,
+            SchemaDiffService schemaDiffService) {
         this.ticketService = ticketService;
         this.queryService = queryService;
         this.reviewService = reviewService;
         this.riskAckService = riskAckService;
         this.executionService = executionService;
         this.rollbackService = rollbackService;
+        this.schemaDiffService = schemaDiffService;
     }
 
     /**
@@ -71,6 +75,17 @@ public class TicketController {
     @GetMapping("/{id}")
     public TicketQueryService.TicketDetail detail(@PathVariable long id) {
         return queryService.detail(CurrentUser.id(), id);
+    }
+
+    /**
+     * 变更前后的结构对比（FR-02 验收 1）：`change_seq=1`（执行前）与 `2`（执行后）的差异。
+     *
+     * <p>返回逐表、逐字段的 `before/after`，例如「列 remark：新增」。还没执行过的工单没有可比对的两份快照，
+     * 返回 409 并说明原因——见 `SchemaDiffService`。
+     */
+    @GetMapping("/{id}/schema-diff")
+    public SchemaDiff schemaDiff(@PathVariable long id) {
+        return schemaDiffService.diff(CurrentUser.id(), id);
     }
 
     /**

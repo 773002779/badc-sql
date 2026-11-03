@@ -15,6 +15,7 @@ import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -24,6 +25,7 @@ import com.badc.sql.executor.exec.ExplainRunner;
 import com.badc.sql.executor.exec.QueryRunner;
 import com.badc.sql.executor.exec.WriteRunner;
 import com.badc.sql.executor.schema.SchemaSnapshotter;
+import com.badc.sql.executor.schema.SnapshotDiffer;
 
 /**
  * 执行器内部接口：只有控制面调用，不经公网暴露。
@@ -37,6 +39,7 @@ public class ExecutorController {
     private final DataSourceAdapter adapter;
     private final QueryRunner queryRunner;
     private final SchemaSnapshotter snapshotter;
+    private final SnapshotDiffer differ;
     private final ExplainRunner explainRunner;
     private final WriteRunner writeRunner;
 
@@ -44,11 +47,13 @@ public class ExecutorController {
             DataSourceAdapter adapter,
             QueryRunner queryRunner,
             SchemaSnapshotter snapshotter,
+            SnapshotDiffer differ,
             ExplainRunner explainRunner,
             WriteRunner writeRunner) {
         this.adapter = adapter;
         this.queryRunner = queryRunner;
         this.snapshotter = snapshotter;
+        this.differ = differ;
         this.explainRunner = explainRunner;
         this.writeRunner = writeRunner;
     }
@@ -75,6 +80,21 @@ public class ExecutorController {
     @PostMapping("/validate")
     public ValidationResult validate(@RequestBody ValidateRequest request) {
         return adapter.validate(request.sql(), request.dbVersion());
+    }
+
+    /**
+     * 比对两次结构快照（FR-02 验收 1：变更前后结构对比）。
+     *
+     * <p>只读快照文件、<b>不连目标库</b>：差异是"已经抓下来的两份事实"的比较，不需要再问数据库一次。
+     * 引用来自控制面（{@code {systemId}/{datasourceId}/{ticketId}/{changeSeq}}），在快照根目录下解析，
+     * 越界引用由 {@link com.badc.sql.executor.schema.SnapshotPaths} 拒绝。
+     *
+     * @param request 前后两份快照的相对引用
+     * @return 逐表差异；后一次快照不存在时 404（没有可比的东西，不能返回"没有差异"）
+     */
+    @PostMapping("/schema-diff")
+    public SchemaDiff schemaDiff(@RequestBody SchemaDiffCall request) {
+        return differ.diff(request.beforeRef(), request.afterRef());
     }
 
     /**
@@ -138,6 +158,9 @@ public class ExecutorController {
     }
 
     /** 快照入参。{@code relativeRef} 形如 {@code {systemId}/{datasourceId}/{ticketId}/{changeSeq}}。 */
+    public record SchemaDiffCall(String beforeRef, String afterRef) {
+    }
+
     public record SnapshotCall(ConnConfig conn, List<String> tables, String relativeRef) {
     }
 

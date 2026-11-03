@@ -22,6 +22,7 @@ import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -242,7 +243,12 @@ class DatasourceCapabilityServiceTest {
         }
 
         @Override
-        public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
+        public SchemaDiff schemaDiff(String beforeRef, String afterRef) {
+        throw new UnsupportedOperationException("能力缓存不应比对结构差异");
+    }
+
+    @Override
+    public ExecuteResult execute(ConnConfig conn, String sql, ExecAccountType type) {
             throw new UnsupportedOperationException("能力缓存不应执行写语句");
         }
     }

@@ -14,6 +14,7 @@ import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 import com.badc.sql.common.error.BizException;
@@ -75,6 +76,12 @@ public class TicketStubExecutor implements ExecutorClient {
     /** snapshot 的入参相对引用，按调用顺序；用来钉住 {@code {systemId}/{datasourceId}/{ticketId}/1} 的形状。 */
     public List<String> snapshotRefs = new ArrayList<>();
 
+    /** 结构差异接口的返回；用例按需替换。 */
+    public SchemaDiff schemaDiffResult = new SchemaDiff(List.of());
+
+    /** schemaDiff 的入参，按调用顺序记成 {before}->{after}。 */
+    public List<String> schemaDiffRefs = new ArrayList<>();
+
     /** snapshot 的入参表名，按调用顺序。 */
     public List<String> snapshotTables = new ArrayList<>();
 
@@ -111,6 +118,8 @@ public class TicketStubExecutor implements ExecutorClient {
         explainedUsernames = new ArrayList<>();
         snapshotFingerprints = new LinkedHashMap<>(Map.of("t_order", "fp-1"));
         snapshotThrows = false;
+        schemaDiffResult = new SchemaDiff(List.of());
+        schemaDiffRefs = new ArrayList<>();
         snapshotRefs = new ArrayList<>();
         snapshotTables = new ArrayList<>();
         executeResults = new ArrayList<>();
@@ -161,6 +170,12 @@ public class TicketStubExecutor implements ExecutorClient {
             throw new BizException(ErrorCode.INTERNAL_ERROR, "结构快照抓取失败：数据源不可达");
         }
         return new SnapshotResult(relativeRef, snapshotFingerprints, 128L);
+    }
+
+    @Override
+    public SchemaDiff schemaDiff(String beforeRef, String afterRef) {
+        this.schemaDiffRefs.add(beforeRef + "->" + afterRef);
+        return schemaDiffResult;
     }
 
     @Override

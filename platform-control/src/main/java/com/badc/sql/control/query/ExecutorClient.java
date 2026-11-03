@@ -10,6 +10,7 @@ import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.dto.RawResult;
+import com.badc.sql.common.dto.SchemaDiff;
 import com.badc.sql.common.dto.SnapshotResult;
 import com.badc.sql.common.dto.ValidationResult;
 
@@ -93,6 +94,21 @@ public interface ExecutorClient {
      * @throws com.badc.sql.common.error.BizException 库不可达、权限不足、执行器不可用或写盘失败
      */
     SnapshotResult snapshot(ConnConfig conn, List<String> tables, String relativeRef);
+
+    /**
+     * 比对两次结构快照（FR-02 验收 1）。
+     *
+     * <p>只读执行器侧的快照文件、<b>不连目标库</b>，所以不需要连接配置，只需要两个相对引用。
+     *
+     * <p><b>后一次快照不存在是 404，不是"没有差异"</b>：后者会被读成"这次变更什么都没改"，
+     * 而事实是"根本没抓到可比的东西"。前一次缺失按空快照处理（建表工单：整张表都是新增）。
+     *
+     * @param beforeRef 执行前快照的相对引用 {@code {systemId}/{datasourceId}/{ticketId}/1}
+     * @param afterRef  执行后快照的相对引用 {@code .../2}
+     * @return 逐表差异，每项带人类可读的 before/after
+     * @throws com.badc.sql.common.error.BizException 后一次快照不存在、快照读不出来或执行器不可用
+     */
+    SchemaDiff schemaDiff(String beforeRef, String afterRef);
 
     /**
      * 执行一条写语句。
