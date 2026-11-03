@@ -150,6 +150,16 @@ class NotificationDispatcherSwitchTest {
         public List<NotificationRow> listForTicket(long ticketId) {
             return List.of();
         }
+
+        @Override
+        public long countForRecipient(long recipientId) {
+            return 0;
+        }
+
+        @Override
+        public List<NotificationRow> pageForRecipient(long recipientId, int limit, int offset) {
+            return List.of();
+        }
     }
 
     private record Insert(long recipientId, NotificationEventType type, NotificationChannel channel) {

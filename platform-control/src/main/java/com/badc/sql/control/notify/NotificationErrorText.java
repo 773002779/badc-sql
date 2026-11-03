@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  * {@link #DISPATCHER_MAX_CHARS}（给类名前缀和后续口径变化留余量），{@link JdbcNotificationStore}
  * 落库前再按 {@link #COLUMN_MAX_CHARS} 兜一次——两层都在，是因为任何一层被绕过都不该让整行写不进去。
  */
-final class NotificationErrorText {
+public final class NotificationErrorText {
 
     /** 投递器写进 {@code last_error} 的上限；远小于列宽 500，留出余量。 */
     static final int DISPATCHER_MAX_CHARS = 200;
@@ -78,7 +78,7 @@ final class NotificationErrorText {
      * @param error 异常；{@code null} 返回 {@code null}
      * @return 形如 {@code IllegalStateException: 邮件发送失败 jdbc:***}；消息为空时只有类名
      */
-    static String sanitize(Throwable error) {
+    public static String sanitize(Throwable error) {
         if (error == null) {
             return null;
         }

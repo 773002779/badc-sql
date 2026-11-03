@@ -377,6 +377,16 @@ class NotificationDispatcherTest {
         }
 
         @Override
+        public long countForRecipient(long recipientId) {
+            return rows.values().stream().filter(row -> row.recipientId == recipientId).count();
+        }
+
+        @Override
+        public List<NotificationRow> pageForRecipient(long recipientId, int limit, int offset) {
+            return List.of();
+        }
+
+        @Override
         public int failureCount(long ticketId) {
             return (int) rows.values().stream()
                     .filter(row -> row.status == NotificationStatus.FAILED)

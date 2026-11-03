@@ -17,7 +17,7 @@ import com.badc.sql.control.ticket.TicketStatus;
 
 /**
  * 工单生命周期 → 通知事件的唯一翻译层：组装白名单事实、判定兜底路径、发布
- * {@link TicketNotificationEvent}。
+ * {@link NotificationEvent}。
  *
  * <h2>业务类只调这里，不碰投递器</h2>
  * <p>工单服务（提交 / 审批 / 执行）只表达"发生了什么"，不关心渠道、重试、开关、脱敏——那些都在
@@ -228,7 +228,7 @@ public class TicketNotificationPublisher {
     private void publish(TicketEntity ticket, NotificationEventType type, String reason) {
         Map<String, String> facts = facts(ticket, type, reason);
         List<Long> explicitRecipients = explicitRecipients(ticket, type);
-        events.publishEvent(new TicketNotificationEvent(new NotificationCommand(
+        events.publishEvent(new NotificationEvent(new NotificationCommand(
                 type, ticket.systemId(), ticket.id(), null, facts, explicitRecipients)));
     }
 

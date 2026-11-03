@@ -77,7 +77,7 @@ class TicketNotificationPublisherTest {
     }
 
     private NotificationCommand capturedCommand() {
-        ArgumentCaptor<TicketNotificationEvent> captor = ArgumentCaptor.forClass(TicketNotificationEvent.class);
+        ArgumentCaptor<NotificationEvent> captor = ArgumentCaptor.forClass(NotificationEvent.class);
         verify(events).publishEvent(captor.capture());
         return captor.getValue().command();
     }

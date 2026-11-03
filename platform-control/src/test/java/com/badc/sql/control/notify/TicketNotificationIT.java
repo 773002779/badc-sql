@@ -500,7 +500,7 @@ class TicketNotificationIT extends TicketITBase {
         int rowsBefore = notificationsOf(id).size();
 
         assertThatThrownBy(() -> new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
-            events.publishEvent(new TicketNotificationEvent(new NotificationCommand(
+            events.publishEvent(new NotificationEvent(new NotificationCommand(
                     NotificationEventType.TICKET_APPROVED, 1L, id, null,
                     Map.of("system", "订单中心", "ticketNo", String.valueOf(id)),
                     List.of(LEAD_ID))));

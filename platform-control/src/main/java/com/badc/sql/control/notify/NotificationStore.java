@@ -77,4 +77,25 @@ public interface NotificationStore {
      * @return 该工单的通知行；没有记录时返回空列表，绝不为 {@code null}
      */
     List<NotificationRow> listForTicket(long ticketId);
+
+    /**
+     * 某个收件人的通知数（"我的消息"的分页总数）。
+     *
+     * @param recipientId 收件人用户 ID
+     * @return 行数；没有记录时 0
+     */
+    long countForRecipient(long recipientId);
+
+    /**
+     * 某个收件人的通知，按创建时间倒序（新的在前）、同刻按 ID 倒序。
+     *
+     * <p>只按 {@code recipient_id} 过滤：收件人只能看到发给自己的行，没有"按系统/工单再看全部"的
+     * 查询入口——那等于把通知内容泄露给与事件无关的人。
+     *
+     * @param recipientId 收件人用户 ID
+     * @param limit       页大小
+     * @param offset      偏移
+     * @return 当前页；没有记录时返回空列表，绝不为 {@code null}
+     */
+    List<NotificationRow> pageForRecipient(long recipientId, int limit, int offset);
 }

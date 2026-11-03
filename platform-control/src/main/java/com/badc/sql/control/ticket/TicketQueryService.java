@@ -10,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.notify.NotificationStore;
 import com.badc.sql.control.ticket.TicketQueryMapper.EventRow;
 import com.badc.sql.control.ticket.TicketQueryMapper.ReviewRow;
 import com.badc.sql.control.ticket.TicketQueryMapper.SnapshotRow;
@@ -64,16 +65,19 @@ public class TicketQueryService {
     private final TicketQueryMapper queryMapper;
     private final UserRoleService userRoleService;
     private final ObjectMapper objectMapper;
+    private final NotificationStore notificationStore;
 
     public TicketQueryService(
             TicketMapper ticketMapper,
             TicketQueryMapper queryMapper,
             UserRoleService userRoleService,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            NotificationStore notificationStore) {
         this.ticketMapper = ticketMapper;
         this.queryMapper = queryMapper;
         this.userRoleService = userRoleService;
         this.objectMapper = objectMapper;
+        this.notificationStore = notificationStore;
     }
 
     /**
@@ -102,6 +106,19 @@ public class TicketQueryService {
      * @throws BizException 工单不存在 → 404；存在但当前用户无权 → 403
      */
     public TicketDetail detail(long userId, long ticketId) {
+        TicketEntity ticket = requireVisible(userId, ticketId);
+        return detailOf(ticket);
+    }
+
+    /**
+     * 断言当前用户对该工单可见，并返回工单。
+     *
+     * <p>独立出来是因为"工单的通知记录"也是一条需要同一判据的读路径：通知正文里虽然没有 SQL，
+     * 但"谁在什么时候被通知了什么"本身是敏感的。两条路径共用同一份谓词，不会一条严一条松。
+     *
+     * @throws BizException 工单不存在 → 404；存在但当前用户无权 → 403
+     */
+    public TicketEntity requireVisible(long userId, long ticketId) {
         TicketEntity ticket = ticketMapper.findById(ticketId)
                 .orElseThrow(() -> new BizException(ErrorCode.NOT_FOUND, "工单不存在：" + ticketId));
 
@@ -110,7 +127,7 @@ public class TicketQueryService {
         if (!queryMapper.isVisible(ticketId, userId, scope)) {
             throw new BizException(ErrorCode.FORBIDDEN, "无权查看该工单：" + ticketId);
         }
-        return detailOf(ticket);
+        return ticket;
     }
 
     private TicketDetail detailOf(TicketEntity ticket) {
@@ -140,6 +157,7 @@ public class TicketQueryService {
                 ticket.approvedAt(),
                 ticket.executedAt(),
                 ticket.finishedAt(),
+                notificationStore.failureCount(ticketId),
                 queryMapper.statements(ticketId).stream()
                         .map(TicketQueryService::statementOf).toList(),
                 queryMapper.reviews(ticketId).stream()
@@ -257,6 +275,9 @@ public class TicketQueryService {
      *
      * @param snapshotEnabled 提交时是否抓取结构快照（本切片恒为 {@code true}；暴露给前端判断快照语义）
      * @param riskSnapshot    {@code risk_snapshot_json} 解析后的对象；坏 JSON 时为 {@code null}
+     * @param notificationFailures 该工单投递失败的通知行数（只数 {@code FAILED}）。前端据此提示
+     *                        "有审批人可能没收到通知"，避免"点了通过但对方一直没收到"的静默漏发；
+     *                        {@code SKIPPED}（渠道未配置）不算失败，不计入。
      */
     public record TicketDetail(
             long id,
@@ -283,6 +304,7 @@ public class TicketQueryService {
             Instant approvedAt,
             Instant executedAt,
             Instant finishedAt,
+            int notificationFailures,
             List<StatementView> statements,
             List<ReviewView> reviews,
             List<SnapshotView> snapshots,

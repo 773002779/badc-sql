@@ -71,6 +71,24 @@ public class JdbcNotificationStore implements NotificationStore {
     private static final String SELECT_FOR_TICKET =
             "select " + COLUMNS + " from notification where ticket_id = ? order by id";
 
+    private static final String COUNT_FOR_RECIPIENT =
+            "select count(*) from notification where recipient_id = ?";
+
+    /**
+     * 倒序分页。
+     *
+     * <p>排序键是 {@code (created_at desc, id desc)} 而不是单看 {@code created_at}：一次投递会给多个收件人
+     * 写多行，{@code created_at} 完全相同（同一毫秒），只按时间排的话页边界会在并列行之间抖动——
+     * 同一行可能在第 1 页和第 2 页各出现一次。{@code id} 兜底让顺序全序。
+     */
+    private static final String PAGE_FOR_RECIPIENT = """
+            select %s
+              from notification
+             where recipient_id = ?
+             order by created_at desc, id desc
+             limit ? offset ?
+            """.formatted(COLUMNS);
+
     private static final RowMapper<NotificationRow> ROW_MAPPER = (rs, rowNum) -> new NotificationRow(
             rs.getLong("id"),
             NotificationEventType.valueOf(rs.getString("event_type")),
@@ -143,6 +161,17 @@ public class JdbcNotificationStore implements NotificationStore {
     @Override
     public List<NotificationRow> listForTicket(long ticketId) {
         return jdbc.query(SELECT_FOR_TICKET, ROW_MAPPER, ticketId);
+    }
+
+    @Override
+    public long countForRecipient(long recipientId) {
+        Long count = jdbc.queryForObject(COUNT_FOR_RECIPIENT, Long.class, recipientId);
+        return count == null ? 0L : count;
+    }
+
+    @Override
+    public List<NotificationRow> pageForRecipient(long recipientId, int limit, int offset) {
+        return jdbc.query(PAGE_FOR_RECIPIENT, ROW_MAPPER, recipientId, limit, offset);
     }
 
     /** "没有"写成 SQL NULL；写成 0 会指向不存在的业务对象。 */
