@@ -162,17 +162,21 @@ class TicketNotificationIT extends TicketITBase {
     void the_delivery_runs_off_the_http_request_thread() {
         long mark = notificationTaskMark();
         long id = submitTicket(L1_SQL, null, L1_ROLLBACK_SQL);
-        awaitNotificationTasks(mark, 1);
 
-        assertThat(recorder.threadNames())
-                .as("渠道必须真的被调用过，否则线程名断言是空转")
-                .isNotEmpty();
-        assertThat(recorder.threadNames()).allSatisfy(name -> assertThat(name)
+        // 等"渠道真的被调用过"这个可观察事实，而不是等通知线程池的任务数：投递若被改回同步，
+        // 它根本不会进线程池，等任务数只会在超时处失败，掩盖掉真正要断言的线程名。
+        awaitFirstDelivery();
+
+        List<String> names = recorder.threadNames();
+        assertThat(names).as("渠道必须真的被调用过，否则线程名断言是空转").isNotEmpty();
+        assertThat(names).allSatisfy(name -> assertThat(name)
                 .as("投递线程不能是 HTTP 请求线程（%s）", Thread.currentThread().getName())
                 .startsWith(AsyncConfig.THREAD_NAME_PREFIX)
                 .doesNotContain("http-nio")
                 .doesNotContain("Test worker"));
         assertThat(notificationsOf(id)).isNotEmpty();
+        // 收尾：等这一批投递跑完，别把活动任务留给下一个用例。
+        awaitNotificationTasks(mark, 1);
     }
 
     // ------------------------------------------------------------------ R16：主备运维缺位的兜底
@@ -471,6 +475,18 @@ class TicketNotificationIT extends TicketITBase {
                 + done + "/" + expected + "，活动线程 " + pool().getActiveCount()
                 + "，队列 " + pool().getQueue().size()
                 + "，notification 行数 " + countNotifications());
+    }
+
+    /** 等渠道桩第一次被调用（轮询，最多 10s）。超时是失败：投递压根没发生。 */
+    private void awaitFirstDelivery() {
+        long deadline = System.nanoTime() + AWAIT_NANOS;
+        while (System.nanoTime() < deadline) {
+            if (!recorder.threadNames().isEmpty()) {
+                return;
+            }
+            sleepPoll();
+        }
+        throw new AssertionError("渠道在 10s 内没有被调用过：notification 行数 " + countNotifications());
     }
 
     /** 等线程池既没有活动线程也没有排队任务。 */
