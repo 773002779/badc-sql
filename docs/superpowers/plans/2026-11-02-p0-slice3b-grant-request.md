@@ -191,6 +191,31 @@ void rejecting_requires_a_comment_and_writes_no_grant() { ... 400; grantCount ==
 
 ---
 
+## 实施记录（2026-11-04，`be089f5`）
+
+5 个任务一次落地，与计划的差异如下（都是"少建一个文件"或"多一条保险"，没有削弱任何一条约束）：
+
+| 计划 | 实际 | 原因 |
+|---|---|---|
+| `SystemOperatorMapper.hasOperator` 单独建类 | 合进 `GrantRequestStore.hasOperator` | 只有一条 `count(*)`；同包同表，另开一个 `@Repository` 只是多一层跳转 |
+| `GrantRequestQueryIT` 单独一个 IT 类 | 折进 `GrantRequestSubmitIT` | 两条列表端点与"提交后能查到"共享同一套夹具；多一个 Spring 上下文要多跑 20 秒 |
+| `GrantRequestStore` 里没有 `findCanExport` | 放在 `UserModuleGrantStore` | 授权表的读写在同一个类里，"有没有授权"与"授权怎么升"是同一条口径 |
+| 审批顺序：先 upsert 授权，再 `moveStatus` | 先 `moveStatus`，再 upsert | 两者在同一个事务里，顺序不影响原子性；先迁移状态可以让 409 直接短路，不做无用的授权写入 |
+| `NotificationCommand` 携带 `canExport` | **不携带** | 白名单（R31）的 10 个键是上限，不为授权事件单独扩键。要看"批的是查询还是导出"点短链进详情 |
+| `NotificationErrorText` 包内可见 | 改为 `public` | `grant` 包要复用同一份脱敏/截断逻辑；另写一份必然分叉 |
+
+测试 26 条 IT，其中审批类**每条都同时断言"授权表有没有多一行"**——只断言 403 不够，自我提权最危险的表现是
+"返回了错误，但授权已经写进去了"。`NotificationErrorText` 的可见性改动没有新增测试：它只改修饰符，行为由
+既有的 `NotificationErrorTextTest`（16 条）守住。
+
+**已知缺口（本计划不覆盖，也不假装覆盖）**：
+1. `CANCELLED` 状态没有任何写入路径（申请人撤回属于后续切片），V5 的 CHECK 已为它留好位置；
+2. 没有"同一人同一模块只能有一条 PENDING"的数据库级约束（MySQL 无法表达条件唯一索引）；服务层先查后插，
+   并发下最坏是两条 PENDING，授权 upsert 幂等，不会写重复授权行；
+3. 授权**收回**没有入口：`greatest(...)` 只增不减，"降级/撤销"需要独立的撤销流程与审计事件。
+
+---
+
 ## 交接
 
 5 个任务完成后，§4.4 的 ②③ 闭环：研发能自助申请、运维能审批、授权即时生效、全程审计与通知。

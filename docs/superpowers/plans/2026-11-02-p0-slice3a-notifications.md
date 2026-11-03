@@ -290,6 +290,17 @@ void a_broken_channel_never_fails_the_submission() {
 - [ ] **Step 2–4:** 红 → 实现 → 绿。
 - [ ] **Step 5: 提交**：`git commit -m "feat(notify): notification list endpoints and surface delivery failures in ticket detail"`
 
+> **已实现（2026-11-04，`a240997`）**，与计划的四处差异：
+> 1. 测试类名为 `NotificationQueryIT`（不是 `NotificationControllerIT`），并额外覆盖"塞 `recipientId` 参数不改变结果"
+>    与"不存在的工单 404"；
+> 2. 顺带把 `TicketNotificationEvent` / `TicketNotificationListener` 改名 `NotificationEvent` /
+>    `NotificationListener` —— 切片 3-B 的授权申请要走同一条投递链路，原名字会让"工单侧"成为假话；
+> 3. `TicketQueryService.detail` 抽出 `requireVisible`，与"某工单的通知记录"共用同一份可见性判词；
+> 4. `notificationFailures` 只数 `FAILED`：`SKIPPED`（渠道未配置）不是投递失败，若计入会让"没配邮箱"看起来像
+>    "通知发不出去"。`TicketNotificationIT` 里已有该语义的用例。
+>
+> 排序改为 `(created_at desc, id desc)`：一次投递会给多个收件人写同毫秒的多行，单按时间排会让页边界抖动。
+
 ---
 
 ## 交接
