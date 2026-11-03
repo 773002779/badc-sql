@@ -40,7 +40,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
  * <p>MySQL 的唯一索引允许多个 {@code NULL}，所以"全局行至多一条"只能靠
  * {@link NotificationSwitchMapper#upsert} 的 update → insert 顺序 + 本类的事务保证<b>串行</b>调用正确。
  * 两个请求在空表上同时首次写同一个事件的全局开关，仍可能各插一行（InnoDB 无唯一性可依赖）。
- * 这种情形下 {@code isEnabled} 读最新插入的那一行（{@code order by id limit 1}），
+ * 这种情形下 {@code isEnabled} 读<b>最新插入</b>的那一行（{@code order by id desc limit 1}），
  * 不会报错；要彻底消除需要给全局行一个非空哨兵列或改用独立表，超出本切片范围。
  */
 @Service

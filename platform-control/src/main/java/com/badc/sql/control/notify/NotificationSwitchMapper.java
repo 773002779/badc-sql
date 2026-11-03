@@ -25,10 +25,14 @@ import org.springframework.stereotype.Repository;
  * （{@link NotificationSwitchService#setGlobal} 带 {@code @Transactional}）。这样串行调用只会有一行；
  * 并发首写仍可能各插一行（InnoDB 无法对 {@code NULL} 做唯一约束），属已知限制，见服务类注释。
  *
- * <h2>读为什么带 {@code limit 1}</h2>
- * <p>正常状态下（按上面的写法）每个作用域至多一行。{@code order by id limit 1} 是对历史脏数据的兜底：
- * 万一库里真有两条全局行，读最新插入的那条，而不是让 {@code queryForObject} 直接抛
- * {@code Incorrect result size}——投递路径上的开关查询不该因为脏数据变成"通知永远发不出去"。
+ * <h2>读为什么带 {@code limit 1}，以及为什么是 {@code desc}</h2>
+ * <p>正常状态下（按上面的写法）每个作用域至多一行。{@code order by id desc limit 1} 是对历史脏数据的兜底：
+ * 万一库里真有两条全局行，读<b>最新插入</b>的那条（{@code id} 最大 = 最近一次写入的那一行），
+ * 而不是让 {@code queryForObject} 直接抛 {@code Incorrect result size}——投递路径上的开关查询不该因为脏数据
+ * 变成"通知永远发不出去"。
+ * <p>方向必须是 {@code desc}：{@code order by id limit 1} 取到的是<b>最旧</b>的一行，等于把最近一次
+ * 开关操作吞掉——那正是本节要防的"最后一次生效变成看运气"。改这个方向前先看
+ * {@code NotificationSwitchServiceIT.a_duplicate_global_row_is_read_from_the_newest_write()}。
  */
 @Repository
 public class NotificationSwitchMapper {
@@ -47,7 +51,7 @@ public class NotificationSwitchMapper {
               from notification_switch
              where event_type = ?
                and system_id is null
-             order by id
+             order by id desc
              limit 1
             """;
 
@@ -60,17 +64,29 @@ public class NotificationSwitchMapper {
      *
      * <p>用 {@code values(enabled)} 而不是 {@code new.enabled}：后者的行别名语法要 MySQL 8.0.19+，
      * 而 V4 的 CHECK 要 8.0.16+，本仓库的部署下限是 8.0.16。
+     *
+     * <p><b>不显式写 {@code updated_at}</b>：列上有 {@code ON UPDATE CURRENT_TIMESTAMP(3)}，
+     * 值真的变了它会自己跳。显式赋值会把"同值写入"也变成一次行变更——那会让
+     * {@code useAffectedRows=true} 的 0 行语义变得不可解释（同一毫秒内是 0，隔一毫秒是 1），
+     * 也会让 {@link #upsert} 的"0 行 = 值没变"判断失去确定性。
      */
     private static final String UPSERT_FOR_SYSTEM = """
             insert into notification_switch (event_type, system_id, enabled)
             values (?, ?, ?)
-            on duplicate key update enabled = values(enabled), updated_at = current_timestamp(3)
+            on duplicate key update enabled = values(enabled)
             """;
 
-    /** 全局行：先更新，命中不了才插入（见类注释）。 */
+    /**
+     * 全局行：先更新，命中不了才插入（见类注释）。
+     *
+     * <p>同样不显式写 {@code updated_at}：同值写入必须是<b>真正的 no-op</b>（0 行变更），
+     * 这样 {@code useAffectedRows=true} 下"0 行"才确定地表示"已有全局行、值没变"，
+     * {@link #upsert} 的二次确认才有意义。见
+     * {@code NotificationSwitchServiceIT.a_same_value_global_write_stays_single_row_when_the_driver_counts_only_changed_rows()}。
+     */
     private static final String UPDATE_GLOBAL = """
             update notification_switch
-               set enabled = ?, updated_at = current_timestamp(3)
+               set enabled = ?
              where event_type = ? and system_id is null
             """;
 
@@ -125,7 +141,10 @@ public class NotificationSwitchMapper {
      * @param systemId {@code null} 表示全局；非空表示只覆盖该系统
      * @param type     事件类型，非 {@code null}
      * @param enabled  开关值
-     * @return 受影响的行数（系统分支：插入 1 / 更新 1 或 2；全局分支：更新命中的行数，或插入 1）
+     * @return 受影响的行数，<b>仅供诊断</b>，调用方不得把它当作"是否写入成功"的判据：
+     *         系统分支的 {@code on duplicate key update} 在"值没变"时可能返回 0（连接串开了
+     *         {@code useAffectedRows=true}）或 2（默认）；全局分支的"有行但值没变"返回 0。
+     *         {@link NotificationSwitchService} 不看这个值。
      */
     public int upsert(Long systemId, NotificationEventType type, boolean enabled) {
         requireType(type);
@@ -135,6 +154,12 @@ public class NotificationSwitchMapper {
         int updated = jdbc.update(UPDATE_GLOBAL, enabled, type.name());
         if (updated > 0) {
             return updated;
+        }
+        // 影响 0 行有两种可能：真的没有全局行，或者有这一行但值没变——MySQL Connector/J 在
+        // useAffectedRows=true 时对同值 UPDATE 返回 0（默认 false 才返回"匹配到的行数"）。
+        // 少了这次确认，同值重复 setGlobal 会插出第二条全局行；而 NULL 不参与唯一性，插进去就是永久的。
+        if (hasGlobal(type)) {
+            return 0;
         }
         // 显式 setNull：让"全局"确实是 SQL NULL，而不是依赖驱动的类型推断。
         return jdbc.update(INSERT, ps -> {
