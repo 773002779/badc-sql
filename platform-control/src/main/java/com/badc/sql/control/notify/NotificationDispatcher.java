@@ -21,6 +21,12 @@ import com.badc.sql.control.notify.channel.ChannelSender;
  * 包括最外层的兜底 catch：{@code resolve} 连不上库、渲染出意外、落库报错，都只是"这次通知没发成"，
  * 不是"业务失败"。
  *
+ * <h2>事件开关（R28）</h2>
+ * <p>投递的第一步是 {@link NotificationSwitchService#isEnabled}：在 resolve 接收人、渲染、落库<b>之前</b>。
+ * 事件关闭时直接返回，<b>不写任何 {@code notification} 行</b>——关闭是"这类事件不通知"，不是"投递失败"；
+ * 写成 {@code SKIPPED} 会让运维把故意关掉看成投递失败，而且每关一个事件就多出成套的行。
+ * 开关查询自身失败不阻断通知：记 warn 后按"默认开"继续投递，理由见 {@link #isEventEnabled}。
+ *
  * <h2>失败隔离到"一个人 × 一个渠道"</h2>
  * <p>双层循环里每个组合独立 try/catch 并独立落库：邮件服务器挂了不影响企业微信，更不影响下一个收件人。
  * 这是 FR-13 的核心要求——一个人的通知失败不能顺带把别人也拖下水。落库在发送<b>之前</b>（{@code PENDING}），
@@ -69,6 +75,7 @@ public class NotificationDispatcher {
     private final NotificationRecipients recipients;
     private final NotificationTargetStore targetStore;
     private final NotificationStore store;
+    private final NotificationSwitchService switchService;
     private final List<ChannelSender> senders;
     private final NotificationProperties properties;
     private final Clock clock;
@@ -77,18 +84,19 @@ public class NotificationDispatcher {
     /** 生产构造器：睡眠就是 {@code Thread.sleep}。 */
     @Autowired
     public NotificationDispatcher(NotificationRecipients recipients, NotificationTargetStore targetStore,
-            NotificationStore store, List<ChannelSender> senders, NotificationProperties properties,
-            Clock clock) {
-        this(recipients, targetStore, store, senders, properties, clock, THREAD_SLEEPER);
+            NotificationStore store, NotificationSwitchService switchService, List<ChannelSender> senders,
+            NotificationProperties properties, Clock clock) {
+        this(recipients, targetStore, store, switchService, senders, properties, clock, THREAD_SLEEPER);
     }
 
     /** 可注入时钟与睡眠的构造器：单测用它，避免真睡。 */
     NotificationDispatcher(NotificationRecipients recipients, NotificationTargetStore targetStore,
-            NotificationStore store, List<ChannelSender> senders, NotificationProperties properties,
-            Clock clock, LongConsumer sleeper) {
+            NotificationStore store, NotificationSwitchService switchService, List<ChannelSender> senders,
+            NotificationProperties properties, Clock clock, LongConsumer sleeper) {
         this.recipients = recipients;
         this.targetStore = targetStore;
         this.store = store;
+        this.switchService = switchService;
         this.senders = senders == null ? List.of() : List.copyOf(senders);
         this.properties = properties;
         this.clock = clock;
@@ -106,11 +114,36 @@ public class NotificationDispatcher {
             return;
         }
         try {
+            if (!isEventEnabled(command)) {
+                log.info("事件 {} 在系统 {} 已关闭，跳过投递", command.type(), command.systemId());
+                return;
+            }
             deliverAll(command);
         } catch (Exception e) {
             // 兜底：resolve / 渲染 / 加载收件人任何一步炸了，都不能回传给已提交的业务事务。
             log.warn("通知投递中止（事件 {}，系统 {}）：{}", command.type(), command.systemId(),
                     NotificationErrorText.sanitize(e));
+        }
+    }
+
+    /**
+     * 事件开关判定，外面再包一层"失败即默认开"。
+     *
+     * <p><b>为什么失败时选"开"而不是"关"</b>：开关是"少发"的调节阀，而通知的价值是"该收到的人收到"。
+     * 如果一次 {@code notification_switch} 查询抖动就按"关"处理，会<b>静默</b>吃掉本来该发的通知，
+     * 且没有任何人能看出这个事件其实没被关——用户影响是漏发。按"开"处理最坏是关闭期间多发了通知
+     * （用户可以忽略），而开关查询本身的错误已经由这条 warn 暴露出来，不会无声无息。
+     *
+     * <p>顺序（R28）：本方法在 resolve 接收人、渲染、落库<b>之前</b>调用。否则关闭的事件仍会写下
+     * {@code PENDING} 行，运维看到的是"投递中/投递失败"，而不是"这个事件被关掉了"。
+     */
+    private boolean isEventEnabled(NotificationCommand command) {
+        try {
+            return switchService.isEnabled(command.type(), command.systemId());
+        } catch (Exception e) {
+            log.warn("通知开关查询失败（事件 {}，系统 {}），按默认开启继续投递：{}",
+                    command.type(), command.systemId(), NotificationErrorText.sanitize(e));
+            return true;
         }
     }
 

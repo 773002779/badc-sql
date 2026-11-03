@@ -63,6 +63,7 @@ class NotificationDispatcherTest {
     private final List<Long> slept = new ArrayList<>();
     private final NotificationRecipients recipients = mock(NotificationRecipients.class);
     private final NotificationTargetStore targetStore = mock(NotificationTargetStore.class);
+    private final NotificationSwitchService switchService = mock(NotificationSwitchService.class);
     private final JavaMailSender mailSender = mock(JavaMailSender.class);
 
     @Test
@@ -307,7 +308,9 @@ class NotificationDispatcherTest {
     }
 
     private NotificationDispatcher dispatcher(NotificationProperties properties, ChannelSender... senders) {
-        return new NotificationDispatcher(recipients, targetStore, store, List.of(senders),
+        // 开关默认开：本类的用例都验投递行为，开关的接线由 NotificationDispatcherSwitchTest 覆盖。
+        when(switchService.isEnabled(any(NotificationEventType.class), anyLong())).thenReturn(true);
+        return new NotificationDispatcher(recipients, targetStore, store, switchService, List.of(senders),
                 properties, CLOCK, slept::add);
     }
 
