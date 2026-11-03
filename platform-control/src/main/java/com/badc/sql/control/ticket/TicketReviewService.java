@@ -14,6 +14,7 @@ import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.audit.AuditCommand;
 import com.badc.sql.control.audit.AuditService;
+import com.badc.sql.control.notify.TicketNotificationPublisher;
 import com.badc.sql.control.user.UserRoleService;
 import com.badc.sql.control.web.RequestMetadata;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -77,6 +78,7 @@ public class TicketReviewService {
     private final RiskAcknowledgementMapper acknowledgementMapper;
     private final UserRoleService userRoleService;
     private final AuditService auditService;
+    private final TicketNotificationPublisher notifications;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
@@ -87,6 +89,7 @@ public class TicketReviewService {
             RiskAcknowledgementMapper acknowledgementMapper,
             UserRoleService userRoleService,
             AuditService auditService,
+            TicketNotificationPublisher notifications,
             ObjectMapper objectMapper,
             Clock clock) {
         this.ticketMapper = ticketMapper;
@@ -95,6 +98,7 @@ public class TicketReviewService {
         this.acknowledgementMapper = acknowledgementMapper;
         this.userRoleService = userRoleService;
         this.auditService = auditService;
+        this.notifications = notifications;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -131,6 +135,13 @@ public class TicketReviewService {
         // 一级的确认阶段是 REVIEW，二级是 L3_REVIEW（V3 的 ck_risk_acknowledgement_stage）。
         apply(ticket, reviewerId, plan.level(), TicketReviewMapper.DECISION_APPROVED, normalized,
                 plan.approvalTarget(), true);
+        // 通知在事务提交后异步投递（事件监听器 AFTER_COMMIT）。
+        // L3 的一审通过只是"转入二级"：此时才第一次通知组长（R15），不发"已通过"。
+        if (plan.approvalTarget() == TicketStatus.REVIEWING_L2) {
+            notifications.l3PendingLead(ticketId);
+        } else {
+            notifications.approved(ticketId, normalized);
+        }
         return new ReviewOutcome(ticketId, plan.approvalTarget(), ticket.riskLevel());
     }
 
@@ -156,6 +167,8 @@ public class TicketReviewService {
         TicketStateMachine.assertTransition(from, TicketStatus.REJECTED);
         apply(ticket, reviewerId, plan.level(), TicketReviewMapper.DECISION_REJECTED, normalized,
                 TicketStatus.REJECTED, false);
+        // 驳回是终局：通知里带驳回理由（reason 只放审核意见，不放任何语句内容）。
+        notifications.rejected(ticketId, normalized);
         return new ReviewOutcome(ticketId, TicketStatus.REJECTED, ticket.riskLevel());
     }
 

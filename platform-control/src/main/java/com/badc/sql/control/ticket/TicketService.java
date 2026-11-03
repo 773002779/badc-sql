@@ -11,6 +11,7 @@ import com.badc.sql.common.dto.ConnConfig;
 import com.badc.sql.common.dto.ExplainEstimate;
 import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
+import com.badc.sql.control.notify.TicketNotificationPublisher;
 import com.badc.sql.control.org.ConnAccountService;
 import com.badc.sql.control.query.ExecutorClient;
 import com.badc.sql.control.risk.RiskAssessment;
@@ -55,6 +56,7 @@ public class TicketService {
     private final ConnAccountService connAccountService;
     private final RiskEngine riskEngine;
     private final RiskProperties riskProperties;
+    private final TicketNotificationPublisher notifications;
     private final Clock clock;
 
     public TicketService(
@@ -64,6 +66,7 @@ public class TicketService {
             ConnAccountService connAccountService,
             RiskEngine riskEngine,
             RiskProperties riskProperties,
+            TicketNotificationPublisher notifications,
             Clock clock) {
         this.assignmentService = assignmentService;
         this.ticketStore = ticketStore;
@@ -71,6 +74,7 @@ public class TicketService {
         this.connAccountService = connAccountService;
         this.riskEngine = riskEngine;
         this.riskProperties = riskProperties;
+        this.notifications = notifications;
         this.clock = clock;
     }
 
@@ -144,6 +148,11 @@ public class TicketService {
 
         // 5 步：一个事务落库；归属与静态校验在事务内重跑。
         long ticketId = ticketStore.create(submitterId, command, prepared, RequestMetadata.current());
+
+        // 6 步：通知。发布点紧跟在落库之后，但<b>不等投递</b>：事件在提交后由通知线程池消费，
+        // 发布本身也把异常收在 publisher 内。通知失败不能让已落库的工单看起来像提交失败。
+        // L3 单在这里只通知运维一审；组长要等一审通过（R15，见 TicketReviewService）。
+        notifications.submitted(ticketId);
 
         return new SubmitResult(ticketId, TicketStatus.REVIEWING_L1, ticketLevel,
                 summaries(validated, statementLevels));

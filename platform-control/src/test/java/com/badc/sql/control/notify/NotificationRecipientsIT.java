@@ -93,9 +93,36 @@ class NotificationRecipientsIT extends AbstractMySqlIT {
                 .containsAll(baseline);
     }
 
+    /**
+     * R16 兜底事件的收件人：系统没有主/备运维时，查询必须返回组长。
+     *
+     * <p>这一条是"改发组长"能不能落地的<b>关键环节</b>：发布侧把事件类型换成
+     * {@link NotificationEventType#TICKET_LEAD_FALLBACK} 之后，投递器会按<b>新类型重新解析</b>收件人。
+     * 若这里仍走只取 PRIMARY/BACKUP 的基线 SQL，兜底通知会解析出空列表——"改发组长"变成"谁也不发"，
+     * 而提交接口依旧 201，问题只在"组长永远收不到"里体现。
+     */
     @Test
-    void recipients_are_unique_and_ordered_by_user_id() {
-        insertOperator(BACKUP_SECOND, "ops03", "BACKUP_OPS", "备运维三号", "BACKUP");
+    void a_fallback_event_resolves_to_the_lead_when_no_primary_or_backup_exists() {
+        insertOperator(LEAD, "lead01", "OPS_LEAD", "组长一号", "LEAD");
+        // 先把夹具里的主运维（user 2）摘掉，制造"只有组长"的系统；finally 里恢复。
+        jdbc.update("delete from sys_system_operator where system_id = ? and user_id = ?", SYSTEM, PRIMARY_OPS);
+        try {
+            assertThat(recipients.resolve(SYSTEM, NotificationEventType.TICKET_SUBMITTED))
+                    .as("没有主/备运维时基线为空，发布侧据此判定走兜底")
+                    .isEmpty();
+            assertThat(recipients.resolve(SYSTEM, NotificationEventType.TICKET_LEAD_FALLBACK))
+                    .as("兜底事件必须解析得到组长，否则通知谁也发不到")
+                    .containsExactly(LEAD);
+        } finally {
+            jdbc.update("""
+                    insert into sys_system_operator (id, system_id, user_id, operator_type)
+                    values (1, 2, 2, 'PRIMARY')
+                    """);
+        }
+    }
+
+    @Test
+    void recipients_are_unique_and_ordered_by_user_id() {        insertOperator(BACKUP_SECOND, "ops03", "BACKUP_OPS", "备运维三号", "BACKUP");
         insertOperator(BACKUP_FIRST, "ops02", "BACKUP_OPS", "备运维二号", "BACKUP");
 
         assertThat(recipients.resolve(SYSTEM, NotificationEventType.TICKET_SUBMITTED))

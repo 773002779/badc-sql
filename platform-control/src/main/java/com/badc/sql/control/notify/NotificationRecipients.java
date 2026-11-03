@@ -1,6 +1,8 @@
 package com.badc.sql.control.notify;
 
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
@@ -9,7 +11,8 @@ import org.springframework.stereotype.Component;
  * 事件接收人解析：某个系统上"谁该收到这条通知"。
  *
  * <p>规则（FR-13）：<b>基线 = 主运维 + 备运维</b>（{@code operator_type in ('PRIMARY','BACKUP')}）；
- * 只有 L3 待终审（{@link NotificationEventType#TICKET_L3_PENDING_LEAD}）才并入组长（{@code LEAD}）。
+ * 只有两类事件并入组长（{@code LEAD}）：L3 待终审（{@link NotificationEventType#TICKET_L3_PENDING_LEAD}）
+ * 与主备运维缺位时的兜底（{@link NotificationEventType#TICKET_LEAD_FALLBACK}）。
  * 基线<b>不能</b>写成"取该系统全部归属行"：那样组长会收到所有普通事件的通知，而"L3 再并入 LEAD"
  * 也就成了空操作——计划原文的这处自相矛盾已按 FR-13 裁决（R10）。
  *
@@ -41,6 +44,17 @@ public class NotificationRecipients {
              order by user_id
             """;
 
+    /**
+     * 需要并入组长的两类事件。
+     *
+     * <p>{@link NotificationEventType#TICKET_LEAD_FALLBACK} 必须在这里：兜底路径把事件类型从
+     * {@code TICKET_SUBMITTED} 换成了它，投递器随后<b>按新类型重新解析收件人</b>；
+     * 若仍走只取 PRIMARY/BACKUP 的基线 SQL，兜底通知会解析出空列表——"改发组长"变成"谁也不发"。
+     */
+    private static final Set<NotificationEventType> LEAD_INCLUSIVE = EnumSet.of(
+            NotificationEventType.TICKET_L3_PENDING_LEAD,
+            NotificationEventType.TICKET_LEAD_FALLBACK);
+
     private final JdbcTemplate jdbc;
 
     public NotificationRecipients(JdbcTemplate jdbc) {
@@ -58,9 +72,7 @@ public class NotificationRecipients {
         if (type == null) {
             throw new IllegalArgumentException("事件类型不能为空");
         }
-        String sql = type == NotificationEventType.TICKET_L3_PENDING_LEAD
-                ? OPERATORS_WITH_LEAD_SQL
-                : OPERATORS_SQL;
+        String sql = LEAD_INCLUSIVE.contains(type) ? OPERATORS_WITH_LEAD_SQL : OPERATORS_SQL;
         return jdbc.queryForList(sql, Long.class, systemId);
     }
 }

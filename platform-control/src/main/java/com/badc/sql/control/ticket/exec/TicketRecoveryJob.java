@@ -18,7 +18,9 @@ import org.springframework.stereotype.Service;
 
 import com.badc.sql.control.audit.AuditCommand;
 import com.badc.sql.control.audit.AuditService;
+import com.badc.sql.control.notify.TicketNotificationPublisher;
 import com.badc.sql.control.ticket.TicketEventMapper;
+import com.badc.sql.control.ticket.TicketStatus;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -136,6 +138,7 @@ public class TicketRecoveryJob {
     private final TicketEventMapper eventMapper;
     private final DatasourceExecLock lock;
     private final AuditService auditService;
+    private final TicketNotificationPublisher notifications;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
@@ -144,12 +147,14 @@ public class TicketRecoveryJob {
             TicketEventMapper eventMapper,
             DatasourceExecLock lock,
             AuditService auditService,
+            TicketNotificationPublisher notifications,
             ObjectMapper objectMapper,
             Clock clock) {
         this.jdbc = jdbc;
         this.eventMapper = eventMapper;
         this.lock = lock;
         this.auditService = auditService;
+        this.notifications = notifications;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -235,6 +240,9 @@ public class TicketRecoveryJob {
             auditService.record(new AuditCommand(
                     "TICKET_RECOVERY", null, null, ticket.datasourceId(),
                     RECOVERY_REASON, String.valueOf(ticket.id()), detail));
+            // NEEDS_MANUAL_CONFIRM 是执行终态之一（工单已不再由执行线程接管）：按 TICKET_EXEC_FAILED
+            // 通知主备运维去人工核对。消息里不带任何错误文本，原因在事件/审计与详情页。
+            notifications.executionFinished(ticket.id(), TicketStatus.NEEDS_MANUAL_CONFIRM);
         }
         return recovered;
     }

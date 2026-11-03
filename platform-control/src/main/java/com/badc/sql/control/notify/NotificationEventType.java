@@ -19,6 +19,14 @@ public enum NotificationEventType {
 
     /** 工单已提交，等待一级审核。 */
     TICKET_SUBMITTED("工单已提交"),
+    /**
+     * 工单已提交，但该系统没有主/备运维归属，改请组长代为审批（R16 兜底）。
+     *
+     * <p>它不是"提交"的同义词：收件人是组长而不是主备运维，文案也必须点明"缺位"，
+     * 否则组长会以为自己只是普通抄送对象。发布侧在 {@code resolve(system, TICKET_SUBMITTED)}
+     * 为空时把 {@link #TICKET_SUBMITTED} 替换成本类型。
+     */
+    TICKET_LEAD_FALLBACK("主备运维缺位，待组长代为审批"),
     /** 工单审批通过，等待执行。 */
     TICKET_APPROVED("工单已通过"),
     /** 工单被驳回。 */

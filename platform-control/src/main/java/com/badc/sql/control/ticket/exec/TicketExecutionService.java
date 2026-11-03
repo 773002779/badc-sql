@@ -26,6 +26,7 @@ import com.badc.sql.common.error.BizException;
 import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.audit.AuditCommand;
 import com.badc.sql.control.audit.AuditService;
+import com.badc.sql.control.notify.TicketNotificationPublisher;
 import com.badc.sql.control.org.ConnAccountService;
 import com.badc.sql.control.query.ExecutorClient;
 import com.badc.sql.control.risk.Classification;
@@ -199,6 +200,7 @@ public class TicketExecutionService {
     private final ConnAccountService connAccountService;
     private final AuditService auditService;
     private final UserRoleService userRoleService;
+    private final TicketNotificationPublisher notifications;
     private final DatasourceExecLock lock;
     private final ThreadPoolTaskExecutor ticketExecutor;
     private final ObjectMapper objectMapper;
@@ -218,6 +220,7 @@ public class TicketExecutionService {
             ConnAccountService connAccountService,
             AuditService auditService,
             UserRoleService userRoleService,
+            TicketNotificationPublisher notifications,
             DatasourceExecLock lock,
             @Qualifier("ticketExecutor") ThreadPoolTaskExecutor ticketExecutor,
             ObjectMapper objectMapper,
@@ -235,6 +238,7 @@ public class TicketExecutionService {
         this.connAccountService = connAccountService;
         this.auditService = auditService;
         this.userRoleService = userRoleService;
+        this.notifications = notifications;
         this.lock = lock;
         this.ticketExecutor = ticketExecutor;
         this.objectMapper = objectMapper;
@@ -535,6 +539,10 @@ public class TicketExecutionService {
                         json(Map.of("rollbackTicketId", ticketId)));
             }
         }
+
+        // 终态通知（发布即返回；投递在通知线程池里）。放在状态与审计落库之后：收件人点开短链时
+        // 看到的必须是已经稳定的终态，而不是还停在 EXECUTING 的工单。消息里不带任何错误文本。
+        notifications.executionFinished(ticketId, finalStatus);
     }
 
     /**
@@ -551,6 +559,9 @@ public class TicketExecutionService {
         eventMapper.append(ticketId, "EXEC_ABORTED", operatorId, detailJson);
         auditService.record(new AuditCommand(
                 "TICKET_ABORTED", operatorId, null, datasourceId, code, String.valueOf(ticketId), detailJson));
+        // 中止是执行终态之一：运维需要知道"这单没跑成功"。事件类型是 TICKET_EXEC_FAILED，
+        // 但不把 code/detail 塞进消息——那里面可能有 SQL 片段与库的结构信息，只留短链回详情页看。
+        notifications.executionFinished(ticketId, TicketStatus.FAILED);
     }
 
     // ------------------------------------------------------------------ 结构漂移
