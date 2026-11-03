@@ -31,9 +31,9 @@ import com.badc.sql.control.ticket.TicketStatus;
  *
  * <h2>facts 只放白名单键（R31）</h2>
  * <p>按事件严格分开：<b>提交类</b>只放 system/module/datasource/statementType/riskLevel/submitter/
- * ticketNo/link；<b>审批类</b>额外放 reason（只放审核意见/驳回理由）；<b>执行类</b>只放
- * system/ticketNo/link——<b>不放任何错误文本</b>，因为执行错误可能含 SQL 片段、主机、账号等凭证形态，
- * 要看原因请点短链进工单详情（那里有权限校验）。
+ * ticketNo/link；<b>审批类</b>只放 system/submitter/ticketNo/link/reason（reason 只放审核意见/驳回理由）；
+ * <b>执行类</b>只放 system/ticketNo/link——<b>不放任何错误文本</b>，因为执行错误可能含 SQL 片段、主机、
+ * 账号等凭证形态，要看原因请点短链进工单详情（那里有权限校验）。三个键集互不"借用"（见 {@link #facts}）。
  *
  * <h2>两个事实为什么缺席</h2>
  * <ul>
@@ -219,32 +219,49 @@ public class TicketNotificationPublisher {
     }
 
     /**
-     * 按事件组装 facts（R31）。键名只能取自 {@link NotificationCommand#ALLOWED_FACT_KEYS}，
-     * 多一个键会在构造 {@link NotificationCommand} 时抛——所以这里不"顺手"加任何东西（尤其不加语句文本）。
+     * 按事件组装 facts（R31）。
+     *
+     * <p>三个事件族各有<b>自己的</b>键集，不是"全量的子集"——R31 的清单是上限，不是建议：
+     * <ul>
+     *   <li>提交类（{@code TICKET_SUBMITTED} / {@code TICKET_L3_PENDING_LEAD} /
+     *       {@code TICKET_LEAD_FALLBACK}）：system、module、datasource、statementType、riskLevel、
+     *       submitter、ticketNo、link（{@code estimatedRows} 没有落库来源，见类注释）；</li>
+     *   <li>审批类（{@code TICKET_APPROVED} / {@code TICKET_REJECTED}）：system、submitter、ticketNo、
+     *       link、reason——<b>不含</b> module/datasource/statementType/riskLevel：审批通知只需要说清
+     *       "哪张单、谁提的、为什么"，多带一份风险描述既超出 R31，也让消息更容易被截断；</li>
+     *   <li>执行类（{@code TICKET_EXECUTED} / {@code TICKET_EXEC_FAILED}）：system、ticketNo、link
+     *       ——<b>不放任何错误文本</b>（错误可能含 SQL 片段与凭证形态，看原因请点短链进详情页）。</li>
+     * </ul>
+     *
+     * <p>键名只能取自 {@link NotificationCommand#ALLOWED_FACT_KEYS}，多一个键会在构造
+     * {@link NotificationCommand} 时抛——所以这里不"顺手"加任何东西（尤其不加语句文本）。
      */
     private Map<String, String> facts(TicketEntity ticket, NotificationEventType type, String reason) {
         Map<String, String> facts = new LinkedHashMap<>();
+        put(facts, "system", name(SYSTEM_NAME_SQL, ticket.systemId()));
+        put(facts, "ticketNo", String.valueOf(ticket.id()));
+        put(facts, "link", TICKET_LINK_PREFIX + ticket.id());
+
         if (type == NotificationEventType.TICKET_EXECUTED
                 || type == NotificationEventType.TICKET_EXEC_FAILED) {
-            // 执行类只给"哪张单、哪个系统、去哪看"：错误文本可能含 SQL 片段与凭证形态，绝不进消息。
-            put(facts, "system", name(SYSTEM_NAME_SQL, ticket.systemId()));
-            put(facts, "ticketNo", String.valueOf(ticket.id()));
-            put(facts, "link", TICKET_LINK_PREFIX + ticket.id());
+            // 执行类到此为止：不携带任何错误文本、语句类型或风险描述。
             return facts;
         }
 
-        put(facts, "system", name(SYSTEM_NAME_SQL, ticket.systemId()));
+        if (type == NotificationEventType.TICKET_APPROVED
+                || type == NotificationEventType.TICKET_REJECTED) {
+            // 审批类：提交人 + 审核意见/驳回理由，仅此而已。
+            put(facts, "submitter", name(SUBMITTER_NAME_SQL, ticket.submitterId()));
+            put(facts, "reason", reason);
+            return facts;
+        }
+
+        // 提交类（含 L3 待终审与主备缺位兜底）：一句"这是什么单、要审什么"。
         put(facts, "module", name(MODULE_NAME_SQL, ticket.moduleId()));
         put(facts, "datasource", name(DATASOURCE_NAME_SQL, ticket.datasourceId()));
         put(facts, "statementType", statementTypes(ticket.id()));
         put(facts, "riskLevel", ticket.riskLevel());
         put(facts, "submitter", name(SUBMITTER_NAME_SQL, ticket.submitterId()));
-        put(facts, "ticketNo", String.valueOf(ticket.id()));
-        put(facts, "link", TICKET_LINK_PREFIX + ticket.id());
-        // reason 只可能是审核意见/驳回理由：调用方没有别的入口能把它传进来。
-        if (type == NotificationEventType.TICKET_APPROVED || type == NotificationEventType.TICKET_REJECTED) {
-            put(facts, "reason", reason);
-        }
         return facts;
     }
 

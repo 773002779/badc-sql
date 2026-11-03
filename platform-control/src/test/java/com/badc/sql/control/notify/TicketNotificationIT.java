@@ -333,6 +333,38 @@ class TicketNotificationIT extends TicketITBase {
                 .isNotEmpty();
     }
 
+    // ------------------------------------------------------------------ 审批事件（R31 键集）
+
+    /**
+     * R31：审批类通知的 facts 只有 system/submitter/ticketNo/link/reason。
+     *
+     * <p>为什么要单独钉：白名单是"所有事件共用的键集合"，把 module/datasource 塞进审批通知不会被
+     * {@link NotificationCommand} 拒绝——它只校验键名合法，不校验"这个事件该不该带这个键"。R31 按事件
+     * 分别规定了键集，这条用例把审批类的边界钉死（提交类由 R11/R15 的用例覆盖）。
+     */
+    @Test
+    void an_approval_notification_carries_only_the_approval_key_set() {
+        long mark = notificationTaskMark();
+        long id = submitTicket(L1_SQL, null, L1_ROLLBACK_SQL);
+        awaitNotificationTasks(mark, 1);
+
+        long approveMark = notificationTaskMark();
+        assertThat(approve(OPS02_TOKEN, id, "同意执行").getStatusCode()).isEqualTo(HttpStatus.OK);
+        awaitNotificationTasks(approveMark, 1);
+
+        List<Row> approved = rowsOfType(id, "TICKET_APPROVED");
+        assertThat(approved).as("审批通过必须通知").isNotEmpty();
+        assertThat(approved).allSatisfy(row -> {
+            assertThat(row.body()).contains("提交人").contains("工单号").contains("原因：同意执行");
+            assertThat(row.body())
+                    .as("审批类不带 module/datasource/statementType/riskLevel（R31）")
+                    .doesNotContain("模块")
+                    .doesNotContain("数据源")
+                    .doesNotContain("语句类型")
+                    .doesNotContain("风险等级");
+        });
+    }
+
     // ------------------------------------------------------------------ 执行终态
 
     /** 执行成功 → {@link NotificationEventType#TICKET_EXECUTED}，且消息里没有任何错误文本/SQL。 */
