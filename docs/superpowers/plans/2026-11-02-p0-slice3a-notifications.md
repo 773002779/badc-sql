@@ -323,6 +323,8 @@ FR-13 列了 10 类事件，本计划只做与**已交付**流程相关的 7 类
    事件类型用新的 `TICKET_LEAD_FALLBACK`，文案要点明"主备运维缺位，请代为审批"而非普通"待审核"。
    实现上不需要新查询：基线 `resolve(system, TICKET_SUBMITTED)` 为空时，改用
    `resolve(system, TICKET_L3_PENDING_LEAD)`（此时该查询只会返回 LEAD 行），并把事件类型替换为
-   `TICKET_LEAD_FALLBACK`。**归属由 T7 接线时判定**，T3 的 `NotificationRecipients` 不改。
+   `TICKET_LEAD_FALLBACK`。**归属由 T7 接线时判定**。注意（实测修正）：T3 的 `NotificationRecipients` **必须**把新类型
+`TICKET_LEAD_FALLBACK` 并入 LEAD 查询——投递器是按 `command.type()` 重新解析收件人的，
+不改则 R16 兜底永远解析出空列表、通知发不出去。
 5. **"运维在岗但临时无法审批"平台不检测**：这属于组织状态，平台没有在岗数据。沿用切片 2 既有机制
    （§4.3-4：管理员临时授予另一名组长根终审权并留审计），本切片不做在岗检测，也不做"超时未审升级"。
