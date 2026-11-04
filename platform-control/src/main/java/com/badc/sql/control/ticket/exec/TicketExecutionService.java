@@ -30,7 +30,6 @@ import com.badc.sql.common.error.ErrorCode;
 import com.badc.sql.control.audit.AuditCommand;
 import com.badc.sql.control.audit.AuditService;
 import com.badc.sql.control.notify.TicketNotificationPublisher;
-import com.badc.sql.control.org.ConnAccountService;
 import com.badc.sql.control.query.ExecutorClient;
 import com.badc.sql.control.risk.Classification;
 import com.badc.sql.control.risk.DdlAction;
@@ -202,7 +201,7 @@ public class TicketExecutionService {
     private final RiskEngine riskEngine;
     private final RiskProperties riskProperties;
     private final ExecutorClient executorClient;
-    private final ConnAccountService connAccountService;
+    private final ExecAccountsResolver accountsResolver;
     private final AuditService auditService;
     private final UserRoleService userRoleService;
     private final TicketNotificationPublisher notifications;
@@ -222,7 +221,7 @@ public class TicketExecutionService {
             RiskEngine riskEngine,
             RiskProperties riskProperties,
             ExecutorClient executorClient,
-            ConnAccountService connAccountService,
+            ExecAccountsResolver accountsResolver,
             AuditService auditService,
             UserRoleService userRoleService,
             TicketNotificationPublisher notifications,
@@ -240,7 +239,7 @@ public class TicketExecutionService {
         this.riskEngine = riskEngine;
         this.riskProperties = riskProperties;
         this.executorClient = executorClient;
-        this.connAccountService = connAccountService;
+        this.accountsResolver = accountsResolver;
         this.auditService = auditService;
         this.userRoleService = userRoleService;
         this.notifications = notifications;
@@ -362,9 +361,9 @@ public class TicketExecutionService {
 
         // ---- 执行账号先解析：后面三道闸（估算、漂移、快照）与逐条执行都要用；账号缺失属于配置错误，
         //      同样必须让工单进入终态，而不是把它留在一个永远不再变化的 EXECUTING 上。
-        Accounts accounts;
+        ExecAccountsResolver.Accounts accounts;
         try {
-            accounts = resolveAccounts(datasourceId, classifications);
+            accounts = accountsResolver.resolve(datasourceId, classifications);
         } catch (BizException e) {
             abort(ticketId, operatorId, datasourceId, SNAPSHOT_FAILED,
                     detail("reason", "执行账号不可用，本次执行未下发任何语句", "message", e.getMessage()));
@@ -741,38 +740,6 @@ public class TicketExecutionService {
             resolved.put(table, fingerprint == null ? "" : fingerprint);
         }
         return resolved;
-    }
-
-    // ------------------------------------------------------------------ 执行账号
-
-    /** 一次执行会用到的账号。{@code ddl} 仅在含 DDL 语句时解析。 */
-    private record Accounts(ConnConfig dml, ConnConfig ddl, ConnConfig readonly) {
-
-        /** 漂移检测与快照用的"执行账号"：有 DDL 就用 ddl，否则用 dml。 */
-        ConnConfig execution() {
-            return ddl != null ? ddl : dml;
-        }
-    }
-
-    /**
-     * 按语句类型解析需要的账号。
-     *
-     * <p>只解析真正需要的：一张纯 DDL 工单不该因为数据源没配 dml 账号而执行不了，反之亦然。
-     * 账号缺失抛 {@code BizException}（配置错误），由调用方转成中止。
-     */
-    private Accounts resolveAccounts(long datasourceId, List<Classification> classifications) {
-        boolean needsDdl = classifications.stream().anyMatch(c -> c.ddlAction() != DdlAction.NONE);
-        boolean needsDmlExecute = classifications.stream()
-                .anyMatch(c -> c.ddlAction() == DdlAction.NONE);
-        boolean needsReadonly = classifications.stream()
-                .anyMatch(c -> !c.writeStatement() && c.ddlAction() == DdlAction.NONE);
-
-        ConnConfig dml = (needsDmlExecute || !needsDdl)
-                ? connAccountService.dmlConnConfig(datasourceId)
-                : null;
-        ConnConfig ddl = needsDdl ? connAccountService.ddlConnConfig(datasourceId) : null;
-        ConnConfig readonly = needsReadonly ? connAccountService.readonlyConnConfig(datasourceId) : null;
-        return new Accounts(dml, ddl, readonly);
     }
 
     // ------------------------------------------------------------------ 小工具
