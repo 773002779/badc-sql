@@ -21,6 +21,7 @@ import org.springframework.http.ResponseEntity;
 
 import com.badc.sql.common.dto.ExecAccountType;
 import com.badc.sql.common.dto.ExecuteResult;
+import com.badc.sql.control.support.JwtTestSupport;
 import com.badc.sql.control.support.TicketITBase;
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -88,16 +89,35 @@ class TempExecutionIT extends TicketITBase {
 
     // ------------------------------------------------------------------ 角色闸（接口级，不是前端藏按钮）
 
+    /**
+     * 研发的请求必须 403，而且**角色闸在取锁之前**。
+     *
+     * <p>怎么把"取锁后又释放"与"从未取锁"分开：先给数据源 101 手工插一行别人持有的锁。若实现把角色闸放在
+     * {@code acquire} 之后，这一行会让请求撞主键、返回 409「该数据源有变更正在执行」；只有角色闸真的先跑，
+     * 才会看到 403。原先的 {@code lockRows(...) == 0} 断言分不开这两种情形——{@code release} 在
+     * {@code finally} 里，异常路径会把锁放掉，于是"取过又放掉"与"从未取过"都是 0。
+     */
     @Test
     void a_developer_cannot_execute_anything_directly() {
-        ResponseEntity<String> response = postExecution(DEV_TOKEN, body(ORDER_DATASOURCE_ID, true, L1_UPDATE));
+        jdbc.update("""
+                insert into datasource_exec_lock (datasource_id, ticket_id, acquired_at)
+                values (?, ?, utc_timestamp(3))
+                """, ORDER_DATASOURCE_ID, 900L);
+        try {
+            ResponseEntity<String> response = postExecution(DEV_TOKEN, body(ORDER_DATASOURCE_ID, true, L1_UPDATE));
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(response.getBody()).contains("研发");
-        assertThat(stub.executedSql).as("研发一条语句都不许发出去").isEmpty();
-        assertThat(tempExecutedAuditCount()).as("被拒绝的请求不得留下执行审计").isZero();
-        assertThat(lockRows(ORDER_DATASOURCE_ID)).as("角色闸必须先于取锁").isZero();
-        assertThat(stub.explainCalls).as("角色闸必须先于分级：被拒的请求不该为它跑一次 EXPLAIN").isZero();
+            assertThat(response.getStatusCode())
+                    .as("角色闸必须在取锁之前：真去取锁会撞上那行锁并返回 409")
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(response.getBody()).contains("研发");
+            assertThat(stub.executedSql).as("研发一条语句都不许发出去").isEmpty();
+            assertThat(tempExecutedAuditCount()).as("被拒绝的请求不得留下执行审计").isZero();
+            assertThat(lockRows(ORDER_DATASOURCE_ID)).as("别人的锁不能被删掉").isEqualTo(1);
+            assertThat(stub.explainCalls).as("角色闸必须先于分级：被拒的请求不该为它跑一次 EXPLAIN").isZero();
+        } finally {
+            jdbc.update("delete from datasource_exec_lock where datasource_id = ? and ticket_id = ?",
+                    ORDER_DATASOURCE_ID, 900L);
+        }
     }
 
     @Test
@@ -223,19 +243,117 @@ class TempExecutionIT extends TicketITBase {
         assertThat(payload).contains("\"riskLevel\":\"L3\"").contains("\"selfApproved\":true");
     }
 
+    // ------------------------------------------------------------------ L3 转工单
+
     /**
-     * L3 且提交人不是组长：本任务先返回 409（Task 3 会换成 202 + 转工单），
-     * 但"一条语句都不许发出去"这条现在就必须成立。
+     * L3 且提交人不是组长：不再 409，而是**转成一张 {@code TEMP_EXEC} 工单**等组长审批，一条语句都不下发。
+     *
+     * <p>断言里既有"响应形状"（202 + executed:false + ticketId + REVIEWING_L1），也有"库里的那张单长什么样"
+     * （类型、等级、状态、提交人）与"到底有没有执行"（{@code stub.executeCalls == 0}）。只断言状态码的用例
+     * 证明不了"转单没有顺手把语句跑掉"。
      */
     @Test
-    void an_l3_change_by_a_non_lead_operator_needs_the_lead() {
+    void an_l3_change_by_a_non_lead_becomes_a_ticket_instead_of_running() {
         ResponseEntity<String> response =
                 postExecution(OPS02_TOKEN, body(ORDER_DATASOURCE_ID, true, "truncate table t_order"));
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(response.getBody()).contains("TEMP_EXEC_NEEDS_APPROVAL").contains("组长");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        JsonNode json = tree(response);
+        assertThat(json.path("executed").asBoolean()).as("转单不是执行").isFalse();
+        assertThat(json.path("riskLevel").asText()).isEqualTo("L3");
+        assertThat(json.path("status").asText()).isEqualTo("REVIEWING_L1");
+        long ticketId = json.path("ticketId").asLong();
+        assertThat(ticketId).as("响应里必须带新工单 ID，前端据此跳转").isPositive();
+
+        Map<String, Object> ticket = ticketRow(ticketId);
+        assertThat(ticket.get("ticket_type")).isEqualTo("TEMP_EXEC");
+        assertThat(ticket.get("risk_level")).isEqualTo("L3");
+        assertThat(ticket.get("status")).isEqualTo("REVIEWING_L1");
+        assertThat(ticket.get("datasource_id")).isEqualTo(ORDER_DATASOURCE_ID);
+        assertThat(((Number) ticket.get("submitter_id")).longValue())
+                .as("提交人是发起临时执行的运维本人（审批时据此判「不能审自己的单」）").isEqualTo(4L);
+
+        assertThat(stub.executedSql).as("一条语句都不许发出去").isEmpty();
         assertThat(stub.executeCalls).isZero();
-        assertThat(tempExecutedAuditCount()).isZero();
+        assertThat(tempExecutedAuditCount()).as("转单没有执行，不该写 TEMP_EXECUTED").isZero();
+        assertThat(lockRows(ORDER_DATASOURCE_ID)).as("转单不取执行锁：没有任何语句要跑").isZero();
+    }
+
+    /**
+     * 普通运维（主运维）不能批 {@code TEMP_EXEC} 单：这张单只有组长能批。
+     *
+     * <p><b>为什么由备运维提单</b>：若让 ops02 自己提、自己批，拦下他的是"提交人不能审核自己的工单"
+     * （同样 403），这条用例就分不开"角色闸生效"与"自审闸生效"——把 Step 4 的类型判定整段删掉它依然全绿。
+     * 换一个非组长的运维提单，403 就只能来自 LEAD_ONLY 这道闸。夹具里系统 1 没有备运维，这里临时建一个
+     * （{@code finally} 清理，与 {@code TicketReviewIT} 同形）。
+     */
+    @Test
+    void a_regular_operator_cannot_approve_a_temp_execution_ticket() {
+        addBackupOperator();
+        try {
+            long ticketId = postExecutionForTicketId(BACKUP_OPS_TOKEN,
+                    body(ORDER_DATASOURCE_ID, true, "truncate table t_order"));
+
+            ResponseEntity<String> response = approve(OPS02_TOKEN, ticketId, "主运维想批临时执行单");
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(response.getBody()).contains("运维临时执行的 L3 变更只能由运维组长审批");
+            assertThat(status(ticketId)).isEqualTo("REVIEWING_L1");
+            assertThat(reviewRows(ticketId)).as("被拒的审批不得留下审核行").isZero();
+        } finally {
+            removeBackupOperator();
+        }
+    }
+
+    /**
+     * 组长批准 {@code TEMP_EXEC} 单：**一级即终态**，不得出现 {@code REVIEWING_L2}。
+     *
+     * <p>"不得进二级"必须用状态与审核行一起断言：只看最终 {@code APPROVED} 的话，一个"先进二级、再由同一个
+     * 组长终审"的实现也会绿——而那正是这张单不该有的行为（运维临时执行不走四眼原则）。
+     */
+    @Test
+    void the_lead_approves_a_temp_execution_ticket_in_one_level() {
+        long ticketId = postExecutionForTicketId(OPS02_TOKEN,
+                body(ORDER_DATASOURCE_ID, true, "truncate table t_order"));
+
+        ResponseEntity<String> response = approve(LEAD01_TOKEN, ticketId, "组长批准");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = tree(response);
+        assertThat(json.path("status").asText()).isEqualTo("APPROVED");
+        assertThat(status(ticketId)).isEqualTo("APPROVED");
+        assertThat(reviewRows(ticketId)).as("只有一级审核记录，没有第二条").isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "select review_level from ticket_review where ticket_id = ?", Integer.class, ticketId))
+                .as("批准落在 review_level=1").isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "select count(*) from ticket_event where ticket_id = ? and event_type = 'APPROVED_L2'",
+                Integer.class, ticketId))
+                .as("临时执行单不进二级：不该有 APPROVED_L2 事件").isZero();
+        assertThat(jdbc.queryForObject(
+                "select approved_at from ticket where id = ?", java.sql.Timestamp.class, ticketId))
+                .as("单级批准必须置 approved_at").isNotNull();
+    }
+
+    /**
+     * 转工单不要求回滚 SQL / 回滚方案：请求里没有任何回滚信息，建单依然成功，且两列都是空。
+     *
+     * <p>这条性质如果不成立，运维会被迫为一次临时执行编一段"回滚 SQL"——而临时执行的安全网是执行前结构快照
+     * 与审计（§4.3-3），假 SQL 只会让审批人误以为有一份可用的回滚方案。
+     */
+    @Test
+    void a_temp_execution_ticket_needs_no_rollback_sql() {
+        long ticketId = postExecutionForTicketId(OPS02_TOKEN,
+                body(ORDER_DATASOURCE_ID, true, "truncate table t_order"));
+
+        Map<String, Object> ticket = ticketRow(ticketId);
+        assertThat(ticket.get("rollback_sql")).as("临时执行单没有回滚 SQL").isNull();
+        assertThat(ticket.get("rollback_plan")).as("临时执行单没有回滚方案").isNull();
+        assertThat((String) ticket.get("title")).startsWith("运维临时执行：").contains("TRUNCATE").contains("t_order");
+        assertThat((String) ticket.get("change_reason")).isEqualTo("运维临时执行（L3），需组长一级审批");
+        // 语句仍然完整落库（审批人要看的是"到底要执行什么"，而不是回滚怎么做）。
+        assertThat(jdbc.queryForObject(
+                "select count(*) from ticket_statement where ticket_id = ?", Integer.class, ticketId)).isEqualTo(1);
     }
 
     // ------------------------------------------------------------------ DDL：先快照，再执行
@@ -435,6 +553,72 @@ class TempExecutionIT extends TicketITBase {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /** 系统 1 的备运维（夹具里没有；只在"普通运维不能批临时执行单"那条用例里临时存在）。 */
+    private static final long BACKUP_OPERATOR_ID = 6L;
+
+    private static final String BACKUP_OPS_TOKEN = JwtTestSupport.token(BACKUP_OPERATOR_ID, "backup01");
+
+    private void addBackupOperator() {
+        removeBackupOperator();
+        jdbc.update("""
+                insert into sys_user (id, login_name, password_hash, role, display_name)
+                values (?, 'backup01', ?, 'BACKUP_OPS', '备运维')
+                """, BACKUP_OPERATOR_ID,
+                "$2b$10$TznpaUV2xFOaY3aN9B0lpe0H6sbVMVrDBekF4fxgICSl5BcU9SVGW");
+        jdbc.update("""
+                insert into sys_system_operator (system_id, user_id, operator_type)
+                values (1, ?, 'BACKUP')
+                """, BACKUP_OPERATOR_ID);
+    }
+
+    private void removeBackupOperator() {
+        jdbc.update("delete from sys_system_operator where system_id = 1 and user_id = ?", BACKUP_OPERATOR_ID);
+        jdbc.update("delete from sys_user where id = ?", BACKUP_OPERATOR_ID);
+    }
+
+    /**
+     * 发一次临时执行请求并要求它转成了工单：返回新工单 ID。
+     *
+     * <p>状态码与 {@code executed:false} 也在这里断言一次，避免三个审批用例各自漏掉"到底转没转单"。
+     */
+    private long postExecutionForTicketId(String token, String body) {
+        ResponseEntity<String> response = postExecution(token, body);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        JsonNode json = tree(response);
+        assertThat(json.path("executed").asBoolean()).isFalse();
+        long ticketId = json.path("ticketId").asLong();
+        assertThat(ticketId).isPositive();
+        return ticketId;
+    }
+
+    private ResponseEntity<String> approve(String token, long ticketId, String comment) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(token);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("comment", comment);
+        try {
+            return rest.exchange("/api/v1/tickets/" + ticketId + "/approve", HttpMethod.POST,
+                    new HttpEntity<>(objectMapper.writeValueAsString(body), headers), String.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("无法序列化审批请求体", e);
+        }
+    }
+
+    /** {@code ticket} 表的一行（用例自己取需要的列断言）。 */
+    private Map<String, Object> ticketRow(long ticketId) {
+        return jdbc.queryForMap("""
+                select ticket_type, risk_level, status, datasource_id, submitter_id,
+                       title, change_reason, rollback_plan, rollback_sql
+                  from ticket where id = ?
+                """, ticketId);
+    }
+
+    private int reviewRows(long ticketId) {
+        return jdbc.queryForObject(
+                "select count(*) from ticket_review where ticket_id = ?", Integer.class, ticketId);
+    }
 
     /** 请求体：{@code {datasourceId, statements, confirmed}}；身份只来自 token。 */
     private String body(long datasourceId, boolean confirmed, String... statements) {

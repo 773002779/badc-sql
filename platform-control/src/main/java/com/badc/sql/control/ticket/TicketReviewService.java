@@ -39,6 +39,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * {@code OPS_LEAD}），这个死锁在结构上不可能出现；{@code reviewerId != 一级审核人} 仍保留作纵深防御
  * （今天的单值角色模型下不可达，角色将来变多值就会生效）。
  *
+ * <h2>例外：{@code TEMP_EXEC} 单只有组长一级</h2>
+ * <p>运维临时执行转出的工单不走两级：它的提交人本来就是运维（甚至可能就是主/备运维），让运维先审、组长再终审
+ * 等于自审。所以这张单在 {@code REVIEWING_L1} 只收 {@code OPS_LEAD}，批准即 {@code APPROVED}。这条判定必须
+ * <b>先于</b> L3 分支：临时执行单的等级也是 L3，先走 L3 分支会把唯一能批的组长挡在外面。
+ * 「提交人不能审核自己的工单」对它不变——组长自提的 L3 走的是直执行，根本不产生工单。
+ *
  * <h2>为什么 L3 一级通过前要复查组长</h2>
  * <p>组长可能在提单之后被撤销。让工单停在 {@code REVIEWING_L2} 无人可审是最坏结果，所以一级通过前再查一次
  * {@code count(LEAD)}，为 0 就给 409 和可操作的提示，工单保持 {@code REVIEWING_L1}。
@@ -53,6 +59,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 public class TicketReviewService {
 
     private static final String L3 = "L3";
+
+    /** 运维临时执行转出的工单：审批链只有组长一级（与 V6 的 CHECK 一致，精确比较）。 */
+    private static final String TEMP_EXEC_TICKET_TYPE = "TEMP_EXEC";
 
     /** L3 的一级只收运维；组长做终审（§7.1）。 */
     private static final Set<String> L3_FIRST_LEVEL_ROLES = Set.of("PRIMARY_OPS", "BACKUP_OPS");
@@ -110,6 +119,7 @@ public class TicketReviewService {
      * "批准"特有的目标状态与终审可用性检查。
      *
      * <ul>
+     *   <li>{@code REVIEWING_L1} + {@code TEMP_EXEC} → 组长 → {@code APPROVED}，落 {@code review_level=1}（不进二级）；</li>
      *   <li>{@code REVIEWING_L1} + {@code L3} → 一级（主/备运维）→ {@code REVIEWING_L2}，落 {@code review_level=1}；</li>
      *   <li>{@code REVIEWING_L1} + 非 L3 → 一级（运维或组长）→ {@code APPROVED}，置 {@code approved_at}；</li>
      *   <li>{@code REVIEWING_L2} → 组长终审 → {@code APPROVED}，落 {@code review_level=2}。</li>
@@ -216,6 +226,12 @@ public class TicketReviewService {
      */
     private LevelPlan requireLevelReviewer(TicketEntity ticket, long reviewerId, String role, TicketStatus from) {
         if (from == TicketStatus.REVIEWING_L1) {
+            if (TEMP_EXEC_TICKET_TYPE.equals(ticket.ticketType())) {
+                // 临时执行单**必须先于 L3 分支判定**：它的等级也是 L3，若先走下面的 L3 一级分支会要求
+                // PRIMARY_OPS/BACKUP_OPS，正好把唯一能批的组长挡在外面。它也不进二级：组长一次批准即终态。
+                requireRole(role, LEAD_ONLY, "运维临时执行的 L3 变更只能由运维组长审批");
+                return new LevelPlan(1, TicketStatus.APPROVED);
+            }
             if (L3.equals(ticket.riskLevel())) {
                 // 组长不做 L3 的一级：两级按角色分开，单组长系统不会把 L3 单卡在二级。
                 requireRole(role, L3_FIRST_LEVEL_ROLES, "L3 工单的一级审核只能由主运维或备运维执行");

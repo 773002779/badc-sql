@@ -40,6 +40,12 @@ public class TicketStore {
 
     private static final String ROLLBACK_TICKET_TYPE = "ROLLBACK";
 
+    /** 运维临时执行转出的工单类型。与 V6 的 CHECK 一致，精确大小写比较。 */
+    private static final String TEMP_EXEC_TICKET_TYPE = "TEMP_EXEC";
+
+    /** 默认工单类型：研发提交的普通变更单。 */
+    private static final String NORMAL_TICKET_TYPE = "NORMAL";
+
     /**
      * 回滚单的 {@code origin_ticket_id} / {@code rollback_reason} 在插入后补齐。
      *
@@ -85,7 +91,7 @@ public class TicketStore {
     }
 
     /**
-     * 落一张待审工单。
+     * 落一张待审工单（研发提交的 {@code NORMAL} 单）。
      *
      * <p>前置条件：{@code prepared} 里的风险等级/快照/指纹是事务外按 {@code command.statements()} 算好的；
      * 本方法重跑静态校验并重新推导归属，保证落库时归属仍然成立。
@@ -96,8 +102,35 @@ public class TicketStore {
     @Transactional
     public long create(long submitterId, SubmitCommand command, PreparedTicket prepared,
             RequestMetadata.Client client) {
-        Assignment assignment = assignmentService.assign(submitterId, command.datasourceId());
-        ValidatedSubmission validated = TicketSubmitValidator.validate(command);
+        return create(submitterId, command, prepared, client, NORMAL_TICKET_TYPE);
+    }
+
+    /**
+     * 落一张待审工单，指定 {@code ticket_type}。
+     *
+     * <p>类型决定两件事，其余写入步骤完全同构：
+     * <ul>
+     *   <li><b>回滚要求</b>：{@code TEMP_EXEC} 不要求回滚 SQL / 回滚方案（它的安全网是结构快照与审计，
+     *       见 {@code TicketSubmitValidator#validate(SubmitCommand, boolean)}）；</li>
+     *   <li><b>归属推导口径</b>：{@code TEMP_EXEC} 的提交人是运维，没有 {@code user_module_grant}，
+     *       走 {@link TicketAssignmentService#assignTempExecution}。</li>
+     * </ul>
+     *
+     * <p>为什么归属也要在事务内按类型重推一次：外部调用（指纹 / EXPLAIN）期间提交人的角色、系统归属与
+     * 模块挂载都可能已变；类型是入参，不会变，重推用的还是同一条口径。
+     *
+     * @param ticketType {@code NORMAL} / {@code TEMP_EXEC}（{@code ROLLBACK} 走 {@link #createRollback}）
+     * @return 新工单 ID
+     * @throws BizException 重跑校验失败（403/400）或 L3 无组长（400）
+     */
+    @Transactional
+    public long create(long submitterId, SubmitCommand command, PreparedTicket prepared,
+            RequestMetadata.Client client, String ticketType) {
+        boolean tempExecution = TEMP_EXEC_TICKET_TYPE.equals(ticketType);
+        Assignment assignment = tempExecution
+                ? assignmentService.assignTempExecution(submitterId, command.datasourceId())
+                : assignmentService.assign(submitterId, command.datasourceId());
+        ValidatedSubmission validated = TicketSubmitValidator.validate(command, !tempExecution);
         if (prepared.ticketLevel() == RiskLevel.L3) {
             requireLead(assignment.systemId());
         }
@@ -107,7 +140,7 @@ public class TicketStore {
                 assignment.systemId(),
                 assignment.moduleId(),
                 command.datasourceId(),
-                "NORMAL",
+                ticketType,
                 TicketStatus.REVIEWING_L1.name(),
                 prepared.ticketLevel().name(),
                 prepared.riskSnapshotJson(),

@@ -34,6 +34,9 @@ import com.badc.sql.control.risk.StatementClassifier;
  *       "我知道这表只能按快照重建"变成可审计的文本，而不是靠审核人猜。</li>
  * </ul>
  *
+ * <p>以上三条要求可按工单类型关闭（{@link #validate(SubmitCommand, boolean)} 的 {@code requireRollback}）：
+ * 运维临时执行转出的 {@code TEMP_EXEC} 工单没有回滚方案，它的安全网是结构快照与审计（§4.3-3）。
+ *
  * <h2>回滚 SQL 的表名必须命中工单语句</h2>
  * <p>一条 {@code update t_other ...} 的回滚 SQL 挂在一张只改 {@code t_order} 的工单上，执行时会把另一张表
  * 改回去。这里把两边表名按"去反引号 → 取最后一段"归一后比较：{@code `order_db`.`t_order`} 与
@@ -67,11 +70,30 @@ public final class TicketSubmitValidator {
     }
 
     /**
-     * 校验一张待提交的工单。
+     * 校验一张待提交的工单（按研发工单的口径：DML 必填回滚 SQL、DDL 必填回滚方案）。
      *
      * @throws BizException {@link ErrorCode#INVALID_ARGUMENT}：任意一条规则不满足
      */
     public static ValidatedSubmission validate(SubmitCommand command) {
+        return validate(command, true);
+    }
+
+    /**
+     * 校验一张待提交的工单，可选择是否要求回滚信息。
+     *
+     * <p><b>为什么允许关掉回滚要求</b>：运维临时执行不使用四眼原则，它的安全网是执行前结构快照与审计
+     * （§4.3-3）。把"DML 必须填回滚 SQL"照搬到临时执行转出的工单上，只会逼提交人编一段不会有人执行的假 SQL
+     * ——假数据比空值更坏，因为它看上去像一份可用的回滚方案。
+     *
+     * <p>关掉时<b>只跳过</b>三条：DML 必填 {@code rollbackSql}、DDL 必填 {@code rollbackPlan}、
+     * {@code drop table} 的固定确认语。其余校验一条不少，尤其是：<b>回滚 SQL 一旦给了仍然要校验</b>
+     * （{@link #validateRollbackSql}），不能因为类型特殊就放过一条指向别的表的回滚语句。
+     *
+     * @param requireRollback DML 是否必须给 {@code rollbackSql}、DDL 是否必须给 {@code rollbackPlan}
+     *                        （{@code TEMP_EXEC} 传 {@code false}）
+     * @throws BizException {@link ErrorCode#INVALID_ARGUMENT}：任意一条规则不满足
+     */
+    public static ValidatedSubmission validate(SubmitCommand command, boolean requireRollback) {
         if (command == null) {
             throw new BizException(ErrorCode.INVALID_ARGUMENT, "请求体不能为空");
         }
@@ -112,16 +134,19 @@ public final class TicketSubmitValidator {
             seq++;
         }
 
-        if (hasDmlWrite && isBlank(command.rollbackSql())) {
-            throw new BizException(ErrorCode.INVALID_ARGUMENT, "变更数据的工单必须填写回滚 SQL");
+        if (requireRollback) {
+            if (hasDmlWrite && isBlank(command.rollbackSql())) {
+                throw new BizException(ErrorCode.INVALID_ARGUMENT, "变更数据的工单必须填写回滚 SQL");
+            }
+            if (hasDdl && isBlank(command.rollbackPlan())) {
+                throw new BizException(ErrorCode.INVALID_ARGUMENT, "DDL 变更必须填写回滚方案");
+            }
+            if (hasDropTable && !containsDropTableConfirmation(command.rollbackPlan())) {
+                throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                        "drop table 的回滚方案必须包含确认语「" + DROP_TABLE_CONFIRMATION + "」");
+            }
         }
-        if (hasDdl && isBlank(command.rollbackPlan())) {
-            throw new BizException(ErrorCode.INVALID_ARGUMENT, "DDL 变更必须填写回滚方案");
-        }
-        if (hasDropTable && !containsDropTableConfirmation(command.rollbackPlan())) {
-            throw new BizException(ErrorCode.INVALID_ARGUMENT,
-                    "drop table 的回滚方案必须包含确认语「" + DROP_TABLE_CONFIRMATION + "」");
-        }
+        // 回滚 SQL 是"可选但一旦给了就校验"：跳过必填不等于放过一条指向别的表的回滚语句。
         if (!isBlank(command.rollbackSql())) {
             validateRollbackSql(command.rollbackSql(), targetTables);
         }

@@ -50,6 +50,12 @@ import com.badc.sql.control.web.RequestMetadata;
 @Service
 public class TicketService {
 
+    /** 默认工单类型：研发提交的普通变更单。 */
+    private static final String NORMAL_TICKET_TYPE = "NORMAL";
+
+    /** 运维临时执行转出的工单类型（与 V6 的 CHECK 一致，精确大小写比较）。 */
+    private static final String TEMP_EXEC_TICKET_TYPE = "TEMP_EXEC";
+
     private final TicketAssignmentService assignmentService;
     private final TicketStore ticketStore;
     private final ExecutorClient executorClient;
@@ -79,7 +85,7 @@ public class TicketService {
     }
 
     /**
-     * 提交一张研发变更工单。
+     * 提交一张研发变更工单（{@code NORMAL}）。
      *
      * @param submitterId 提交人（必须是 {@code DEVELOPER}）
      * @param command     工单内容
@@ -88,9 +94,27 @@ public class TicketService {
      *                      外部依赖失败时原样上抛（库不可达绝不降级成"表不存在"）
      */
     public SubmitResult submit(long submitterId, SubmitCommand command) {
+        return submit(submitterId, command, NORMAL_TICKET_TYPE);
+    }
+
+    /**
+     * 提交一张指定类型的工单。
+     *
+     * <p>与 {@link #submit(long, SubmitCommand)} 唯一的差别是类型带来的两处口径：
+     * {@code TEMP_EXEC} 不要求回滚 SQL / 回滚方案，且提交人按运维口径推导归属（见
+     * {@link TicketAssignmentService#assignTempExecution}）。<b>整条链路（指纹、EXPLAIN、风险快照）不复制</b>：
+     * 临时执行转出的工单必须由提交路径自己算指纹与快照，外部凭猜测塞进来的数据会让执行前的漂移比对失效。
+     *
+     * @param ticketType {@code NORMAL} / {@code TEMP_EXEC}（{@code ROLLBACK} 走回滚单自己的路径）
+     */
+    public SubmitResult submit(long submitterId, SubmitCommand command, String ticketType) {
+        boolean tempExecution = TEMP_EXEC_TICKET_TYPE.equals(ticketType);
+
         // 1–2 步：先做最便宜的权限与静态校验，避免为一个越权请求去连目标库。
-        Assignment assignment = assignmentService.assign(submitterId, command.datasourceId());
-        ValidatedSubmission validated = TicketSubmitValidator.validate(command);
+        Assignment assignment = tempExecution
+                ? assignmentService.assignTempExecution(submitterId, command.datasourceId())
+                : assignmentService.assign(submitterId, command.datasourceId());
+        ValidatedSubmission validated = TicketSubmitValidator.validate(command, !tempExecution);
 
         // 3 步：指纹与估算都在事务外。写语句必须用 dml 账号估算：MySQL 要求 EXPLAIN UPDATE/INSERT/DELETE
         // 具备对应写权限，只读账号会拿到 1142，执行器吞成 -1，风险引擎就会把每条 DML 判成 L3。
@@ -147,7 +171,7 @@ public class TicketService {
                 fingerprint, tableFingerprints);
 
         // 5 步：一个事务落库；归属与静态校验在事务内重跑。
-        long ticketId = ticketStore.create(submitterId, command, prepared, RequestMetadata.current());
+        long ticketId = ticketStore.create(submitterId, command, prepared, RequestMetadata.current(), ticketType);
 
         // 6 步：通知。发布点紧跟在落库之后，但<b>不等投递</b>：事件在提交后由通知线程池消费，
         // 发布本身也把异常收在 publisher 内。通知失败不能让已落库的工单看起来像提交失败。

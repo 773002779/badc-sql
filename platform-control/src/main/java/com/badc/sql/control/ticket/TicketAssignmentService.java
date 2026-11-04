@@ -1,6 +1,7 @@
 package com.badc.sql.control.ticket;
 
 import java.util.List;
+import java.util.Set;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -34,6 +35,9 @@ public class TicketAssignmentService {
 
     private static final String ROLE_DEVELOPER = "DEVELOPER";
 
+    /** 能通过临时执行通道转出工单的角色：与该通道的直执行角色集合一致（研发与管理员不在其中）。 */
+    private static final Set<String> TEMP_EXEC_ROLES = Set.of("PRIMARY_OPS", "BACKUP_OPS", "OPS_LEAD");
+
     private static final String SYSTEM_OF_DATASOURCE_SQL =
             "select system_id from datasource where id = ?";
 
@@ -49,6 +53,14 @@ public class TicketAssignmentService {
              where g.user_id = ? and md.datasource_id = ?
              order by g.module_id
             """;
+
+    /** 数据源挂在哪些模块下（TEMP_EXEC：运维没有 {@code user_module_grant}，只能按数据源反查模块）。 */
+    private static final String MODULES_OF_DATASOURCE_SQL =
+            "select module_id from module_datasource where datasource_id = ? order by module_id";
+
+    /** 兜底：该系统的模块（数据源没被任何模块挂载时用）。 */
+    private static final String MODULES_OF_SYSTEM_SQL =
+            "select id from sys_module where system_id = ? order by id";
 
     private final JdbcTemplate jdbc;
     private final UserRoleService userRoleService;
@@ -85,6 +97,50 @@ public class TicketAssignmentService {
                     "无法确定发起模块：数据源 " + datasourceId + " 不是经由任何已授权模块可见的");
         }
         return new Assignment(systemIds.get(0), moduleIds.get(0), List.copyOf(moduleIds));
+    }
+
+    /**
+     * 推导"运维临时执行转工单"的归属（{@code TEMP_EXEC}）。
+     *
+     * <p>与 {@link #assign} 的差别只有两处，都源于"提交人不是研发"：
+     * <ul>
+     *   <li><b>角色闸</b>从"必须是研发"换成"必须是主运维/备运维/组长"——临时执行通道本来就不给研发与管理员走，
+     *       而 {@link #assign} 的 403 文案（"仅研发可提交变更工单"）会把这条路径挡死；</li>
+     *   <li><b>模块</b>不是"提交人经由哪个模块拿到这个库"（运维没有 {@code user_module_grant}），而是
+     *       <b>该数据源所属的模块</b>，取最小 module_id。数据源没被任何模块挂载时退回该系统的模块；
+     *       两者都没有才报 400——{@code ticket.module_id} 是 NOT NULL，编一个不存在的模块只会让工单
+     *       从所有按模块过滤的列表里消失。</li>
+     * </ul>
+     *
+     * <p>系统归属仍取 {@code datasource.system_id}，可见性仍走 {@link VisibilityService}（运维经
+     * {@code sys_system_operator} 可见），于是"只能在自己负责的系统上转工单"与直执行是同一判据。
+     *
+     * @throws BizException 角色不是运维/组长 → 403；数据源不可见 → 403 / 不存在 → 404；
+     *                      数据源与系统都没有模块 → 400
+     */
+    public Assignment assignTempExecution(long submitterId, long datasourceId) {
+        String role = userRoleService.roleOf(submitterId);
+        if (role == null || !TEMP_EXEC_ROLES.contains(role)) {
+            throw new BizException(ErrorCode.FORBIDDEN, "只有运维可以通过临时执行通道提交工单");
+        }
+        visibilityService.assertVisible(submitterId, datasourceId);
+
+        List<Long> systemIds = jdbc.queryForList(SYSTEM_OF_DATASOURCE_SQL, Long.class, datasourceId);
+        if (systemIds.isEmpty()) {
+            // 可见性刚判过存在，这里为空只可能是并发删除：按不存在处理，不要 NPE。
+            throw new BizException(ErrorCode.NOT_FOUND, "数据源不存在：" + datasourceId);
+        }
+        long systemId = systemIds.get(0);
+
+        List<Long> moduleIds = jdbc.queryForList(MODULES_OF_DATASOURCE_SQL, Long.class, datasourceId);
+        if (moduleIds.isEmpty()) {
+            moduleIds = jdbc.queryForList(MODULES_OF_SYSTEM_SQL, Long.class, systemId);
+        }
+        if (moduleIds.isEmpty()) {
+            throw new BizException(ErrorCode.INVALID_ARGUMENT,
+                    "无法确定发起模块：数据源 " + datasourceId + " 不属于任何模块，其所属系统也没有模块");
+        }
+        return new Assignment(systemId, moduleIds.get(0), List.copyOf(moduleIds));
     }
 
     /**

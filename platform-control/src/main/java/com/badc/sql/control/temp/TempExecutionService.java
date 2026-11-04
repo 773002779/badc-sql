@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -35,7 +36,10 @@ import com.badc.sql.control.risk.RiskHit;
 import com.badc.sql.control.risk.RiskLevel;
 import com.badc.sql.control.risk.RiskProperties;
 import com.badc.sql.control.risk.StatementClassifier;
+import com.badc.sql.control.ticket.SubmitCommand;
 import com.badc.sql.control.ticket.TicketReviewMapper;
+import com.badc.sql.control.ticket.TicketService;
+import com.badc.sql.control.ticket.TicketStatus;
 import com.badc.sql.control.ticket.exec.DatasourceExecLock;
 import com.badc.sql.control.ticket.exec.ExecAccountsResolver;
 import com.badc.sql.control.user.UserRoleService;
@@ -43,7 +47,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * 运维临时执行：<b>不建工单</b>，主/备运维与组长直接对写库执行 DML/DDL。
+ * 运维临时执行：<b>能直执行就不建工单</b>，主/备运维与组长直接对写库执行 DML/DDL；
+ * 唯一例外是 L3 且提交人不是组长，那种请求转成一张只需组长一级审批的 {@code TEMP_EXEC} 工单。
  *
  * <h2>谁能执行什么（§4.2 / §4.3）</h2>
  * <ul>
@@ -54,8 +59,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *   <li><b>L1/L2</b>：本人确认风险（{@code confirmed=true}）即执行——临时执行不使用四眼原则（§4.3-3）；</li>
  *   <li><b>L3 且提交人就是本系统组长</b>：直接执行并在审计里记 {@code selfApproved=true}。组长是该系统 L3 的
  *       最终把关人，让他等自己批会把只有一名组长的系统永久卡死；</li>
- *   <li><b>L3 且提交人不是组长</b>：本任务返回 409 {@code TEMP_EXEC_NEEDS_APPROVAL}，一条语句都不下发。
- *       转工单是后续任务（Task 3）在这个分支上做，<b>不要在这里补</b>。</li>
+ *   <li><b>L3 且提交人不是组长</b>：<b>转成一张 {@code TEMP_EXEC} 工单</b>（{@code REVIEWING_L1}），返回
+ *       {@code 202 {executed:false, ticketId, riskLevel, status}}，一条语句都不下发。工单只需组长一级审批
+ *       （{@code TicketReviewService} 按类型收窄），批准后走既有的工单执行路径。转单时把类型交给
+ *       {@code TicketService.submit}：指纹、EXPLAIN、风险快照必须由提交路径自己算，外部凭猜测塞进去会让
+ *       执行前的漂移比对失效；代价是 L3 多跑一次 EXPLAIN，可接受。</li>
  * </ul>
  *
  * <h2>校验顺序是契约</h2>
@@ -86,8 +94,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * </ol>
  *
  * <h2>DDL 先抓快照</h2>
- * <p>含 DDL 时先抓执行前结构快照，抓不到就 500 且<b>一条语句都不执行</b>。临时执行不建工单，所以不写
+ * <p>含 DDL 时先抓执行前结构快照，抓不到就 500 且<b>一条语句都不执行</b>。<b>直执行</b>不建工单，所以不写
  * {@code schema_snapshot} 行——快照引用与逐表指纹进审计 payload，那是"执行前结构是什么样"的唯一凭据。
+ * （L3 转出的工单由提交路径自己写 {@code schema_snapshot}，与这里互不干扰。）
  * 引用形状 {@code {systemId}/{datasourceId}/temp/{uuid}} 与工单的 {@code {systemId}/{datasourceId}/{ticketId}/n}
  * 刻意分开。
  *
@@ -122,6 +131,18 @@ public class TempExecutionService {
     /** {@code audit_event.exec_identity} 的列宽（VARCHAR(128)）。 */
     private static final int EXEC_IDENTITY_MAX_LENGTH = 128;
 
+    /** {@code ticket.title} 的列宽（VARCHAR(200)）。 */
+    private static final int TICKET_TITLE_MAX_LENGTH = 200;
+
+    /** 转工单的标题前缀：列表里一眼能看出这张单是从临时执行通道转来的。 */
+    private static final String TICKET_TITLE_PREFIX = "运维临时执行：";
+
+    /** 转工单的变更原因（固定文本：它不是用户填的，而是这条通道的事实说明）。 */
+    private static final String TICKET_CHANGE_REASON = "运维临时执行（L3），需组长一级审批";
+
+    /** 运维临时执行转出的工单类型（与 V6 的 CHECK 一致，精确大小写比较）。 */
+    private static final String TEMP_EXEC_TICKET_TYPE = "TEMP_EXEC";
+
     /** 分类器无状态，可安全复用一个实例。 */
     private static final StatementClassifier CLASSIFIER = new StatementClassifier();
 
@@ -129,6 +150,7 @@ public class TempExecutionService {
     private final UserRoleService userRoleService;
     private final TicketReviewMapper reviewMapper;
     private final ExecAccountsResolver accountsResolver;
+    private final TicketService ticketService;
     private final RiskEngine riskEngine;
     private final RiskProperties riskProperties;
     private final ExecutorClient executorClient;
@@ -142,6 +164,7 @@ public class TempExecutionService {
             UserRoleService userRoleService,
             TicketReviewMapper reviewMapper,
             ExecAccountsResolver accountsResolver,
+            TicketService ticketService,
             RiskEngine riskEngine,
             RiskProperties riskProperties,
             ExecutorClient executorClient,
@@ -153,6 +176,7 @@ public class TempExecutionService {
         this.userRoleService = userRoleService;
         this.reviewMapper = reviewMapper;
         this.accountsResolver = accountsResolver;
+        this.ticketService = ticketService;
         this.riskEngine = riskEngine;
         this.riskProperties = riskProperties;
         this.executorClient = executorClient;
@@ -167,11 +191,12 @@ public class TempExecutionService {
      *
      * @param userId  操作人，身份只来自 JWT
      * @param command 目标数据源、语句与自确认标记
-     * @return 200 正文：{@code {executed:true, riskLevel, selfApproved, results:[...]}}
+     * @return 直执行时是 200 正文 {@code {executed:true, riskLevel, selfApproved, results:[...]}}；
+     *         L3 非组长时是 202 正文 {@code {executed:false, ticketId, riskLevel, status}}（一条语句都不下发）
      * @throws BizException 400 参数/条数/未确认/硬规则禁止、403 角色或归属、404 数据源不存在、
-     *                      409 该库有变更正在执行或 L3 需要组长审批、500 快照抓取失败
+     *                      409 该库有变更正在执行、500 快照抓取失败
      */
-    public ExecutionResult execute(long userId, TempExecutionCommand command) {
+    public Outcome execute(long userId, TempExecutionCommand command) {
         // ---- 1. 入参。清洗（去空白、丢空串）后为空同样算"没有要执行的语句"。
         if (command == null || command.datasourceId() == null) {
             throw new BizException(ErrorCode.INVALID_ARGUMENT, "缺少数据源 ID");
@@ -223,10 +248,10 @@ public class TempExecutionService {
         // 组长自提的 L3：他自己就是该系统 L3 的最终把关人，直接执行并留痕 selfApproved。
         boolean selfApproved = riskLevel == RiskLevel.L3 && OPS_LEAD.equals(role);
 
-        // L3 且提交人不是组长：本任务先 409（Task 3 换成转工单）。一条语句都不下发。
+        // L3 且提交人不是组长：转成一张 TEMP_EXEC 工单等组长一级审批。转单不是执行——
+        // 这条 return 在取锁与任何 executor 调用之前，本次请求一条语句都不会下发。
         if (riskLevel == RiskLevel.L3 && !OPS_LEAD.equals(role)) {
-            throw new BizException(ErrorCode.CONFLICT,
-                    "TEMP_EXEC_NEEDS_APPROVAL：该变更的风险等级为 L3，需要运维组长审批后才能执行");
+            return submitForLeadApproval(userId, datasourceId, statements, classifications, riskLevel);
         }
 
         // 自确认闸放在分级之后：前端弹框要显示"你正在执行一条 L?_ 变更"，所以未确认的请求也要先算出等级。
@@ -236,6 +261,51 @@ public class TempExecutionService {
 
         return executeUnderLock(userId, datasource, datasourceId, statements, classifications, accounts,
                 riskLevel, selfApproved);
+    }
+
+    // ------------------------------------------------------------------ 转工单
+
+    /**
+     * 把一条 L3 临时执行请求转成 {@code TEMP_EXEC} 工单，停在 {@code REVIEWING_L1} 等组长一级审批。
+     *
+     * <p><b>为什么走 {@code TicketService.submit} 而不是自己拼一张单</b>：工单的风险快照哈希、语句指纹与
+     * 结构快照必须由提交路径自己算——执行前的漂移比对就是拿它们比对的。外部（本类）凭已有分类结果塞一份
+     * 进去，两份口径一旦分叉，这张单审批通过后永远执行不了（{@code RISK_ACK_MISSING} 或指纹不匹配）。
+     * 代价是 L3 多一次 EXPLAIN 往返，可接受。
+     *
+     * <p>标题与变更原因由本类给：临时执行没有"标题/变更原因"输入框，而 {@code ticket} 的这两列是必填。
+     * 回滚方案与回滚 SQL 都留空——{@code TEMP_EXEC} 不要求回滚（它的安全网是结构快照与审计，§4.3-3）。
+     *
+     * @return 202 正文：{@code executed=false} + 新工单 ID + 等级 + 状态
+     */
+    private TicketPending submitForLeadApproval(long userId, long datasourceId, List<String> statements,
+            List<Classification> classifications, RiskLevel riskLevel) {
+
+        SubmitCommand submitCommand = new SubmitCommand(
+                datasourceId,
+                ticketTitle(classifications),
+                TICKET_CHANGE_REASON,
+                null,
+                null,
+                statements,
+                // expectedExecuteAt 不能为 null：转单意味着"组长批准后尽快执行"。
+                clock.instant());
+        long ticketId = ticketService.submit(userId, submitCommand, TEMP_EXEC_TICKET_TYPE).id();
+        return new TicketPending(false, ticketId, riskLevel.name(), TicketStatus.REVIEWING_L1.name());
+    }
+
+    /**
+     * 转单标题：{@code 运维临时执行：<第一条语句的类型> <表>}，超过 {@code VARCHAR(200)} 截断。
+     *
+     * <p>只取第一条语句：运维在列表里靠它认出"这是哪一次操作"，全量语句在工单详情里。类型用大写动词，
+     * 与 {@code ticket_statement.statement_type} 的写法一致。
+     */
+    private static String ticketTitle(List<Classification> classifications) {
+        Classification first = classifications.get(0);
+        String keyword = first.firstKeyword() == null ? "UNKNOWN" : first.firstKeyword().toUpperCase(Locale.ROOT);
+        String table = bareTable(first.table());
+        String subject = table == null ? keyword : keyword + " " + table;
+        return truncate(TICKET_TITLE_PREFIX + subject, TICKET_TITLE_MAX_LENGTH);
     }
 
     // ------------------------------------------------------------------ 执行
@@ -497,6 +567,15 @@ public class TempExecutionService {
     }
 
     /**
+     * 一次临时执行请求的结果：要么当场执行了（{@link ExecutionResult}），要么转成了工单（{@link TicketPending}）。
+     *
+     * <p>用同一个类型做出口，是为了让"到底执行了没有"在类型层面只有一个答案；控制器据此选择 200 / 202。
+     * {@code executed} 两个分支都有，前端只靠它分流即可。
+     */
+    public sealed interface Outcome permits ExecutionResult, TicketPending {
+    }
+
+    /**
      * 200 正文（直执行）。
      *
      * @param executed     恒为 {@code true}：请求被直接执行了（不是转成了工单）
@@ -508,7 +587,22 @@ public class TempExecutionService {
             boolean executed,
             String riskLevel,
             boolean selfApproved,
-            List<StatementResult> results) {
+            List<StatementResult> results) implements Outcome {
+    }
+
+    /**
+     * 202 正文（L3 转工单）：请求没有执行，而是变成了一张等组长审批的 {@code TEMP_EXEC} 工单。
+     *
+     * @param executed  恒为 {@code false}：一条语句都没有下发
+     * @param ticketId  新工单 ID（前端据此跳转详情页）
+     * @param riskLevel 整次请求的风险等级（此分支恒为 {@code L3}）
+     * @param status    工单提交后的状态（恒为 {@code REVIEWING_L1}）
+     */
+    public record TicketPending(
+            boolean executed,
+            long ticketId,
+            String riskLevel,
+            String status) implements Outcome {
     }
 
     /**
