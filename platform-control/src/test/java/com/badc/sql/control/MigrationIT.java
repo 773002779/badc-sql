@@ -45,6 +45,21 @@ class MigrationIT extends AbstractMySqlIT {
     }
 
     @Test
+    void ticket_type_check_allows_temp_exec() {
+        // 运维临时执行的 L3 变更要落成一张 ticket_type = 'TEMP_EXEC' 的工单（V6）。
+        // 只断言约束定义、不插一行数据：ticket 有十几个 NOT NULL 列，为了一条断言去凑齐它们，
+        // 等于在迁移测试里编造一条假的业务写路径（列一改就得跟着改）。约束定义才是唯一事实来源。
+        // 另：CHECK 自 MySQL 8.0.16 起才真正生效，更低版本会静默忽略——那时 TEMP_EXEC 能写进去，
+        // 但'临时执行'以外任意拼写也一样能写进去，所以这里必须直接查 check_clause。
+        assertThat(jdbc.queryForObject("""
+                select check_clause
+                  from information_schema.check_constraints
+                 where constraint_schema = database()
+                   and constraint_name = 'ck_ticket_ticket_type'
+                """, String.class)).contains("NORMAL").contains("ROLLBACK").contains("TEMP_EXEC");
+    }
+
+    @Test
     void grant_request_declares_the_columns_and_status_check_the_mappers_expect() {
         // 列宽是"理由/意见写入被拒"的边界：varchar 太短会让一次正常申请在严格模式下 500。
         assertThat(columnType("grant_request", "can_export")).isEqualTo("tinyint(1)");
